@@ -47,8 +47,11 @@ set (OSL_USING_IMATH 3)
 
 
 # OpenImageIO
+# LOCAL DEVIATION: this machine only has OpenImageIO 2.5.18 prebuilt, while
+# upstream 1.16 asks for >= 3.0.  Lowered to 2.5 so the Vulkan port can be
+# built and tested here; revisit if OIIO 3.x is installed.
 checked_find_package (OpenImageIO REQUIRED
-                      VERSION_MIN 3.0
+                      VERSION_MIN 2.5
                       DEFINITIONS OIIO_HIDE_FORMAT=1)
 
 checked_find_package (pugixml REQUIRED
