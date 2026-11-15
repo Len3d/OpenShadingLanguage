@@ -276,6 +276,17 @@ struct FrameParams {
     float cx[3];
     float cy[3];
     float invw, invh;
+    /// Constants of the device-side mip selector, which now follows OIIO's
+    /// ellipse + log2 rule (see osl_texture in vulkan_shadeops.cpp):
+    ///   footprint (texels) = major axis of the (s,t)-vs-(x,y) Jacobian ellipse
+    ///                        * tex_foot_scale
+    ///   level              = log2(footprint) + tex_lod_bias
+    /// OIIO multiplies the axis by a filter-width factor and folds the
+    /// sblur/tblur terms in, so both constants are exposed as host overrides
+    /// (OSL_VULKAN_TEX_FOOT_SCALE / OSL_VULKAN_TEX_LOD_BIAS) to be calibrated
+    /// against the CPU path without rebuilding the device shaders.
+    float tex_foot_scale;
+    float tex_lod_bias;
 };
 
 /// Where FrameParams sits: the first bytes of the buffer, so the kernel can

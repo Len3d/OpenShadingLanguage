@@ -501,28 +501,70 @@ osl_texture(GlobalPtr sg, unsigned long long namehash, GlobalPtr opt,
     const int h      = tab[slot].height;
     const int nlv    = tab[slot].nlevels > 0 ? tab[slot].nlevels : 1;
 
-    // Which mip level the CPU would have picked.  We do not build OIIO's
-    // anisotropy ellipse; the footprint along s and t is enough to land on the
-    // same level for these scenes, and blending two levels hides an off-by-one.
-    float foot_s = (dsdx < 0.0f ? -dsdx : dsdx) * (float)w;
-    float foot_t = (dtdy < 0.0f ? -dtdy : dtdy) * (float)h;
-    float foot   = foot_s > foot_t ? foot_s : foot_t;
+    // Which mip level the CPU would have picked.  The CPU goes through OIIO's
+    // TextureSystemImpl::texture_lookup_trilinear_mipmap, which builds the
+    // anisotropy ellipse of the (s,t)-vs-(x,y) Jacobian, takes its MAJOR axis
+    // length as the footprint, and uses log2 of that as the (fractional) level;
+    // the fractional part is the trilinear blend weight.  Reproducing that here
+    // is what makes the device land on the same level as the CPU -- the earlier
+    // `max(|dsdx|*w, |dtdy|*h)` only looked at the two axis-aligned gradients,
+    // ignored the cross terms, and then refused to blend anything below one
+    // texel, so it picked a level that was both too coarse and unblended.
+    //
+    // The derivatives are taken into texel space first (s scaled by width,
+    // t by height) because the ellipse is axis-aligned in texels, not in the
+    // 0-1 parameterisation.
+    const VK_GLOBAL FrameParams* fp_tex
+        = (const VK_GLOBAL FrameParams*)block;
+    float j00 = dsdx * (float)w;  // d(s in texels) / dx
+    float j01 = dsdy * (float)w;  // d(s in texels) / dy
+    float j10 = dtdx * (float)h;  // d(t in texels) / dx
+    float j11 = dtdy * (float)h;  // d(t in texels) / dy
+    // Eigenvalues of the 2x2 metric [[E,F],[F,G]] are the squared axis lengths.
+    float E    = j00 * j00 + j10 * j10;
+    float F    = j00 * j01 + j10 * j11;
+    float G    = j01 * j01 + j11 * j11;
+    float tr2  = 0.5f * (E + G);
+    float det2 = 0.5f * (E - G);
+    float sq   = det2 * det2 + F * F;
+    sq         = sq > 0.0f ? __builtin_sqrtf(sq) : 0.0f;
+    float major = tr2 + sq;  // larger eigenvalue
+    major       = major > 0.0f ? __builtin_sqrtf(major) : 0.0f;
+    float foot = major * fp_tex->tex_foot_scale;
+    // log2 goes straight to the hardware math instruction: clang lowers
+    // __builtin_log2f to `llvm.log2.f32`, and clspv maps every `llvm.log2.*`
+    // by name prefix to GLSL.std.450 Log2 (Builtins.cpp:786-788, reached from
+    // Builtins::GetExtInst via the intrinsic's name -- the same mechanism that
+    // already covers llvm.sqrt at Builtins.cpp:720).  The emitted SPIR-V is a
+    // single OpExtInst Log2, never a software approximation.  The mapping table
+    // has llvm.log and llvm.exp/exp2/pow but NO llvm.log10, so routing log2
+    // through log10 would not compile at all.
+    float lod_f = foot > 1.0e-8f
+                      ? __builtin_log2f(foot) + fp_tex->tex_lod_bias
+                      : 0.0f;
+    if (lod_f < 0.0f)
+        lod_f = 0.0f;
+
     // The level is chosen host-side (FrameParams::tex_mode) so the alternatives
     // can be compared on real frames without a rebuild.
-    const int tex_mode = ((const VK_GLOBAL FrameParams*)block)->tex_mode;
+    const int tex_mode = fp_tex->tex_mode;
     const int use_mips = (tex_mode == 0 || tex_mode == 2) ? 1 : 0;
     int lod            = 0;
     float blend        = 0.0f;
     if (use_mips) {
-    while (foot > 1.0f && lod + 1 < nlv) {
-        foot *= 0.5f;
-        ++lod;
-    }
-    if (tex_mode == 0 && foot > 0.5f) {
-        blend = foot * 2.0f - 1.0f;
-        if (blend > 1.0f)
-            blend = 1.0f;
-    }
+        lod = floori(lod_f);
+        if (lod > nlv - 1)
+            lod = nlv - 1;
+        if (tex_mode == 0) {
+            // Trilinear: blend towards the next coarser level by the fractional
+            // part of the level.  At the coarsest level there is nothing to
+            // blend with, so the weight drops to zero instead of holding.
+            blend = lod_f - (float)lod;
+            if (blend > 1.0f)
+                blend = 1.0f;
+            if (lod + 1 >= nlv)
+                blend = 0.0f;
+        }
 
     float acc0[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     float acc1[4] = { 0.0f, 0.0f, 0.0f, 0.0f };

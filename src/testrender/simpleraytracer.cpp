@@ -2150,6 +2150,14 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
     fp.tex_mode = 0;
     if (const char* tm = getenv("OSL_VULKAN_TEX_MODE"))
         fp.tex_mode = atoi(tm);
+    // Calibration of the device mip selector against OIIO (see vulkan_types.h):
+    // footprint_scale folds OIIO's filter-width factor, lod_bias its blur terms.
+    fp.tex_foot_scale = 2.0f;
+    fp.tex_lod_bias   = -1.0f;
+    if (const char* fs = getenv("OSL_VULKAN_TEX_FOOT_SCALE"))
+        fp.tex_foot_scale = (float)atof(fs);
+    if (const char* lb = getenv("OSL_VULKAN_TEX_LOD_BIAS"))
+        fp.tex_lod_bias = (float)atof(lb);
     // Russian roulette depth, same attribute the CPU tracer uses
     // (simpleraytracer.cpp:1092 passes absorb = b >= rr_depth).
     fp.rr_depth = rr_depth;
