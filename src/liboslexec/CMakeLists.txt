@@ -182,6 +182,27 @@ foreach(src ${lib_src})
     endif()
 endforeach(src)
 
+# Which clang compiles the Vulkan device runtime to bitcode.  It must be a
+# clang that knows the `spirv64` target (it only emits IR; clspv makes the
+# actual SPIR-V), i.e. the same LLVM we build oslexec against.
+# NOTE: the doc string below must stay on one line -- splitting it over several
+# quoted strings turns the extra pieces into additional cache *values*.
+set (VULKAN_SHADEOPS_CLANG "" CACHE FILEPATH "clang used to compile the Vulkan device runtime (vulkan_shadeops.cpp) to LLVM bitcode; empty means the Vulkan backend is built without one")
+if (NOT VULKAN_SHADEOPS_CLANG)
+    # LLVM_DIR points at <prefix>/lib/cmake/llvm; LLVM_TOOLS_BINARY_DIR at
+    # <prefix>/bin.  Try both spellings before giving up.
+    set (_vk_clang_candidates
+         "${LLVM_TOOLS_BINARY_DIR}/clang${CMAKE_EXECUTABLE_SUFFIX}"
+         "${LLVM_DIR}/../../../bin/clang${CMAKE_EXECUTABLE_SUFFIX}")
+    foreach (_candidate ${_vk_clang_candidates})
+        if (EXISTS "${_candidate}")
+            set (VULKAN_SHADEOPS_CLANG "${_candidate}")
+            break()
+        endif ()
+    endforeach ()
+endif ()
+message (STATUS "Vulkan device runtime clang: '${VULKAN_SHADEOPS_CLANG}'")
+
 if (USE_LLVM_BITCODE)
     set (llvm_ops_srcs llvm_ops.cpp)
 
@@ -260,6 +281,59 @@ else ()
     # Instead it is part of the regular build process.
     add_compile_definitions (OSL_LLVM_NO_BITCODE)
     set (lib_src ${lib_src} llvm_ops.cpp)
+endif ()
+
+# The Vulkan device runtime is different from llvm_ops.cpp: it is written to be
+# self contained (vulkan_types.h includes nothing), so clang *can* compile it
+# for the spirv64 target -- it only has to emit IR, clspv produces the actual
+# SPIR-V.  Doing it at build time (instead of shipping a .ll in the tree) means
+# the bitcode can never drift from the source.
+if (VULKAN_SHADEOPS_CLANG)
+    set (vk_shadeops_src ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_shadeops.cpp)
+    set (vk_shadeops_bc ${CMAKE_CURRENT_BINARY_DIR}/vulkan_shadeops.bc)
+
+    add_custom_command (OUTPUT ${vk_shadeops_bc}
+        COMMAND ${VULKAN_SHADEOPS_CLANG}
+            -target spirv64 -emit-llvm -c -O2
+            -fno-rtti -fno-exceptions
+            -I${CMAKE_CURRENT_SOURCE_DIR}
+            -o ${vk_shadeops_bc} ${vk_shadeops_src}
+        DEPENDS ${vk_shadeops_src} ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_types.h
+        COMMENT "Compiling Vulkan device runtime to bitcode"
+        VERBATIM)
+
+    # Serialize the bitcode into a .cpp with a byte array, so liboslexec does
+    # not have to find a file on disk at runtime.
+    MAKE_EMBEDDED_CPP ( "vulkan_shadeops_llvm_compiled_ops"
+                        ${CMAKE_CURRENT_BINARY_DIR}/vulkan_shadeops.bc.cpp
+                        ${vk_shadeops_bc} )
+    list (APPEND lib_src ${CMAKE_CURRENT_BINARY_DIR}/vulkan_shadeops.bc.cpp)
+
+    # The whole-frame render kernel (camera/ray generation/sampling/intersection/
+    # accumulation) is built the same way.  It is a second module because it is
+    # only linked in when the scene is rendered frame-at-a-time on the device,
+    # not when a single shading point is evaluated from the host.
+    set (vk_render_src ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_render.cpp)
+    set (vk_render_bc ${CMAKE_CURRENT_BINARY_DIR}/vulkan_render.bc)
+
+    add_custom_command (OUTPUT ${vk_render_bc}
+        COMMAND ${VULKAN_SHADEOPS_CLANG}
+            -target spirv64 -emit-llvm -c -O2
+            -fno-rtti -fno-exceptions
+            -I${CMAKE_CURRENT_SOURCE_DIR}
+            -o ${vk_render_bc} ${vk_render_src}
+        DEPENDS ${vk_render_src} ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_types.h
+        COMMENT "Compiling Vulkan device render kernel to bitcode"
+        VERBATIM)
+
+    MAKE_EMBEDDED_CPP ( "vulkan_render_llvm_compiled_ops"
+                        ${CMAKE_CURRENT_BINARY_DIR}/vulkan_render.bc.cpp
+                        ${vk_render_bc} )
+    list (APPEND lib_src ${CMAKE_CURRENT_BINARY_DIR}/vulkan_render.bc.cpp)
+else ()
+    message (WARNING "VULKAN_SHADEOPS_CLANG not set: Vulkan backend will run "
+                     "without a device runtime and its SPIR-V will not have an "
+                     "entry point")
 endif ()
 
 # Always build target specific libraries for batched execution as shared
@@ -601,6 +675,76 @@ if (partio_FOUND)
     target_compile_definitions (${local_lib} PRIVATE USE_PARTIO=1)
 endif ()
 
+# Optional: clspv is the lowering engine for the Vulkan-flavor SPIR-V backend.
+# clspv keeps its own LLVM (24.x) inside clspv_core.dll, so linking it does not
+# conflict with the LLVM used for the CPU JIT.
+set (CLSPV_ROOT "" CACHE PATH
+     "Root of a clspv build tree (containing src/clspv/include and build/lib/Release)")
+if (CLSPV_ROOT AND EXISTS "${CLSPV_ROOT}/src/clspv/include/clspv/Compiler.h")
+    message (STATUS "clspv found at ${CLSPV_ROOT}: Vulkan SPIR-V backend enabled")
+    target_sources (${local_lib} PRIVATE clspv_util.cpp)
+    target_include_directories (${local_lib} PRIVATE "${CLSPV_ROOT}/src/clspv/include")
+    set (CLSPV_CORE_LIB "${CLSPV_ROOT}/build/lib/Release/clspv_core.lib")
+    if (NOT EXISTS "${CLSPV_CORE_LIB}")
+        # build tree may place the import lib elsewhere
+        file (GLOB_RECURSE CLSPV_CORE_LIB2 "${CLSPV_ROOT}/build/*/clspv_core.lib")
+        list (GET CLSPV_CORE_LIB2 0 CLSPV_CORE_LIB)
+    endif ()
+
+    # clspv_core.lib in the clspv build tree is the *static* library that the
+    # DLL itself was built from: it contains clspv's own objects, compiled
+    # against clspv's bundled LLVM.  Linking that into oslexec collides with
+    # the LLVM that OSL JITs with (duplicate definitions and unresolved
+    # symbols with the other LLVM's ABI).  clspv_core.dll exports only the two
+    # C API entry points, so the link must go through an import library
+    # generated from that DLL.  Regenerate it with:
+    #   lib /def:clspv_core_import.def /machine:x64 /out:clspv_core_import.lib
+    # where the .def lists clspvCompileFromSourcesString and
+    # clspvFreeOutputBuildObjs.
+    set (CLSPV_IMPORT_LIB "${CLSPV_ROOT}/build/lib/Release/clspv_core_import.lib")
+    if (NOT EXISTS "${CLSPV_IMPORT_LIB}")
+        message (WARNING
+            "clspv_core_import.lib not found next to clspv_core.dll; falling back to "
+            "the static clspv_core.lib, which cannot be linked together with OSL's LLVM")
+        set (CLSPV_IMPORT_LIB "${CLSPV_CORE_LIB}")
+    endif ()
+
+    target_link_libraries (${local_lib} PRIVATE "${CLSPV_IMPORT_LIB}")
+    target_compile_definitions (${local_lib} PRIVATE OSL_USE_CLSPV=1)
+    if (MSVC)
+        # Only pull clspv_core.dll in when the SPIR-V backend is actually used,
+        # so the CPU JIT path keeps working on machines without that DLL.
+        # target_link_options puts this on the linker command line as
+        # /DELAYLOAD; the LINK_FLAGS property was silently ignored by the VS
+        # generator, which turned the DLL into a hard startup dependency.
+        target_link_libraries (${local_lib} PRIVATE delayimp)
+        target_link_options (${local_lib} PRIVATE "/DELAYLOAD:clspv_core.dll")
+    endif ()
+    add_custom_command (TARGET ${local_lib} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CLSPV_ROOT}/build/lib/Release/clspv_core.dll"
+                $<TARGET_FILE_DIR:${local_lib}>
+        COMMENT "Copying clspv_core.dll next to oslexec")
+
+    # Unit test for the lowering path (no gtest dependency). clspv_util.cpp is
+    # compiled into the test directly because pvt functions are not exported
+    # from the oslexec DLL.
+    add_executable (clspv_compile_test clspv_compile_test.cpp clspv_util.cpp)
+    target_include_directories (clspv_compile_test PRIVATE
+                                "${CMAKE_CURRENT_SOURCE_DIR}"
+                                "${CMAKE_SOURCE_DIR}/src/include"
+                                "${CLSPV_ROOT}/src/clspv/include"
+                                ${OpenImageIO_INCLUDES})
+    target_link_libraries (clspv_compile_test PRIVATE "${CLSPV_IMPORT_LIB}"
+                             OpenImageIO::OpenImageIO ${CMAKE_DL_LIBS})
+    target_compile_definitions (clspv_compile_test PRIVATE OSL_USE_CLSPV=1)
+    add_custom_command (TARGET clspv_compile_test POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CLSPV_ROOT}/build/lib/Release/clspv_core.dll"
+                $<TARGET_FILE_DIR:clspv_compile_test>)
+    set_target_properties (clspv_compile_test PROPERTIES FOLDER "Unit Tests")
+endif ()
+
 # Disable RTTI from just the one module where we have classes that inherit
 # from LLVM classes.
 if (MSVC)
@@ -615,6 +759,8 @@ endif()
 if (MSVC)
     target_link_libraries (${local_lib} PRIVATE "Version.lib")
 endif()
+
+target_sources (${local_lib} PRIVATE vulkan_legalize.cpp vulkan_abi_check.cpp vulkan_module.cpp)
 
 target_link_libraries (${local_lib}
     PUBLIC
@@ -673,3 +819,16 @@ if (OSL_BUILD_TESTS AND BUILD_TESTING)
     set_target_properties (llvmutil_test PROPERTIES FOLDER "Unit Tests")
     add_test (unit_llvmutil ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/llvmutil_test)
 endif ()
+
+# Driver for the Vulkan legalisation pass (the rewrite that makes an OSL module
+# consumable by `clspv -x ir`).  Needs only LLVM, not clspv, so it builds even
+# when the SPIR-V backend is disabled.
+add_executable (vulkan_legalize_test vulkan_legalize_test.cpp vulkan_legalize.cpp)
+target_include_directories (vulkan_legalize_test PRIVATE
+                            "${CMAKE_CURRENT_SOURCE_DIR}"
+                            "${CMAKE_SOURCE_DIR}/src/include"
+                            ${OpenImageIO_INCLUDES})
+target_link_libraries (vulkan_legalize_test PRIVATE
+                       ${LLVM_LIBRARIES} ${LLVM_LDFLAGS} ${LLVM_SYSTEM_LIBRARIES}
+                       ${CMAKE_DL_LIBS})
+set_target_properties (vulkan_legalize_test PROPERTIES FOLDER "Unit Tests")

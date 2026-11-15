@@ -15,6 +15,11 @@
 #include "background.h"
 #include "raytracer.h"
 #include "sampling.h"
+// Host side of the Vulkan compute path (declared at global scope, so the
+// member below does not create an OSL::VulkanShading that nothing defines).
+// Included rather than forward declared because ~SimpleRaytracer is inline
+// and therefore needs the complete type to destroy the unique_ptr.
+#include "vulkan_shading.h"
 
 
 OSL_NAMESPACE_BEGIN
@@ -52,6 +57,12 @@ public:
                        TypeDesc type, ustringhash name, void* val) override;
     bool get_userdata(bool derivatives, ustringhash name, TypeDesc type,
                       ShaderGlobals* sg, void* val) override;
+    // OSL asks the renderer for a texture handle while compiling a group;
+    // recording the name there is how the Vulkan path learns which textures
+    // it has to decode and upload.  Returning null keeps the CPU path's
+    // behaviour unchanged.
+    TextureHandle* get_texture_handle(ustring filename, ShadingContext* context,
+                                     const TextureOpt* options = nullptr) override;
 
     void name_transform(const char* name, const Transformation& xform);
 
@@ -139,6 +150,38 @@ private:
     class ErrorHandler;  // subclass ErrorHandler for SimpleRaytracer
     std::unique_ptr<OIIO::ErrorHandler> m_errhandler;
     bool m_had_error = false;
+
+    // ------------------------------------------------------------------
+    // Vulkan shading path
+    // ------------------------------------------------------------------
+    //
+    // When the shading system was asked to also lower groups to Vulkan
+    // SPIR-V (OSL_USE_VULKAN=1), each shading point is evaluated by dispatching
+    // that group's compute shader instead of running the group on the CPU.
+    // The ray tracing, closure evaluation and image accumulation all stay on
+    // the host -- what moves to the GPU is exactly the OSL shader execution.
+    //
+    // One pipeline per surface group, plus one ShadeBlock scratch buffer per
+    // thread (the block must outlive the closure evaluation, because `sg.Ci`
+    // points into it).
+    std::unique_ptr<::VulkanShading> m_vk;
+    std::vector<int> m_vk_pipeline;  // one pipeline id per material, -1 = CPU
+    // Whole-frame pipeline (batch mode): one dispatch per image, doing the
+    // ray generation, intersection, shading and accumulation on the device.
+    int m_vk_frame = -1;
+    // Textures the shaders referenced while compiling; recorded by the
+    // get_texture_handle() override and uploaded to the device.
+    std::vector<ustring> m_vk_texture_names;
+    bool m_vulkan_ready  = false;
+    bool m_vulkan_failed = false;
+
+    void init_vulkan_shading();
+    bool shade_vulkan(ShaderGlobals& sg, int shaderID, ShadingContext* ctx);
+    /// Decode and upload every recorded texture into the device buffer.
+    void upload_vulkan_textures();
+    /// Render the whole image with the batch pipeline: lay the scene out in the
+    /// buffer, dispatch once, read the float image back into `pixelbuf`.
+    bool render_vulkan_frame(int xres, int yres);
 
     // Named transforms
     typedef std::map<ustringhash, std::shared_ptr<Transformation>> TransformMap;

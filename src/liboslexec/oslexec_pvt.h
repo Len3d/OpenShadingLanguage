@@ -668,6 +668,9 @@ public:
 
     bool use_optix() const { return m_use_optix; }
     bool use_optix_cache() const { return m_use_optix_cache; }
+    /// True when shader groups should additionally be lowered to
+    /// Vulkan-flavor SPIR-V (via the legalization pass + clspv).
+    bool use_vulkan() const { return m_use_vulkan; }
     bool debug_nan() const { return m_debugnan; }
     bool debug_uninit() const { return m_debug_uninit; }
     bool lockgeom_default() const { return m_lockgeom_default; }
@@ -1016,6 +1019,7 @@ private:
     int m_compile_report;    ///< Print compilation report?
     bool m_use_optix;        ///< This is an OptiX-based renderer
     bool m_use_optix_cache;  ///< Renderer-enabled caching for OptiX ptx
+    bool m_use_vulkan = false;  ///< Also lower groups to Vulkan SPIR-V
     int m_max_optix_groupdata_alloc;  ///< Maximum OptiX groupdata buffer allocation
     bool m_buffer_printf;             ///< Buffer/batch printf output?
     bool m_no_noise;                  ///< Substitute trivial noise calls
@@ -1815,6 +1819,14 @@ public:
     int jitted() const { return m_jitted; }
     void jitted(int jitted) { m_jitted = jitted; }
 
+    /// Legalised Vulkan IR kept in batch mode, and the functions a caller has
+    /// to invoke for this group (see vulkan_module.cpp).
+    const std::string& vulkan_ir() const { return m_vulkan_ir; }
+    const std::vector<std::string>& vulkan_entry_names() const
+    {
+        return m_vulkan_entry_names;
+    }
+
     int batch_jitted() const { return m_batch_jitted; }
     void batch_jitted(int batch_jitted) { m_batch_jitted = batch_jitted; }
 
@@ -2143,6 +2155,22 @@ private:
 
     // PTX assembly for compiled ShaderGroup
     std::string m_llvm_ptx_compiled_version;
+
+    // Vulkan-flavor SPIR-V for the compiled ShaderGroup, and the log of the
+    // legalization + clspv lowering that produced it.  Empty unless the group
+    // was compiled with the Vulkan backend enabled.
+    std::vector<uint32_t> m_vulkan_spirv;
+    std::string m_vulkan_compile_log;
+    ustring m_vulkan_entry_point;
+
+    // Batch mode (OSL_VULKAN_BATCH=1): instead of compiling this group to its
+    // own SPIR-V, keep the legalised IR text and the names of the functions a
+    // caller has to invoke.  A whole-frame render kernel has to be able to call
+    // *any* material, and SPIR-V modules cannot call across modules, so all the
+    // groups plus the render kernel are linked into one module and compiled
+    // once -- see vulkan_module.cpp.
+    std::string m_vulkan_ir;
+    std::vector<std::string> m_vulkan_entry_names;
 
     ParamValueList m_pending_params;          // Pending Parameter() values
     std::vector<ParamHints> m_pending_hints;  // ParamHints of pending params

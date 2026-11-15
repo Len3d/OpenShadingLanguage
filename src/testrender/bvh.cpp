@@ -206,6 +206,8 @@ build_bvh(OIIO::cspan<Vec3> verts, OIIO::cspan<TriangleIndices> triangles,
     bvh->nodes = std::make_unique<BVHNode[]>(buildnodes.size());
     memcpy(bvh->nodes.get(), buildnodes.data(),
            buildnodes.size() * sizeof(BVHNode));
+    bvh->num_nodes   = (unsigned)buildnodes.size();
+    bvh->num_indices = (unsigned)triangles.size();
     double loadtime = timer();
     errhandler.infofmt("BVH built {} nodes over {} triangles in {}",
                        buildnodes.size(), triangles.size(),

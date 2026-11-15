@@ -10,6 +10,7 @@ set (testrender_srcs
      simpleraytracer.cpp
      scene.cpp
      bvh.cpp
+     vulkan_shading.cpp
      testrender.cpp)
 
 find_package(Threads REQUIRED)
@@ -90,6 +91,7 @@ add_executable (testrender ${testrender_srcs})
 
 target_include_directories (testrender BEFORE PRIVATE
                             ${OpenImageIO_INCLUDES} "${PROJECT_SOURCE_DIR}/src")
+target_include_directories (testrender PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../liboslexec")
 
 target_link_libraries (testrender
     PRIVATE
@@ -99,6 +101,28 @@ target_link_libraries (testrender
 
 if (OSL_USE_OPTIX)
     add_dependencies(testrender testrender_ptx)
+endif ()
+
+# The host side of the Vulkan compute path needs the Vulkan loader.  Without
+# it testrender must still build and run -- the Vulkan shading path is opt-in
+# (OSL_USE_VULKAN=1) and falls back to CPU execution -- so this is not a hard
+# requirement.  Override the location with -DOSL_VULKAN_SDK=<dir>.
+if (DEFINED OSL_VULKAN_SDK)
+    set (vulkan_sdk "${OSL_VULKAN_SDK}")
+elseif (DEFINED ENV{VULKAN_SDK})
+    set (vulkan_sdk "$ENV{VULKAN_SDK}")
+elseif (EXISTS "C:/VulkanSDK/1.4.357.0")
+    set (vulkan_sdk "C:/VulkanSDK/1.4.357.0")
+endif ()
+
+if (vulkan_sdk AND EXISTS "${vulkan_sdk}/Include/vulkan/vulkan.h")
+    message (STATUS "testrender: Vulkan host path enabled, SDK = ${vulkan_sdk}")
+    target_include_directories (testrender PRIVATE "${vulkan_sdk}/Include")
+    target_link_libraries (testrender PRIVATE "${vulkan_sdk}/Lib/vulkan-1.lib")
+    target_compile_definitions (testrender PRIVATE OSL_USE_VULKAN_HOST=1)
+else ()
+    message (STATUS "testrender: no Vulkan SDK found, Vulkan host path disabled")
+    target_compile_definitions (testrender PRIVATE OSL_USE_VULKAN_HOST=0)
 endif ()
 
 osl_optix_target (testrender)

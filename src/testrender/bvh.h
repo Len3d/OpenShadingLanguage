@@ -39,6 +39,10 @@ struct Intersection {
 struct BVH {
     std::unique_ptr<BVHNode[]> nodes;
     std::unique_ptr<unsigned[]> indices;
+    /// Sizes, so a client (the Vulkan path) can upload the flat arrays without
+    /// having to walk the tree to count them.
+    unsigned num_nodes   = 0;
+    unsigned num_indices = 0;
 };
 
 OSL_NAMESPACE_END

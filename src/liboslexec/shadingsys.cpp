@@ -1249,6 +1249,12 @@ ShadingSystemImpl::ShadingSystemImpl(RendererServices* renderer,
     if (llvm_debug_env && *llvm_debug_env)
         m_llvm_debug = atoi(llvm_debug_env);
 
+    // Alternate way of enabling the Vulkan-flavor SPIR-V backend: every group
+    // that is compiled also gets lowered to Vulkan SPIR-V on the side, while
+    // the CPU JIT path stays exactly as it was.
+    const char* vulkan_env = getenv("OSL_USE_VULKAN");
+    if (vulkan_env && *vulkan_env)
+        m_use_vulkan = atoi(vulkan_env) != 0;
     // Initialize C++ backend defaults from configure-time constants
     m_cpp_compiler       = OSL_CPP_COMPILER_DEFAULT;
     m_cpp_compiler_flags = OSL_CPP_COMPILER_FLAGS_DEFAULT;
@@ -2390,6 +2396,22 @@ ShadingSystemImpl::getattribute(ShaderGroup* group, string_view name,
     if (name == "ptx_compiled_version" && type.basetype == TypeDesc::PTR) {
         bool exists        = !group->m_llvm_ptx_compiled_version.empty();
         *(std::string*)val = exists ? group->m_llvm_ptx_compiled_version : "";
+        return true;
+    }
+    if (name == "vulkan_spirv_size" && type == TypeInt) {
+        *(int*)val = (int)(group->m_vulkan_spirv.size() * 4);
+        return true;
+    }
+    if (name == "vulkan_spirv" && type.basetype == TypeDesc::PTR) {
+        *(const std::vector<uint32_t>**)val = &group->m_vulkan_spirv;
+        return true;
+    }
+    if (name == "vulkan_entry_point" && type == TypeDesc::STRING) {
+        *(ustring*)val = group->m_vulkan_entry_point;
+        return true;
+    }
+    if (name == "vulkan_log" && type == TypeDesc::STRING) {
+        *(ustring*)val = ustring(group->m_vulkan_compile_log);
         return true;
     }
     if (name == "interactive_params" && type.basetype == TypeDesc::PTR) {
