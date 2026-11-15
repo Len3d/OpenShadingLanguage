@@ -1548,8 +1548,18 @@ LLVM_Util::make_jit_execengine(std::string* err, TargetISA requestedISA,
     // faster). Since we call the option "jit_fma", we interpret that as
     // switching between Strict and Standard. We will need some other control
     // if we ever want full "Fast" mode.
+#if OSL_LLVM_VERSION < 240
     options.AllowFPOpFusion = jit_fma() ? llvm::FPOpFusion::Standard
                                         : llvm::FPOpFusion::Strict;
+#else
+    // LOCAL DEVIATION: LLVM 24 removed TargetOptions::AllowFPOpFusion and the
+    // llvm::FPOpFusion enum; FP contraction is now driven by the per
+    // instruction `contract` fast-math flag, which the front end has to put
+    // on the fmul/fadd pairs it wants fused.  oslc does not emit those flags,
+    // so `jit_fma` no longer has any effect through this code path: the
+    // back end keeps its own default (contracting where the target allows
+    // it), which is what "Standard" used to approximate.
+#endif
     // Unfortunately enabling UnsafeFPMath allows reciprocals, which we don't want for divides
     // To match results for existing unit tests we might need to disable UnsafeFPMath
     // TODO: investigate if reciprocals can be disabled by other means.
@@ -1575,15 +1585,22 @@ LLVM_Util::make_jit_execengine(std::string* err, TargetISA requestedISA,
     options.NoSignedZerosFPMath = false;
 #endif
     // We will not be setting up any exception handling for FP math
-    options.NoTrappingFPMath = true;
     // We will NOT be changing rounding mode dynamically
+#if OSL_LLVM_VERSION < 240
+    // LLVM 24 removed these TargetOptions entirely: FP contraction and
+    // rounding-mode behaviour are expressed per instruction (fast-math flags /
+    // constrained intrinsics) now, and `FloatABI` moved to the target machine.
+    options.NoTrappingFPMath = true;
     options.HonorSignDependentRoundingFPMathOption = false;
+#endif
 
     options.NoZerosInBSS          = false;
     options.GuaranteedTailCallOpt = false;
     options.FunctionSections      = true;
     options.UseInitArray          = false;
-    options.FloatABIType          = llvm::FloatABI::Default;
+#if OSL_LLVM_VERSION < 240
+    options.FloatABIType = llvm::FloatABI::Default;
+#endif
 #if OSL_LLVM_VERSION < 190
     options.RelaxELFRelocations = false;
 #endif
@@ -1829,10 +1846,12 @@ LLVM_Util::nvptx_target_machine()
     if (m_nvptx_target_machine == nullptr) {
         llvm::Triple ModuleTriple(module()->getTargetTriple());
         llvm::TargetOptions options;
+#if OSL_LLVM_VERSION < 240
         options.AllowFPOpFusion = llvm::FPOpFusion::Standard;
         // N.B. 'Standard' only allow fusion of 'blessed' ops (currently just
         // fmuladd). To truly disable FMA and never fuse FP-ops, we need to
         // instead use llvm::FPOpFusion::Strict.
+#endif
 #if OSL_LLVM_VERSION < 220
         // UnsafeFPMath was removed from TargetOptions in LLVM 22; FP math
         // control is now handled via per-instruction fast-math flags in IR.
@@ -1844,9 +1863,14 @@ LLVM_Util::nvptx_target_machine()
         options.NoInfsFPMath = 1;
         options.NoNaNsFPMath = 1;
 #endif
+#if OSL_LLVM_VERSION < 240
         options.HonorSignDependentRoundingFPMathOption = 0;
         options.FloatABIType          = llvm::FloatABI::Default;
         options.AllowFPOpFusion       = llvm::FPOpFusion::Fast;
+#endif
+        // LLVM 24 dropped HonorSignDependentRoundingFPMathOption, FloatABI and
+        // the FPOpFusion knob from TargetOptions; see the note in
+        // make_target_machine().
         options.NoZerosInBSS          = 0;
         options.GuaranteedTailCallOpt = 0;
         options.UseInitArray          = 0;
@@ -1947,7 +1971,12 @@ LLVM_Util::setup_new_optimization_passes(int optlevel, bool target_host)
     llvm::TargetMachine* target_machine = (target_host)
                                               ? execengine()->getTargetMachine()
                                               : nullptr;
+#if OSL_LLVM_VERSION >= 240
+    // LLVM 24's PassBuilder takes the LLVMContext first.
+    llvm::PassBuilder pass_builder(module()->getContext(), target_machine);
+#else
     llvm::PassBuilder pass_builder(target_machine);
+#endif
 
     if (target_host) {
         llvm::Triple ModuleTriple(module()->getTargetTriple());
@@ -4070,7 +4099,13 @@ LLVM_Util::op_alloca(llvm::Type* llvmtype, int n, const std::string& name,
     if (align > 0) {
         allocainst->setAlignment(llvm::Align(align));
     }
+#if OSL_LLVM_VERSION >= 240
+    // LLVM 24's InsertPoint is just a BasicBlock::iterator, with no isSet()
+    // predicate; a default-constructed iterator is the "unset" state.
+    OSL_ASSERT(previousIP != llvm::BasicBlock::iterator());
+#else
     OSL_ASSERT(previousIP.isSet());
+#endif
     m_builder->restoreIP(previousIP);
 
     return allocainst;

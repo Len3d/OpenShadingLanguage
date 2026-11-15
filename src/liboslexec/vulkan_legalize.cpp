@@ -340,7 +340,13 @@ llvm::Function* Retyper::intrinsicFor(llvm::IntrinsicInst* II,
     }
     case llvm::Intrinsic::lifetime_start:
     case llvm::Intrinsic::lifetime_end:
+#if OSL_LLVM_VERSION >= 240
+        // LLVM 24 removed the size argument: llvm.lifetime.start/end take the
+        // pointer alone and are overloaded on the pointer type.
+        overloads.push_back(mapType(args[0]->getType()));
+#else
         overloads.push_back(mapType(args[1]->getType()));
+#endif
         break;
     default:
         // Any other intrinsic is left alone.  Two reasons:
@@ -354,7 +360,14 @@ llvm::Function* Retyper::intrinsicFor(llvm::IntrinsicInst* II,
         //    llvm.smax.i32 inside the closure allocator).
         return II->getCalledFunction();
     }
+#if OSL_LLVM_VERSION >= 240
+    // LLVM 24 dropped getDeclaration(); getOrInsertDeclaration() behaves the
+    // same for an already-declared intrinsic.
+    return llvm::Intrinsic::getOrInsertDeclaration(&M, II->getIntrinsicID(),
+                                                   overloads);
+#else
     return llvm::Intrinsic::getDeclaration(&M, II->getIntrinsicID(), overloads);
+#endif
 }
 
 // Byte offsets into ShadeBlock that the Vulkan runtime addresses by *offset*
@@ -484,6 +497,12 @@ llvm::Value* Retyper::recreate(llvm::Instruction& I, llvm::IRBuilder<>& B,
     }
     case Instruction::AddrSpaceCast:
     case Instruction::PtrToInt:
+#if OSL_LLVM_VERSION >= 240
+    // LLVM 24 added `ptrtoaddr`: the address of a pointer as an integer, with
+    // provenance preserved.  Device pointers are plain offsets in the Vulkan
+    // model, so a ptrtoint is the correct lowering here.
+    case Instruction::PtrToAddr:
+#endif
     case Instruction::IntToPtr:
     case Instruction::Trunc:
     case Instruction::ZExt:
@@ -535,6 +554,19 @@ llvm::Value* Retyper::recreate(llvm::Instruction& I, llvm::IRBuilder<>& B,
         m_phis.emplace_back(&cast<PHINode>(I), NP);
         return NP;
     }
+#if OSL_LLVM_VERSION >= 240
+    // LLVM 24 split BranchInst into UncondBrInst / CondBrInst.
+    case Instruction::UncondBr: {
+        auto& BR = cast<UncondBrInst>(I);
+        return B.CreateBr(cast<BasicBlock>(mapValue(BR.getSuccessor(0))));
+    }
+    case Instruction::CondBr: {
+        auto& BR = cast<CondBrInst>(I);
+        BasicBlock* T = cast<BasicBlock>(mapValue(BR.getSuccessor(0)));
+        BasicBlock* F = cast<BasicBlock>(mapValue(BR.getSuccessor(1)));
+        return B.CreateCondBr(arg(0), T, F);
+    }
+#else
     case Instruction::Br: {
         auto& BR = cast<BranchInst>(I);
         BasicBlock* T = cast<BasicBlock>(mapValue(BR.getSuccessor(0)));
@@ -543,6 +575,7 @@ llvm::Value* Retyper::recreate(llvm::Instruction& I, llvm::IRBuilder<>& B,
         BasicBlock* F = cast<BasicBlock>(mapValue(BR.getSuccessor(1)));
         return B.CreateCondBr(arg(0), T, F);
     }
+#endif
     case Instruction::Switch: {
         auto& SW = cast<SwitchInst>(I);
         BasicBlock* Def = cast<BasicBlock>(mapValue(SW.getDefaultDest()));
@@ -642,6 +675,20 @@ bool Retyper::rebuildBody(llvm::Function* oldfn, llvm::Function* newfn,
             fprintf(stderr, "\n");
         }
         BasicBlock* NB = cast<BasicBlock>(mapValue(I->getParent()));
+#if OSL_LLVM_VERSION >= 240
+        // LLVM 24 verifies llvm.lifetime.start/end against the argument being
+        // an alloca, and every alloca has become an arena_alloc() call by now,
+        // so these calls are unconditionally invalid.  They say nothing about
+        // the arena storage anyway -- drop them.
+        if (auto* II = dyn_cast<IntrinsicInst>(I)) {
+            auto id = II->getIntrinsicID();
+            if (id == llvm::Intrinsic::lifetime_start
+                || id == llvm::Intrinsic::lifetime_end) {
+                g_dropped.insert("lifetime intrinsic");
+                continue;
+            }
+        }
+#endif
         IRBuilder<> B(NB);
         Value* NV = recreate(*I, B, log);
         if (!NV)
@@ -879,7 +926,12 @@ void vulkan_set_module_target (llvm::Module& M)
     // A module from the CPU JIT has no target information at all; clspv
     // overrides the triple but keeps whatever data layout is present, and
     // prefers a spirv64 one.
+#if OSL_LLVM_VERSION < 210
     M.setTargetTriple("spirv64-unknown-vulkan");
+#else
+    // LLVM 21+ takes a Triple rather than a string.
+    M.setTargetTriple(llvm::Triple("spirv64-unknown-vulkan"));
+#endif
     M.setDataLayout(kSpirv64DataLayout);
 }
 
@@ -956,7 +1008,7 @@ bool vulkan_link_shadeops (llvm::Module& M, std::string& out_log)
         fprintf(stderr,
                 "[vulkan-link] group module: as0=%d as4=%d dl='%s' triple='%s'\n",
                 g0, g4, M.getDataLayoutStr().c_str(),
-                M.getTargetTriple().c_str());
+                M.getTargetTriple().str().c_str());
     }
 
     // The group module carries `declare` for each shadeop; linking the

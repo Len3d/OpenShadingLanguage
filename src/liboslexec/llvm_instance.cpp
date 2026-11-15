@@ -2622,8 +2622,13 @@ BackendLLVM::run()
                         fprintf(stderr,
                                 "[vulkan] skipping clspv lowering of group '%s'\n",
                                 group().name().c_str());
-                } else if (!pvt::clspv_compile(ir_text, "-x ir --arch=spirv64", spirv,
-                                       vk_log)) {
+                // --spv-version=1.4: the legalised module compares pointers
+                // (closure roots, arena cursors) against null, and clspv only
+                // accepts that from SPIR-V 1.4 on.  The batch path in
+                // testrender uses the same version.
+                } else if (!pvt::clspv_compile(ir_text,
+                                               "-x ir --arch=spirv64 --spv-version=1.4",
+                                               spirv, vk_log)) {
                     shadingsys().errorfmt("clspv failed for group '{}': {}",
                                           group().name(), vk_log);
                 } else {

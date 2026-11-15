@@ -20,6 +20,15 @@
 
 OSL_NAMESPACE_BEGIN
 
+// LLVM 24 moved the CRTP mix-in into llvm::detail and split the public names
+// into Required/OptionalPassInfoMixin.  "Optional" is exactly the old
+// PassInfoMixin behaviour: the pass is skipped for optnone functions.
+#if OSL_LLVM_VERSION >= 240
+#    define OSL_PASS_INFO_MIXIN llvm::OptionalPassInfoMixin
+#else
+#    define OSL_PASS_INFO_MIXIN llvm::PassInfoMixin
+#endif
+
 namespace pvt {
 
 namespace {
@@ -380,7 +389,7 @@ public:
 // New pass manager adapter
 template<int WidthT>
 class NewPreventBitMasksFromBeingLiveinsToBasicBlocks final
-    : public llvm::PassInfoMixin<
+    : public OSL_PASS_INFO_MIXIN<
           NewPreventBitMasksFromBeingLiveinsToBasicBlocks<WidthT>> {
     PreventBitMasksFromBeingLiveinsToBasicBlocks<WidthT> m_pass;
 

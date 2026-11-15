@@ -676,56 +676,43 @@ if (partio_FOUND)
 endif ()
 
 # Optional: clspv is the lowering engine for the Vulkan-flavor SPIR-V backend.
-# clspv keeps its own LLVM (24.x) inside clspv_core.dll, so linking it does not
-# conflict with the LLVM used for the CPU JIT.
+#
+# clspv is linked *statically*, and it is built against the same LLVM 24
+# install that OSL itself links.  That is the point of the arrangement: the
+# process ends up with exactly one copy of LLVM instead of two (previously
+# clspv's own LLVM lived inside clspv_core.dll).  CLSPV_ROOT must therefore
+# point at a directory laid out as
+#   <CLSPV_ROOT>/include/clspv/Compiler.h
+#   <CLSPV_ROOT>/lib/clspv_core.lib
+#   <CLSPV_ROOT>/lib/SPIRV-Tools.lib
 set (CLSPV_ROOT "" CACHE PATH
-     "Root of a clspv build tree (containing src/clspv/include and build/lib/Release)")
-if (CLSPV_ROOT AND EXISTS "${CLSPV_ROOT}/src/clspv/include/clspv/Compiler.h")
-    message (STATUS "clspv found at ${CLSPV_ROOT}: Vulkan SPIR-V backend enabled")
+     "Directory holding include/clspv and the static clspv_core.lib/SPIRV-Tools.lib")
+set (CLSPV_LLVM_LIB_DIR "" CACHE PATH "Directory holding the LLVM/clang static libs clspv_core.lib was built against; empty means derive it from LLVM_DIR")
+if (CLSPV_ROOT AND EXISTS "${CLSPV_ROOT}/include/clspv/Compiler.h"
+        AND EXISTS "${CLSPV_ROOT}/lib/clspv_core.lib")
+    message (STATUS "clspv found at ${CLSPV_ROOT}: Vulkan SPIR-V backend enabled (static)")
     target_sources (${local_lib} PRIVATE clspv_util.cpp)
-    target_include_directories (${local_lib} PRIVATE "${CLSPV_ROOT}/src/clspv/include")
-    set (CLSPV_CORE_LIB "${CLSPV_ROOT}/build/lib/Release/clspv_core.lib")
-    if (NOT EXISTS "${CLSPV_CORE_LIB}")
-        # build tree may place the import lib elsewhere
-        file (GLOB_RECURSE CLSPV_CORE_LIB2 "${CLSPV_ROOT}/build/*/clspv_core.lib")
-        list (GET CLSPV_CORE_LIB2 0 CLSPV_CORE_LIB)
-    endif ()
+    target_include_directories (${local_lib} PRIVATE "${CLSPV_ROOT}/include")
 
-    # clspv_core.lib in the clspv build tree is the *static* library that the
-    # DLL itself was built from: it contains clspv's own objects, compiled
-    # against clspv's bundled LLVM.  Linking that into oslexec collides with
-    # the LLVM that OSL JITs with (duplicate definitions and unresolved
-    # symbols with the other LLVM's ABI).  clspv_core.dll exports only the two
-    # C API entry points, so the link must go through an import library
-    # generated from that DLL.  Regenerate it with:
-    #   lib /def:clspv_core_import.def /machine:x64 /out:clspv_core_import.lib
-    # where the .def lists clspvCompileFromSourcesString and
-    # clspvFreeOutputBuildObjs.
-    set (CLSPV_IMPORT_LIB "${CLSPV_ROOT}/build/lib/Release/clspv_core_import.lib")
-    if (NOT EXISTS "${CLSPV_IMPORT_LIB}")
-        message (WARNING
-            "clspv_core_import.lib not found next to clspv_core.dll; falling back to "
-            "the static clspv_core.lib, which cannot be linked together with OSL's LLVM")
-        set (CLSPV_IMPORT_LIB "${CLSPV_CORE_LIB}")
+    if (NOT CLSPV_LLVM_LIB_DIR)
+        get_filename_component (CLSPV_LLVM_LIB_DIR "${LLVM_DIR}/../.." ABSOLUTE)
     endif ()
+    # clspv_core.lib calls into clang's frontend/parser, so those objects have
+    # to be present too.  They are static libs in the same LLVM install.
+    file (GLOB _clspv_clang_libs "${CLSPV_LLVM_LIB_DIR}/clang*.lib")
+    if (NOT _clspv_clang_libs)
+        message (WARNING "No clang*.lib found in ${CLSPV_LLVM_LIB_DIR}; "
+                         "clspv_core.lib will not link")
+    endif ()
+    message (STATUS "clspv: ${CLSPV_LLVM_LIB_DIR} -> "
+                    "${CMAKE_MATCH_COUNT} clang libs")
 
-    target_link_libraries (${local_lib} PRIVATE "${CLSPV_IMPORT_LIB}")
+    target_link_libraries (${local_lib} PRIVATE
+        "${CLSPV_ROOT}/lib/clspv_core.lib"
+        "${CLSPV_ROOT}/lib/SPIRV-Tools.lib"
+        ${_clspv_clang_libs}
+        ${LLVM_LIBRARIES})
     target_compile_definitions (${local_lib} PRIVATE OSL_USE_CLSPV=1)
-    if (MSVC)
-        # Only pull clspv_core.dll in when the SPIR-V backend is actually used,
-        # so the CPU JIT path keeps working on machines without that DLL.
-        # target_link_options puts this on the linker command line as
-        # /DELAYLOAD; the LINK_FLAGS property was silently ignored by the VS
-        # generator, which turned the DLL into a hard startup dependency.
-        target_link_libraries (${local_lib} PRIVATE delayimp)
-        target_link_options (${local_lib} PRIVATE "/DELAYLOAD:clspv_core.dll")
-    endif ()
-    add_custom_command (TARGET ${local_lib} POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${CLSPV_ROOT}/build/lib/Release/clspv_core.dll"
-                $<TARGET_FILE_DIR:${local_lib}>
-        COMMENT "Copying clspv_core.dll next to oslexec")
-
     # Unit test for the lowering path (no gtest dependency). clspv_util.cpp is
     # compiled into the test directly because pvt functions are not exported
     # from the oslexec DLL.
@@ -733,15 +720,17 @@ if (CLSPV_ROOT AND EXISTS "${CLSPV_ROOT}/src/clspv/include/clspv/Compiler.h")
     target_include_directories (clspv_compile_test PRIVATE
                                 "${CMAKE_CURRENT_SOURCE_DIR}"
                                 "${CMAKE_SOURCE_DIR}/src/include"
-                                "${CLSPV_ROOT}/src/clspv/include"
+                                "${CLSPV_ROOT}/include"
                                 ${OpenImageIO_INCLUDES})
-    target_link_libraries (clspv_compile_test PRIVATE "${CLSPV_IMPORT_LIB}"
+    target_link_libraries (clspv_compile_test PRIVATE
+                             "${CLSPV_ROOT}/lib/clspv_core.lib"
+                             "${CLSPV_ROOT}/lib/SPIRV-Tools.lib"
+                             ${_clspv_clang_libs}
+                             ${LLVM_LIBRARIES}
+                             # LLVM 24's Support library imports these directly.
+                             ntdll
                              OpenImageIO::OpenImageIO ${CMAKE_DL_LIBS})
     target_compile_definitions (clspv_compile_test PRIVATE OSL_USE_CLSPV=1)
-    add_custom_command (TARGET clspv_compile_test POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${CLSPV_ROOT}/build/lib/Release/clspv_core.dll"
-                $<TARGET_FILE_DIR:clspv_compile_test>)
     set_target_properties (clspv_compile_test PROPERTIES FOLDER "Unit Tests")
 endif ()
 
@@ -824,6 +813,13 @@ endif ()
 # consumable by `clspv -x ir`).  Needs only LLVM, not clspv, so it builds even
 # when the SPIR-V backend is disabled.
 add_executable (vulkan_legalize_test vulkan_legalize_test.cpp vulkan_legalize.cpp)
+# vulkan_legalize.cpp links the embedded device shadeops module, which lives in
+# the generated .bc.cpp inside liboslexec.  Pull it in here as well when it
+# was generated (it is only there when a device clang was configured).
+if (VULKAN_SHADEOPS_CLANG)
+    target_sources (vulkan_legalize_test PRIVATE
+                    ${CMAKE_CURRENT_BINARY_DIR}/vulkan_shadeops.bc.cpp)
+endif ()
 target_include_directories (vulkan_legalize_test PRIVATE
                             "${CMAKE_CURRENT_SOURCE_DIR}"
                             "${CMAKE_SOURCE_DIR}/src/include"

@@ -60,8 +60,14 @@ checked_find_package (pugixml REQUIRED
 
 # LLVM library setup
 checked_find_package (LLVM REQUIRED
-                      VERSION_MIN 14.0
-                      VERSION_MAX 23.9
+                      # LOCAL DEVIATION: 24 is the LLVM that clspv is built
+                      # against, and we link clspv statically so that one
+                      # LLVM serves both the CPU JIT and the SPIR-V path.
+                      # The range must stay in one major version: LLVM's
+                      # LLVMConfigVersion.cmake only declares itself compatible
+                      # when the requested major.minor matches exactly.
+                      VERSION_MIN 24.0
+                      VERSION_MAX 24.9
                       PRINT LLVM_SYSTEM_LIBRARIES CLANG_LIBRARIES
                             LLVM_SHARED_MODE)
 # ensure include directory is added (in case of non-standard locations
