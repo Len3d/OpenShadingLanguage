@@ -2421,6 +2421,54 @@ LLVM_Util::do_optimize(std::string* out_err)
 
 
 
+// LOCAL DEVIATION (2026-11-16): the runtime bitcode that gets read into
+// a shader group (llvm_ops / rs_free_functions, built by clang, and the
+// rend_lib / shadeops modules for the OptiX device path) carries its own
+// "Debug Info Version" module flag.  llvm-link does not deduplicate module
+// flags, so the assembled module can carry two of them, and the LLVM verifier
+// rejects that outright:
+//     module flag identifiers must be unique (or of 'require' type)
+//     !"Debug Info Version"
+// ("LLVM ERROR: Broken module found, compilation aborted"), which kills
+// testrender even on the plain CPU path.
+//
+// Duplicates are legal only if every copy is of the 'require' behavior (and
+// that form additionally expects a metadata-pair value), which is not what
+// clang emits, so collapse the copies down to the first one, untouched.  Dropping
+// the flag entirely would make LLVM complain about debug info with version 0.
+static void
+strip_debug_info_version_flag(llvm::Module& M)
+{
+    llvm::NamedMDNode* flags = M.getNamedMetadata("llvm.module.flags");
+    if (!flags)
+        return;
+    std::vector<llvm::MDNode*> keep;
+    keep.reserve(flags->getNumOperands());
+    unsigned occurrences = 0;
+    for (unsigned i = 0; i < flags->getNumOperands(); ++i) {
+        llvm::MDNode* entry = flags->getOperand(i);
+        if (entry && entry->getNumOperands() >= 3) {
+            if (auto* s = llvm::dyn_cast<llvm::MDString>(
+                    entry->getOperand(1).get())) {
+                if (s->getString() == "Debug Info Version") {
+                    ++occurrences;
+                    if (occurrences > 1)
+                        continue;  // keep only the first copy
+                }
+            }
+        }
+        keep.push_back(entry);
+    }
+    if (occurrences <= 1)
+        return;  // already unique
+    M.eraseNamedMetadata(flags);
+    llvm::NamedMDNode* rebuilt = M.getOrInsertNamedMetadata(
+        "llvm.module.flags");
+    for (llvm::MDNode* entry : keep)
+        rebuilt->addOperand(entry);
+}
+
+
 // llvm::Value::getNumUses requires that the entire module be materialized
 // which defeats the purpose of the materialize & prune unneeded below we
 // need to avoid getNumUses and use the materialized_* iterators to count
@@ -2449,6 +2497,14 @@ LLVM_Util::prune_and_internalize_module(
     std::unordered_set<llvm::Function*> external_functions,
     Linkage default_linkage, std::string* out_err)
 {
+    // The base module for a shader group is assembled from clang-generated
+    // bitcode (llvm_ops, llvm_rs_dependent_ops) that may itself carry more than
+    // one "Debug Info Version" module flag -- llvm-link does not deduplicate
+    // them, and the LLVM verifier then aborts the whole group compile with
+    // "module flag identifiers must be unique (or of 'require' type)".  Drop
+    // all of them before verifying/optimizing; nothing here consumes debug
+    // info (shaders are JIT compiled without -g).
+    strip_debug_info_version_flag(*m_llvm_module);
 // WIP:  Investigating stripping global constructors and destructors
 // Avoid calling global variable constructors
 // as it is generally creates order of execution issues
@@ -6478,11 +6534,13 @@ LLVM_Util::write_bitcode_file(const char* filename, std::string* err)
     }
 }
 
+
 bool
 LLVM_Util::absorb_module(
     std::unique_ptr<llvm::Module>
         other_module_ptr /*We claim ownership of this module */)
 {
+    strip_debug_info_version_flag(*other_module_ptr);
     bool failed = llvm::Linker::linkModules(*module(),
                                             std::move(other_module_ptr));
     return !failed;
