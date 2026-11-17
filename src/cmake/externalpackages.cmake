@@ -47,11 +47,12 @@ set (OSL_USING_IMATH 3)
 
 
 # OpenImageIO
-# LOCAL DEVIATION: this machine only has OpenImageIO 2.5.18 prebuilt, while
-# upstream 1.16 asks for >= 3.0.  Lowered to 2.5 so the Vulkan port can be
-# built and tested here; revisit if OIIO 3.x is installed.
+# LOCAL DEVIATION (2026-11-16): was temporarily lowered to 2.5 while only
+# OpenImageIO 2.5.18 was available prebuilt.  A 3.0.21 install (static /MT,
+# built against OpenColorIO 2.4.2) and a 3.3 dev build are available now, so
+# this is back to upstream's >= 3.0 requirement.
 checked_find_package (OpenImageIO REQUIRED
-                      VERSION_MIN 2.5
+                      VERSION_MIN 3.0
                       DEFINITIONS OIIO_HIDE_FORMAT=1)
 
 checked_find_package (pugixml REQUIRED
@@ -266,3 +267,21 @@ macro (find_or_download_robin_map)
 endmacro()
 
 find_or_download_robin_map ()
+
+# LOCAL DEVIATION (2026-11-16): OpenImageIO 3.3's exported targets list
+# \$<LINK_ONLY:tsl::robin_map> in their INTERFACE_LINK_LIBRARIES, and the package
+# that actually defines that imported target is named "tsl-robin-map" -- a name
+# find_package(Robinmap) above never looks for (OSL's own FindRobinmap only fills
+# in ROBINMAP_INCLUDE_DIR). Without a real target, CMake aborts at generate time
+# with: "The link interface of target OpenImageIO::OpenImageIO contains
+# tsl::robin_map but the target was not found." Provide the target, either from
+# the installed package config or as an interface target over the headers we
+# already located.
+if (NOT TARGET tsl::robin_map)
+    find_package (tsl-robin-map QUIET)
+endif ()
+if (NOT TARGET tsl::robin_map AND ROBINMAP_INCLUDE_DIR)
+    add_library (tsl::robin_map INTERFACE IMPORTED)
+    set_target_properties (tsl::robin_map PROPERTIES
+                           INTERFACE_INCLUDE_DIRECTORIES "${ROBINMAP_INCLUDE_DIR}")
+endif ()
