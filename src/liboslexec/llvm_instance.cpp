@@ -26,6 +26,7 @@
 #if OSL_USE_CLSPV
 #    include "clspv_util.h"
 #    include "vulkan_legalize.h"
+#    include "vulkan_spirv_llvm.h"
 
 #    include <llvm/IR/Module.h>
 #    include <llvm/Support/raw_ostream.h>
@@ -2626,11 +2627,16 @@ BackendLLVM::run()
                 // (closure roots, arena cursors) against null, and clspv only
                 // accepts that from SPIR-V 1.4 on.  The batch path in
                 // testrender uses the same version.
-                } else if (!pvt::clspv_compile(ir_text,
-                                               "-x ir --arch=spirv64 --spv-version=1.4",
-                                               spirv, vk_log)) {
-                    shadingsys().errorfmt("clspv failed for group '{}': {}",
-                                          group().name(), vk_log);
+                } else if (getenv("OSL_VULKAN_LLVM_SPIRV")
+                               ? !pvt::vulkan_compile_ir_via_llvm_vulkan(
+                                     ir_text, spirv, vk_log)
+                               : !pvt::clspv_compile(
+                                     ir_text,
+                                     "-x ir --arch=spirv64 --spv-version=1.4",
+                                     spirv, vk_log)) {
+                    shadingsys().errorfmt(
+                        "Vulkan SPIR-V codegen failed for group '{}': {}",
+                        group().name(), vk_log);
                 } else {
                     group().m_vulkan_spirv       = spirv;
                     group().m_vulkan_entry_point = entry;

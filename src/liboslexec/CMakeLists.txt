@@ -749,7 +749,7 @@ if (MSVC)
     target_link_libraries (${local_lib} PRIVATE "Version.lib")
 endif()
 
-target_sources (${local_lib} PRIVATE vulkan_legalize.cpp vulkan_abi_check.cpp vulkan_module.cpp)
+target_sources (${local_lib} PRIVATE vulkan_legalize.cpp vulkan_abi_check.cpp vulkan_module.cpp vulkan_spirv_llvm.cpp)
 
 target_link_libraries (${local_lib}
     PUBLIC

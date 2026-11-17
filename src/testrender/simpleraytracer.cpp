@@ -31,6 +31,7 @@ namespace pugi = OIIO::pugi;
 #    include "vulkan_types.h"
 #    include "vulkan_module.h"
 #    include "clspv_util.h"
+#    include "vulkan_spirv_llvm.h"
 #endif
 #include <algorithm>
 
@@ -1410,9 +1411,16 @@ SimpleRaytracer::init_vulkan_shading()
             }
         }
         std::vector<uint32_t> spirv;
-        if (!OSL::pvt::clspv_compile(mod_ir, "-x ir --arch=spirv64 --spv-version=1.4", spirv,
-                                     log)) {
-            fprintf(stderr, "[vulkan] batch clspv failed: %s\n", log.c_str());
+        bool codegen_ok = getenv("OSL_VULKAN_LLVM_SPIRV")
+                              ? OSL::pvt::vulkan_compile_ir_via_llvm_vulkan(
+                                    mod_ir, spirv, log)
+                              : OSL::pvt::clspv_compile(
+                                    mod_ir,
+                                    "-x ir --arch=spirv64 --spv-version=1.4",
+                                    spirv, log);
+        if (!codegen_ok) {
+            fprintf(stderr, "[vulkan] batch SPIR-V codegen failed: %s\n",
+                    log.c_str());
             return;
         }
         fprintf(stderr, "[vulkan] batch SPIR-V: %zu words\n", spirv.size());
