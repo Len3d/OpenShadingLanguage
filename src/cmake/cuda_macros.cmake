@@ -57,6 +57,13 @@ function ( NVCC_COMPILE cuda_src extra_headers ptx_generated extra_nvcc_args ext
             ${ALL_OpenImageIO_INCLUDES}
             ${ALL_IMATH_INCLUDES}
             -DFMT_DEPRECATED=
+            # LOCAL DEVIATION (2026-11-16): OIIO 3.3 vendors fmt 12, whose
+            # base.h static_asserts that the translation unit was compiled with
+            # /utf-8 whenever FMT_UNICODE is on.  nvcc and clang-cuda do not offer
+            # a code-page-independent literal encoding here, so the device passes
+            # (which only see OIIO headers transitively) opt out of fmt's Unicode
+            # support instead.  Nothing formatted on the GPU needs it.
+            -DFMT_UNICODE=0
             ${LLVM_COMPILE_FLAGS}
             -DOSL_USE_FAST_MATH=1
             -m64 -arch ${CUDA_TARGET_ARCH} -ptx
@@ -196,6 +203,7 @@ function ( MAKE_CUDA_BITCODE src suffix generated_bc extra_clang_args )
             ${ALL_OPENEXR_INCLUDES}
             ${LLVM_COMPILE_FLAGS} ${OSL_CUDA_LIB_FLAGS} ${CLANG_MSVC_FIX} ${CUDA_TEXREF_FIX}
             -D__CUDACC__ -DOSL_COMPILING_TO_BITCODE=1 -DNDEBUG -DOIIO_NO_SSE -D__CUDADEVRT_INTERNAL__
+            -DFMT_UNICODE=0
             --language=cuda --cuda-device-only --cuda-gpu-arch=${CUDA_TARGET_ARCH}
             -Wno-deprecated-register -Wno-format-security
             -fno-math-errno -ffast-math ${CUDA_OPT_FLAG_CLANG} ${CLANG_FTZ_FLAG} -S -emit-llvm ${extra_clang_args}
