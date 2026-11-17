@@ -21,11 +21,18 @@ namespace pugi = OIIO::pugi;
 
 #include <cmath>
 
-#include "vulkan_shading.h"
-#include "vulkan_types.h"
+// The host-side Vulkan compute backend lives in liboslexec and pulls in LLVM,
+// std::string, <OSL/oslconfig.h> -- none of which can be compiled for the CUDA
+// device pass.  __CUDACC__ builds of this file (cuda/optix_raytracer.cu includes
+// it) skip the Vulkan headers entirely; all Vulkan code below sits inside
+// #ifndef __CUDACC__ anyway.
+#ifndef __CUDACC__
+#    include "vulkan_shading.h"
+#    include "vulkan_types.h"
+#    include "vulkan_module.h"
+#    include "clspv_util.h"
+#endif
 #include <algorithm>
-#include "vulkan_module.h"
-#include "clspv_util.h"
 
 // Create ustrings for all strings used by the free function renderer services.
 // Required to allow the reverse mapping of hash->string to work when processing messages
