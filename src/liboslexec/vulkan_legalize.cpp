@@ -597,6 +597,23 @@ llvm::Value* Retyper::recreate(llvm::Instruction& I, llvm::IRBuilder<>& B,
         auto& EI = cast<ExtractValueInst>(I);
         return B.CreateExtractValue(arg(0), EI.getIndices(), EI.getName());
     }
+    case Instruction::ExtractElement: {
+        // Vectors indexed at a constant (a `<3 x float>` swizzle such as the
+        // color components ward.osl pulls out) arrive as extractelement, which
+        // clspv accepts as long as the index is an i32.  Keep the index operand
+        // mapped like every other argument.
+        auto& EE = cast<ExtractElementInst>(I);
+        return B.CreateExtractElement(arg(0), arg(1), EE.getName());
+    }
+    case Instruction::InsertElement: {
+        auto& IE = cast<InsertElementInst>(I);
+        return B.CreateInsertElement(arg(0), arg(1), arg(2), IE.getName());
+    }
+    case Instruction::ShuffleVector: {
+        auto& SV = cast<ShuffleVectorInst>(I);
+        return B.CreateShuffleVector(arg(0), arg(1), SV.getShuffleMask(),
+                                     SV.getName());
+    }
     case Instruction::InsertValue: {
         auto& II = cast<InsertValueInst>(I);
         return B.CreateInsertValue(arg(0), arg(1), II.getIndices(),
