@@ -734,6 +734,63 @@ if (CLSPV_ROOT AND EXISTS "${CLSPV_ROOT}/include/clspv/Compiler.h"
     set_target_properties (clspv_compile_test PROPERTIES FOLDER "Unit Tests")
 endif ()
 
+# Optional: the SPIR-V linker (SPIRV-Tools' `spv::Link`).
+#
+# Once the materials are emitted by LLVM's SPIR-V backend and the render kernel
+# keeps going through clspv, the two halves are separate modules and SPIR-V has
+# no cross-module calls, so they have to be merged before the driver sees them.
+# SPIRV_TOOLS_LINK_ROOT must point at a directory laid out as
+#   <SPIRV_TOOLS_LINK_ROOT>/include/spirv-tools/linker.hpp
+#   <SPIRV_TOOLS_LINK_ROOT>/lib/SPIRV-Tools-link.lib
+#   <SPIRV_TOOLS_LINK_ROOT>/lib/SPIRV-Tools-opt.lib
+# The libraries have to be built with the same MSVC runtime as this tree
+# (/MT here), otherwise the link fails with LNK2038.
+set (SPIRV_TOOLS_LINK_ROOT "" CACHE PATH
+     "Directory holding include/spirv-tools/linker.hpp and the static SPIRV-Tools-link/opt libs")
+if (SPIRV_TOOLS_LINK_ROOT
+        AND EXISTS "${SPIRV_TOOLS_LINK_ROOT}/include/spirv-tools/linker.hpp"
+        AND EXISTS "${SPIRV_TOOLS_LINK_ROOT}/lib/SPIRV-Tools-link.lib")
+    message (STATUS "SPIRV-Tools linker found at ${SPIRV_TOOLS_LINK_ROOT}: material/kernel module linking enabled")
+    target_sources (${local_lib} PRIVATE vulkan_spirv_link.cpp)
+    target_include_directories (${local_lib} PRIVATE "${SPIRV_TOOLS_LINK_ROOT}/include")
+    # SPIRV-Tools-link needs the optimizer's IR (it links PUBLIC SPIRV-Tools-opt),
+    # and both sit on top of the SPIRV-Tools core the clspv block already links.
+    target_link_libraries (${local_lib} PRIVATE
+        "${SPIRV_TOOLS_LINK_ROOT}/lib/SPIRV-Tools-link.lib"
+        "${SPIRV_TOOLS_LINK_ROOT}/lib/SPIRV-Tools-opt.lib")
+    target_compile_definitions (${local_lib} PRIVATE OSL_USE_SPIRV_LINK=1)
+
+    # Unit test for the linking path, same shape as clspv_compile_test: no
+    # gtest, the pvt helper is compiled in directly.
+    add_executable (spirv_link_test spirv_link_test.cpp vulkan_spirv_link.cpp)
+    target_include_directories (spirv_link_test PRIVATE
+                                "${CMAKE_CURRENT_SOURCE_DIR}"
+                                "${CMAKE_SOURCE_DIR}/src/include"
+                                "${SPIRV_TOOLS_LINK_ROOT}/include"
+                                ${OpenImageIO_INCLUDES})
+    target_link_libraries (spirv_link_test PRIVATE
+        "${SPIRV_TOOLS_LINK_ROOT}/lib/SPIRV-Tools-link.lib"
+        "${SPIRV_TOOLS_LINK_ROOT}/lib/SPIRV-Tools-opt.lib"
+        "${SPIRV_TOOLS_LINK_ROOT}/lib/SPIRV-Tools.lib")
+    set_target_properties (spirv_link_test PROPERTIES FOLDER "Unit Tests")
+endif ()
+
+# Diagnostic for the LLVM-flavor emitter: same code path the runtime takes (the
+# Vulkan retarget, null-cast folding and arena typing all live in
+# vulkan_spirv_llvm.cpp), so what it writes is exactly what the driver would
+# have been handed.
+add_executable (vulkan_emit_test vulkan_emit_test.cpp vulkan_spirv_llvm.cpp)
+target_include_directories (vulkan_emit_test PRIVATE
+                            "${CMAKE_CURRENT_SOURCE_DIR}"
+                            "${CMAKE_SOURCE_DIR}/src/include"
+                            ${OpenImageIO_INCLUDES})
+target_link_libraries (vulkan_emit_test PRIVATE
+                         ${LLVM_LIBRARIES} ${LLVM_LDFLAGS} ${LLVM_SYSTEM_LIBRARIES}
+                         # LLVM 24's Support library imports these directly.
+                         ntdll
+                         OpenImageIO::OpenImageIO ${CMAKE_DL_LIBS})
+set_target_properties (vulkan_emit_test PROPERTIES FOLDER "Unit Tests")
+
 # Disable RTTI from just the one module where we have classes that inherit
 # from LLVM classes.
 if (MSVC)
