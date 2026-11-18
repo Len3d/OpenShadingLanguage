@@ -35,6 +35,7 @@
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
+#include <llvm/Transforms/Utils/ModuleUtils.h>
 #include <llvm/Linker/Linker.h>
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/SourceMgr.h>
@@ -46,6 +47,11 @@
 // emits them outside any namespace), hence the explicit `::` at the use site.
 extern unsigned char vulkan_render_llvm_compiled_ops_block[];
 extern int vulkan_render_llvm_compiled_ops_size;
+// Same kernel compiled with VK_GLOBAL = address_space(11) (StorageBuffer): the
+// variant the LLVM SPIR-V backend can turn into a Vulkan-legal module, since it
+// keeps no CrossWorkgroup pointers.
+extern unsigned char vulkan_render_sb_llvm_compiled_ops_block[];
+extern int vulkan_render_sb_llvm_compiled_ops_size;
 
 OSL_NAMESPACE_BEGIN
 
@@ -178,21 +184,40 @@ bool vulkan_collect_entry_names (llvm::Module& M, std::vector<std::string>& out,
 
 bool vulkan_build_render_module (const std::vector<std::string>& group_ir,
                                  const std::vector<std::vector<std::string>>& entries,
-                                 std::string& out_ir, std::string& out_log)
+                                 std::string& out_ir, std::string& out_log,
+                                 std::vector<std::string>* out_group_ir,
+                                 std::string* out_entry_ir)
 {
     if (group_ir.size() != entries.size()) {
         out_log = "group IR and entry list sizes differ";
         return false;
     }
 
+    // Split mode: the groups are compiled on their own (Vulkan flavor SPIR-V
+    // backend, where the arena views are legal) and merged with the kernel
+    // afterwards by spirv-link.  Linking them here would put the views into the
+    // module handed to clspv, which rejects the extra descriptor binding.
+    const bool split = (out_group_ir != nullptr);
+    if (split)
+        out_group_ir->clear();
+
     llvm::LLVMContext ctx;
 
     // The frame kernel: compiled at build time by the same clang that produces
     // the device runtime, so it already carries the spirv64 triple and layout.
     {
-        llvm::StringRef content(
-            reinterpret_cast<const char*>(::vulkan_render_llvm_compiled_ops_block),
-            (size_t)::vulkan_render_llvm_compiled_ops_size);
+        // Split mode compiles this half with the LLVM Vulkan flavor backend, so
+        // it needs the StorageBuffer variant of the kernel.
+        const unsigned char* block
+            = (split && ::vulkan_render_sb_llvm_compiled_ops_size > 0)
+                  ? ::vulkan_render_sb_llvm_compiled_ops_block
+                  : ::vulkan_render_llvm_compiled_ops_block;
+        const int block_size
+            = (split && ::vulkan_render_sb_llvm_compiled_ops_size > 0)
+                  ? ::vulkan_render_sb_llvm_compiled_ops_size
+                  : ::vulkan_render_llvm_compiled_ops_size;
+        llvm::StringRef content(reinterpret_cast<const char*>(block),
+                                (size_t)block_size);
         llvm::MemoryBufferRef buf(content, "vulkan_render.bc");
         llvm::Expected<std::unique_ptr<llvm::Module>> mod_or_err
             = llvm::parseBitcodeFile(buf, ctx);
@@ -221,7 +246,17 @@ bool vulkan_build_render_module (const std::vector<std::string>& group_ir,
                 = llvm::parseAssemblyString(group_ir[i], err, ctx);
             if (!g) {
                 out_log = "cannot parse group IR #" + std::to_string(i) + ": "
-                          + err.getMessage().str();
+                          + err.getMessage().str() + " (line "
+                          + std::to_string(err.getLineNo()) + " col "
+                          + std::to_string(err.getColumnNo()) + ")";
+                // Handy when the parser complains: keep the exact text so the
+                // reported line can be looked at instead of guessed at.
+                if (const char* dump = getenv("OSL_VULKAN_DUMP_BAD_IR")) {
+                    std::error_code ec;
+                    llvm::raw_fd_ostream os(dump, ec);
+                    if (!ec)
+                        os << group_ir[i];
+                }
                 return false;
             }
             g->setModuleIdentifier("osl_group_" + std::to_string(i));
@@ -239,7 +274,12 @@ bool vulkan_build_render_module (const std::vector<std::string>& group_ir,
 
             strip_alias_metadata (*g);
 
-            if (llvm::Linker::linkModules(*render, std::move(g))) {
+            if (split) {
+                // Hand this group's (prefixed) IR text to the caller untouched.
+                llvm::raw_string_ostream gos(out_group_ir->emplace_back());
+                g->print(gos, nullptr);
+                gos.flush();
+            } else if (llvm::Linker::linkModules(*render, std::move(g))) {
                 out_log = "linking group IR #" + std::to_string(i)
                           + " failed (duplicate symbol)";
                 return false;
@@ -247,14 +287,18 @@ bool vulkan_build_render_module (const std::vector<std::string>& group_ir,
         }
 
         llvm::Type* ptr1 = llvm::PointerType::get(ctx, 1);
+        // The StorageBuffer kernel variant reaches the frame buffer through
+        // address_space(11) pointers, so its `osl_vk_shade_dispatch` declaration
+        // (and every group entry) takes AS11 rather than CrossWorkgroup.
+        llvm::Type* pbuf  = split ? llvm::PointerType::get(ctx, 11) : ptr1;
         llvm::Type* i32  = llvm::Type::getInt32Ty(ctx);
         llvm::Type* vd   = llvm::Type::getVoidTy(ctx);
         llvm::Value* null1
-            = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ptr1));
+            = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(pbuf));
 
         // ---- osl_vk_shade_dispatch(ptr AS1 sg, i32 material) ----
         llvm::FunctionType* dtype
-            = llvm::FunctionType::get(vd, { ptr1, i32 }, false);
+            = llvm::FunctionType::get(vd, { pbuf, i32 }, false);
         // The render module *calls* the dispatcher, so it already carries a
         // declaration of it.  Fill that declaration in rather than adding a
         // second function: a fresh one would be renamed to
@@ -303,12 +347,40 @@ bool vulkan_build_render_module (const std::vector<std::string>& group_ir,
                 llvm::Value* gd = cb.CreateConstGEP1_32(
                     llvm::Type::getInt8Ty(ctx), dispatch->getArg(0),
                     (unsigned)osl_vk_abi::kGroupDataOffset);
+                // Offset ABI: the last slot carries the block's absolute
+                // position in the storage buffer, which the frame kernel stored
+                // at sg + kOffPool (320, see vulkan_shadeops.cpp).  Every
+                // parameter the group touches is then reached as
+                // sg_off + field offset, so no storage-buffer pointer crosses
+                // a function boundary.
+                llvm::Value* arg5 = null1;
+                if (getenv("OSL_VULKAN_ARENA_INDEX"))
+                    arg5 = cb.CreateLoad(
+                        llvm::Type::getInt64Ty(ctx),
+                        cb.CreateConstGEP1_32(llvm::Type::getInt8Ty(ctx),
+                                              dispatch->getArg(0), 320u));
                 for (auto& name : entries[i]) {
                     llvm::Function* F = render->getFunction(prefixes[i] + name);
-                    if (!F)
-                        continue;
+                    if (!F) {
+                        if (!split)
+                            continue;
+                        // Split mode: the definition lives in the group's own
+                        // SPIR-V module; spirv-link resolves the call afterwards.
+                        // The signature must match what the group entry really
+                        // is, otherwise the link fails on a type mismatch.
+                        llvm::FunctionType* fty = llvm::FunctionType::get(
+                            vd,
+                            { pbuf, pbuf, pbuf, pbuf, i32,
+                              getenv("OSL_VULKAN_ARENA_INDEX")
+                                  ? llvm::Type::getInt64Ty(ctx)
+                                  : pbuf },
+                            false);
+                        F = llvm::Function::Create(
+                            fty, llvm::GlobalValue::ExternalLinkage,
+                            prefixes[i] + name, *render);
+                    }
                     cb.CreateCall(F, { dispatch->getArg(0), gd, null1, null1,
-                                       cb.getInt32(0), null1 });
+                                       cb.getInt32(0), arg5 });
                 }
                 cb.CreateRetVoid();
             }
@@ -318,22 +390,229 @@ bool vulkan_build_render_module (const std::vector<std::string>& group_ir,
         }
 
         // ---- the compute kernel ----
-        llvm::FunctionType* ktype
-            = llvm::FunctionType::get(vd, { ptr1 }, false);
-        llvm::Function* kernel
-            = llvm::Function::Create(ktype, llvm::GlobalValue::ExternalLinkage,
-                                     "osl_kernel", *render);
-        kernel->setCallingConv(llvm::CallingConv::SPIR_KERNEL);
-        {
-            llvm::BasicBlock* bb = llvm::BasicBlock::Create(ctx, "entry", kernel);
-            llvm::IRBuilder<> b(bb);
-            llvm::Function* frame = render->getFunction("osl_vk_raytrace_frame");
-            if (!frame) {
-                out_log = "the device render module has no "
-                          "osl_vk_raytrace_frame";
-                return false;
+        //
+        // A SPIR-V compute entry point cannot take a pointer parameter: with the
+        // `Shader` capability the entry function must be void() with no
+        // arguments, and the frame buffer has to reach it as a descriptor-backed
+        // StorageBuffer variable instead (clspv did that translation itself,
+        // which is why the CrossWorkgroup form only ever worked through clspv).
+        llvm::Value* frame_base = nullptr;
+        if (split && !out_entry_ir) {
+            llvm::Type* bytes = llvm::ArrayType::get(llvm::Type::getInt8Ty(ctx),
+                                                     (uint64_t)80 << 20);
+            llvm::StructType* fbt
+                = llvm::StructType::create(ctx, { bytes }, "struct.FrameBuf");
+            // Declared, not defined: the host binds this descriptor, and spirv-link
+            // resolves the declaration against the module that has the variable.
+            llvm::GlobalVariable* gv = new llvm::GlobalVariable(
+                *render, fbt, /*isConstant=*/false,
+                llvm::GlobalValue::ExternalLinkage, /*init=*/nullptr,
+                "osl_frame_buf", /*insertBefore=*/nullptr,
+                llvm::GlobalVariable::NotThreadLocal,
+                /*AddressSpace=*/11);
+            gv->setAlignment(llvm::Align(16));
+            // GEP through the block to its first byte.  The struct index has to
+            // be an i32 constant (a struct field is not a runtime index); feeding
+            // i64 for it builds invalid IR that parses nowhere and crashes the
+            // backend without a diagnostic.
+            llvm::Constant* idx[3]
+                = { llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx), 0),
+                    llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0),
+                    llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx), 0) };
+            frame_base = llvm::ConstantExpr::getInBoundsGetElementPtr(
+                fbt, gv,
+                llvm::ArrayRef<llvm::Constant*>(idx, 3));
+
+            // The arena view itself is defined here, in the kernel module: the
+            // material modules only import it, and spirv-link resolves imports
+            // against a later module, which is exactly where this one sits.
+            llvm::Type* i32m = llvm::Type::getInt32Ty(ctx);
+            llvm::StructType* word_m
+                = llvm::StructType::create(ctx, { i32m }, "struct.ArenaWord");
+            llvm::ArrayType* words_m = llvm::ArrayType::get(word_m, 65536);
+            llvm::StructType* view_m
+                = llvm::StructType::create(ctx, { words_m },
+                                           "struct.ArenaViewI32");
+            llvm::GlobalVariable* arena_m = new llvm::GlobalVariable(
+                *render, view_m, /*isConstant=*/false,
+                llvm::GlobalValue::InternalLinkage,
+                llvm::UndefValue::get(view_m), "osl_arena_i32", nullptr,
+                llvm::GlobalVariable::NotThreadLocal, /*AddressSpace=*/11);
+            arena_m->setAlignment(llvm::Align(16));
+        }
+        llvm::Function* frame = render->getFunction("osl_vk_raytrace_frame");
+        if (!frame) {
+            out_log = "the device render module has no osl_vk_raytrace_frame";
+            return false;
+        }
+
+        llvm::Function* kernel = nullptr;   // only exists in the non-split path
+        if (split && out_entry_ir) {
+            // The entry goes into a *separate* module.  LLVM's SPIR-V
+            // structurizer fails ("No valid candidate in the queue. Is the graph
+            // reducible?") when it has to structure the whole kernel module at
+            // once, while each half on its own structures fine: the library
+            // half emits as a library (nothing to structure) and this entry
+            // half is five instructions.  spirv-link joins them afterwards.
+            llvm::Module em("osl_entry", ctx);
+            em.setTargetTriple(render->getTargetTriple());
+            em.setDataLayout(render->getDataLayout());
+
+            llvm::Type* i8t = llvm::Type::getInt8Ty(ctx);
+            llvm::Type* ptr11
+                = llvm::PointerType::get(ctx, 11);
+            llvm::Type* bytes = llvm::ArrayType::get(i8t, (uint64_t)80 << 20);
+            llvm::StructType* fbt
+                = llvm::StructType::create(ctx, { bytes }, "struct.FrameBuf");
+            // Defined here (internal linkage + zero initialiser) so the linker has
+            // an export to resolve the kernel module's import against; a second
+            // external declaration would leave "osl_frame_buf" unresolved.
+            // Defined here (internal linkage) so the linker has an export to
+            // resolve any import of it against.  `undef` rather than a zero
+            // initialiser: a global with internal linkage needs a value to be a
+            // definition, and an aggregate zero reaches SPIR-V as an
+            // OpVariable initialiser that the validator rejects ("Initializer
+            // type must match the data type").  undef means "no initialiser".
+            llvm::GlobalVariable* gv = new llvm::GlobalVariable(
+                em, fbt, /*isConstant=*/false,
+                llvm::GlobalValue::InternalLinkage,
+                llvm::UndefValue::get(fbt), "osl_frame_buf", nullptr,
+                llvm::GlobalVariable::NotThreadLocal, /*AddressSpace=*/11);
+            gv->setAlignment(llvm::Align(16));
+
+            // The arena view that the material modules and the offset runtime
+            // import.  It is defined here, next to the frame buffer, so that
+            // spirv-link has one export to resolve those imports against; with
+            // no defining module the link stops at "Unresolved external
+            // reference to osl_arena_i32".  The shape has to match what
+            // vulkan_shadeops_offset.cpp declares -- one array of 32-bit words,
+            // in which the union of an int and a float is a single 32-bit
+            // member -- because a getelementptr whose source element type
+            // disagrees with the global's real type is invalid IR.
+            llvm::Type* i32v = llvm::Type::getInt32Ty(ctx);
+            llvm::StructType* word_t
+                = llvm::StructType::create(ctx, { i32v }, "struct.ArenaWord");
+            llvm::ArrayType* words_t = llvm::ArrayType::get(word_t, 65536);
+            llvm::StructType* view_t
+                = llvm::StructType::create(ctx, { words_t },
+                                           "struct.ArenaViewI32");
+            llvm::GlobalVariable* arena_gv = new llvm::GlobalVariable(
+                em, view_t, /*isConstant=*/false,
+                llvm::GlobalValue::InternalLinkage,
+                llvm::UndefValue::get(view_t), "osl_arena_i32", nullptr,
+                llvm::GlobalVariable::NotThreadLocal, /*AddressSpace=*/11);
+            arena_gv->setAlignment(llvm::Align(16));
+            // Nothing in this module reads the view, so an internal-linkage
+            // global is dropped before codegen and the linker never sees the
+            // definition it is supposed to export: pin it with llvm.used.
+            {
+                llvm::SmallVector<llvm::GlobalValue*, 2> pinned { arena_gv };
+                llvm::appendToUsed(em, pinned);
             }
-            b.CreateCall(frame, { kernel->getArg(0) });
+
+            llvm::Function* fidx = llvm::Function::Create(
+                llvm::FunctionType::get(
+                    vd, { ptr11, llvm::Type::getInt64Ty(ctx) }, false),
+                llvm::GlobalValue::ExternalLinkage, "osl_vk_raytrace_frame", em);
+
+            // The kernel library reaches the invocation index through the
+            // mangled OpenCL builtin name.  clspv turned that into
+            // gl_GlobalInvocationID; the LLVM backend treats it as an ordinary
+            // external, so the definition has to exist here -- and only here,
+            // because a builtin belongs to the module that owns the entry point.
+            llvm::Type* i32t = llvm::Type::getInt32Ty(ctx);
+            llvm::ArrayType* id3 = llvm::ArrayType::get(i32t, 3);
+            llvm::GlobalVariable* gidvar = new llvm::GlobalVariable(
+                em, id3, /*isConstant=*/false,
+                llvm::GlobalValue::InternalLinkage,
+                llvm::ConstantAggregateZero::get(id3), "gl_GlobalInvocationID",
+                nullptr, llvm::GlobalVariable::NotThreadLocal,
+                /*AddressSpace=*/7 /* SPIR-V Input */);
+            {
+                // Decoration BuiltIn (11), builtin GlobalInvocationId (28).
+                // !spirv.Decorations is a list of decoration nodes, so the
+                // {kind, operand} pair has to be wrapped one level deeper --
+                // attaching the pair itself is rejected as "Invalid decoration".
+                llvm::Metadata* ops[2] = {
+                    llvm::ConstantAsMetadata::get(
+                        llvm::ConstantInt::get(i32t, 11)),
+                    llvm::ConstantAsMetadata::get(
+                        llvm::ConstantInt::get(i32t, 28))
+                };
+                llvm::Metadata* list[1] = { llvm::MDNode::get(ctx, ops) };
+                gidvar->setMetadata("spirv.Decorations",
+                                    llvm::MDNode::get(ctx, list));
+            }
+            // NOTE: no `_Z13get_global_idj` definition here.  The kernel library
+            // takes the index as an argument precisely so that it imports nothing
+            // from this module; otherwise the two modules would import each
+            // other's exports and spirv-link could not resolve them in one pass.
+
+            llvm::Function* k = llvm::Function::Create(
+                llvm::FunctionType::get(vd, {}, false),
+                llvm::GlobalValue::ExternalLinkage, "osl_kernel", em);
+            k->setCallingConv(llvm::CallingConv::SPIR_KERNEL);
+            k->addFnAttr("hlsl.shader", "compute");
+            // The backend reads the workgroup size from this attribute, comma
+            // separated (the same spelling the working view probe used).
+            k->addFnAttr("hlsl.numthreads",
+                         fmtformat("{},{},{}", osl_vk_abi::kWorkgroupSize, 1, 1));
+            {
+                llvm::BasicBlock* bb = llvm::BasicBlock::Create(ctx, "entry", k);
+                llvm::IRBuilder<> b(bb);
+                llvm::Value* base = llvm::ConstantExpr::getInBoundsGetElementPtr(
+                    fbt, gv,
+                    llvm::ArrayRef<llvm::Constant*>(
+                        { llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx), 0),
+                          llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0),
+                          llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx), 0) }));
+                llvm::Value* gp
+                    = b.CreateInBoundsGEP(id3, gidvar,
+                                          { b.getInt32(0), b.getInt32(0) });
+                llvm::Value* gx = b.CreateZExt(b.CreateLoad(i32t, gp),
+                                               llvm::Type::getInt64Ty(ctx));
+                b.CreateCall(fidx, { base, gx });
+                b.CreateRetVoid();
+            }
+            llvm::raw_string_ostream eos(*out_entry_ir);
+            em.print(eos, nullptr);
+            eos.flush();
+        } else {
+            llvm::FunctionType* ktype = llvm::FunctionType::get(
+                vd, split ? std::vector<llvm::Type*>{}
+                          : std::vector<llvm::Type*>{ pbuf },
+                false);
+            // Assign to the enclosing `kernel`, not a new local: the workgroup
+            // size metadata below is attached through that variable, and a
+            // shadowing declaration here silently leaves it null -- which makes
+            // clspv fall back to 1x1x1 and dispatch only `groups` invocations
+            // (the rest of the frame is never written).
+            kernel = llvm::Function::Create(
+                ktype, llvm::GlobalValue::ExternalLinkage, "osl_kernel",
+                *render);
+            kernel->setCallingConv(llvm::CallingConv::SPIR_KERNEL);
+            llvm::BasicBlock* bb
+                = llvm::BasicBlock::Create(ctx, "entry", kernel);
+            llvm::IRBuilder<> b(bb);
+            // The frame now takes the invocation index as an argument.  In the
+            // clspv path the synthesised kernel asks for it through the OpenCL
+            // builtin (clspv turns that into gl_GlobalInvocationID); in the split
+            // path the entry module supplies it.
+            llvm::Value* gval;
+            if (split) {
+                gval = llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx), 0);
+            } else {
+                llvm::Function* gget
+                    = render->getFunction("_Z13get_global_idj");
+                if (!gget)
+                    gget = llvm::Function::Create(
+                        llvm::FunctionType::get(llvm::Type::getInt64Ty(ctx),
+                                                { i32 }, false),
+                        llvm::GlobalValue::ExternalLinkage,
+                        "_Z13get_global_idj", *render);
+                gval = b.CreateCall(gget, { b.getInt32(0) });
+            }
+            b.CreateCall(frame, { split ? frame_base : kernel->getArg(0), gval });
             b.CreateRetVoid();
         }
         // clspv reads the workgroup size from *metadata* named
@@ -341,9 +620,10 @@ bool vulkan_build_render_module (const std::vector<std::string>& group_ir,
         // attribute of the same name), not from a function attribute.  With the
         // attribute form it silently falls back to 1x1x1, which is a silent
         // wrong-answer bug: the dispatch then covers only `groups` pixels.
-        kernel->addFnAttr("reqd_work_group_size",
-                          fmtformat("{} 1 1", osl_vk_abi::kWorkgroupSize));
-        {
+        if (kernel)
+            kernel->addFnAttr("reqd_work_group_size",
+                              fmtformat("{} 1 1", osl_vk_abi::kWorkgroupSize));
+        if (kernel) {
             llvm::Type* i32ty = llvm::Type::getInt32Ty(ctx);
             auto* md          = llvm::MDNode::get(
                 ctx, { llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(

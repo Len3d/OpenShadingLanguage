@@ -283,6 +283,20 @@ public:
     ///
     llvm::Value* sg_ptr() const { return m_llvm_shaderglobals_ptr; }
 
+    /// True when codegen is emitting the Vulkan offset ABI
+    /// (OSL_VULKAN_ARENA_INDEX).  In that mode every address that lives in a
+    /// storage buffer is a byte offset, not a pointer: the arena is reached
+    /// through the osl_arena_i32/f32/i64 views, and the shader globals area is
+    /// reached as "arena base + offset".  Symbols allocated by alloca() are
+    /// untouched -- they are in Private, where pointers are legal on Vulkan.
+    bool vulkan_offset_abi() const;
+
+    /// Byte offset of the shader globals block inside the arena (Vulkan offset
+    /// ABI only; valid only when vulkan_offset_abi() is true).  Replaces
+    /// sg_ptr() for every use that reaches the device runtime or a field of the
+    /// globals block.
+    llvm::Value* sg_off();
+
     llvm::Type* llvm_type_closure_component();
     llvm::Type* llvm_type_closure_component_ptr();
 
@@ -339,6 +353,21 @@ public:
     /// Return the group data pointer.
     ///
     llvm::Value* groupdata_ptr() const { return m_llvm_groupdata_ptr; }
+
+    /// Byte offset of groupdata field \a fieldnum inside the arena, as an i64
+    /// (Vulkan offset ABI only).  The base is sg_off(); the field displacement
+    /// comes from the struct layout of the groupdata type, so nothing here is
+    /// hand-computed.  This is the offset counterpart of groupdata_field_ref()
+    /// and is what parameter load/store will route through.
+    llvm::Value* groupdata_field_off(int fieldnum);
+
+    /// Address of a byte offset inside one of the device arena views, as a
+    /// pointer into the view global (Vulkan offset ABI only).  width selects
+    /// which view: 4 = osl_arena_f32/i32, 8 = osl_arena_i64.  This is how
+    /// parameter storage is reached without ever forming a storage-buffer
+    /// pointer from the groupdata base: the view global is a fixed, non
+    /// pointer-derived object, so the backend lowers it to OpAccessChain.
+    llvm::Value* arena_view_addr(llvm::Value* byte_off, int width);
 
     /// Return the group data pointer cast as a void*.
     ///

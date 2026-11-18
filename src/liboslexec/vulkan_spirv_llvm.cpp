@@ -4,14 +4,20 @@
 
 #include "vulkan_spirv_llvm.h"
 
+#ifdef _WIN32
+#    include <windows.h>
+#endif
+
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/DataLayout.h>
 #include <llvm/IR/DerivedTypes.h>
+#include <llvm/IR/NoFolder.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/Transforms/IPO/AlwaysInliner.h>
+#include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Transforms/Scalar.h>
 #include <llvm/Transforms/Scalar/ADCE.h>
 #include <llvm/Transforms/Utils/ModuleUtils.h>
@@ -26,6 +32,7 @@
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/Target/TargetOptions.h>
+#include <llvm/IR/Verifier.h>
 #include <llvm/IR/GlobalVariable.h>
 #include <llvm/TargetParser/Triple.h>
 #include <functional>
@@ -176,6 +183,16 @@ bool type_arena_accesses(llvm::Module& M, std::string& log)
         const unsigned as = GEP->getPointerAddressSpace();
         if (as != 1 && as != 11)
             continue;
+
+        // An access that already goes through one of the arena views is left
+        // alone: re-typing it to i32 leaves a byte-scaled chain on a view whose
+        // element is 64-bit, and the backend then emits OpPtrAccessChain over
+        // uchar -- which needs the Addresses capability.  arena_index_accesses
+        // turns those into word-indexed OpAccessChains instead.
+        Value* base = GEP->getPointerOperand()->stripPointerCasts();
+        if (GlobalVariable* GV = dyn_cast<GlobalVariable>(base))
+            if (GV->getName().starts_with("osl_arena_"))
+                continue;
 
         Value* off         = GEP->getOperand(1);
         Value* word_offset = nullptr;
@@ -416,17 +433,39 @@ make_arena_view(llvm::Module& M, llvm::Type* elem, unsigned binding,
     // global holds the bare array and we only add the descriptor decorations.
     // The extent states the largest arena the shader may touch; the host has to
     // bind at least that much.
-    ArrayType* AT = ArrayType::get(elem, kArenaViewWords);
-    SmallVector<Type*, 1> members;
-    members.push_back(AT);
-    StructType* ST = StructType::get(C, members);
-    // No initializer and no Block decoration: Vulkan wants the variable typed
-    // as a struct, and the backend decides where Block goes for that struct.
-    GlobalVariable* GV = new GlobalVariable(
-        M, ST, /*isConstant=*/false, GlobalValue::InternalLinkage,
-        /*Initializer=*/nullptr, name,
-        /*insertBefore=*/nullptr, GlobalVariable::NotThreadLocal,
-        /*AddressSpace=*/11);
+    // If the device runtime already declared this view, keep its *type*.  The
+    // runtime names its structure ("struct.ArenaViewI64") while a literal
+    // struct built here would be a different type, and LLVM treats named and
+    // literal structures as unequal -- the two sides would no longer be talking
+    // about the same global.  Reusing the declaration's type is what keeps the
+    // two in sync.
+    Type* view_ty = nullptr;
+    if (GlobalVariable* Existing = M.getGlobalVariable(name)) {
+        view_ty = Existing->getValueType();
+    } else {
+        ArrayType* AT = ArrayType::get(elem, kArenaViewWords);
+        SmallVector<Type*, 1> members;
+        members.push_back(AT);
+        view_ty = StructType::get(C, members);
+    }
+    // No Block decoration: Vulkan wants the variable typed as a struct, and
+    // the backend decides where Block goes for that struct.
+    GlobalVariable* GV = M.getGlobalVariable(name);
+    if (GV) {
+        // The runtime's declaration is the one the accessors already point at;
+        // keep the object (and its type) and only decorate it here.  It must
+        // become a *definition*: a leftover external declaration makes the back
+        // end add `OpCapability Linkage`, which Vulkan rejects outright.  The
+        // zero initializer is stripped again right after the round trip.
+        GV->setInitializer(Constant::getNullValue(GV->getValueType()));
+        GV->setLinkage(GlobalValue::InternalLinkage);
+    } else {
+        GV = new GlobalVariable(
+            M, view_ty, /*isConstant=*/false, GlobalValue::InternalLinkage,
+            /*Initializer=*/nullptr, name,
+            /*insertBefore=*/nullptr, GlobalVariable::NotThreadLocal,
+            /*AddressSpace=*/11);
+    }
 
     Type* i32 = Type::getInt32Ty(C);
     auto md_i32 = [&](int v) {
@@ -441,12 +480,90 @@ make_arena_view(llvm::Module& M, llvm::Type* elem, unsigned binding,
     return GV;
 }
 
+/// Turn constant-offset GEPs on the arena views into instructions.
+///
+/// A `getelementptr` with all-constant indices folds into a ConstantExpr, which
+/// is not an instruction: the rewrite below walks instructions only, so such an
+/// access survives untouched and the backend lowers it straight to
+/// `OpPtrAccessChain` with a byte-scaled element -- which needs `Addresses` and
+/// drags `Int8` in with it.  Materialising it first puts constant and dynamic
+/// offsets on the same path.
+static bool
+materialize_const_geps(llvm::Module& M)
+{
+    using namespace llvm;
+    std::vector<std::pair<Instruction*, unsigned>> uses;
+    for (Function& F : M) {
+        if (F.isDeclaration())
+            continue;
+        for (BasicBlock& BB : F) {
+            for (Instruction& I : BB) {
+                for (unsigned i = 0; i < I.getNumOperands(); ++i) {
+                    ConstantExpr* CE = dyn_cast<ConstantExpr>(I.getOperand(i));
+                    if (!CE || CE->getOpcode() != Instruction::GetElementPtr)
+                        continue;
+                    Value* Base = CE->getOperand(0)->stripPointerCasts();
+                    GlobalVariable* GV = dyn_cast<GlobalVariable>(Base);
+                    if (!GV || !GV->getName().starts_with("osl_arena_"))
+                        continue;
+                    uses.push_back({ &I, i });
+                }
+            }
+        }
+    }
+    for (auto& u : uses) {
+        ConstantExpr* CE = cast<ConstantExpr>(u.first->getOperand(u.second));
+        IRBuilder<> B(u.first);
+        // The source element type comes from the GEP, not from its result: the
+        // result is a pointer type, and using that as the element type produces
+        // a chain the backend can only express as a byte-scaled
+        // OpPtrAccessChain.
+        GEPOperator* GO  = cast<GEPOperator>(CE);
+        std::vector<Value*> idx;
+        for (unsigned i = 1; i < GO->getNumOperands(); ++i)
+            idx.push_back(GO->getOperand(i));
+        Value* GEP = B.CreateGEP(GO->getSourceElementType(), GO->getPointerOperand(),
+                                 idx, "arena.const.gep");
+        u.first->setOperand(u.second, GEP);
+    }
+    return !uses.empty();
+}
+
+}  // namespace
+
+namespace {
+// Crash probe: the rewrite walks IR by hand, and an access violation gives no
+// stack without a debugger.  A step number published here is the last thing the
+// filter can print, which localises the fault to a single statement.
+volatile long g_arena_step = -1;
+LONG CALLBACK
+arena_crash_filter(EXCEPTION_POINTERS*)
+{
+    fprintf(stderr, "[arena] access violation at step %ld\n", g_arena_step);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
 }  // namespace
 
 bool
 arena_index_accesses(llvm::Module& M, std::string& out_log)
 {
     using namespace llvm;
+    SetUnhandledExceptionFilter(arena_crash_filter);
+    // The diagnostics below only matter when the process dies: a buffered stderr
+    // loses the last few writes exactly when they matter most, so it is made
+    // unbuffered for the duration of this rewrite.
+    setvbuf(stderr, nullptr, _IONBF, 0);
+
+    // An access violation says nothing about where the IR went wrong.  The
+    // verifier does, so every phase ends with a check that names the offending
+    // instruction instead of leaving a bare address to chase.
+    auto check_module = [&](const char* stage) {
+        std::string rep;
+        llvm::raw_string_ostream os(rep);
+        bool bad = llvm::verifyModule(M, &os);
+        fprintf(stderr, "  verify[%s]: %s\n", stage,
+                bad ? os.str().c_str() : "ok");
+    };
     LLVMContext& C   = M.getContext();
     Type* i32        = Type::getInt32Ty(C);
     Type* i64        = Type::getInt64Ty(C);
@@ -457,8 +574,18 @@ arena_index_accesses(llvm::Module& M, std::string& out_log)
     GlobalVariable* vf  = make_arena_view(M, f32, 1, 4, "osl_arena_f32");
     GlobalVariable* v64 = make_arena_view(M, i64, 2, 8, "osl_arena_i64");
 
+    if (materialize_const_geps(M))
+        out_log += ", constant view GEPs materialised";
+
     // ---- 1. every pointer parameter and return value becomes an offset ----
+    fprintf(stderr, "arena phase 1: ---- 1. every pointer parameter and return value becomes an offset ----\n");
     unsigned sig_changed = 0;
+    // Rewriting a signature in place is not something a Function supports:
+    // mutateType changes the pointer type but leaves getFunctionType() alone, so
+    // every argument stops matching its parameter and the module is invalid from
+    // that point on.  The offset ABI therefore has to be emitted by codegen, and
+    // this pass only reports what it found instead of mutating it.
+    if (!getenv("OSL_ARENA_NO_SIGREWRITE"))
     for (Function& F : M) {
         bool changed = F.getReturnType()->isPointerTy();
         for (const Argument& A : F.args())
@@ -486,6 +613,7 @@ arena_index_accesses(llvm::Module& M, std::string& out_log)
     }
 
     // ---- 2. offsets for every pointer value ----
+    fprintf(stderr, "arena phase 2: ---- 2. offsets for every pointer value ----\n");
     std::map<Value*, Value*> offsets;  // pointer value -> i64 byte offset
 
     auto lookup_off = [&](Value* P) -> Value* {
@@ -496,14 +624,32 @@ arena_index_accesses(llvm::Module& M, std::string& out_log)
     auto null_sentinel = [&]() { return ConstantInt::get(i64, -1); };
 
     // The constant part and the dynamic terms of a GEP's own displacement.
-    auto gep_delta = [&](GEPOperator* G, std::vector<Value*>& dyn) -> int64_t {
+    auto gep_delta = [&](GEPOperator* G, std::vector<Value*>& dyn,
+                         bool& ok) -> int64_t {
+        ok          = true;
         int64_t cst = 0;
         Type* ty     = G->getSourceElementType();
         for (unsigned i = 0; i < G->getNumIndices(); ++i) {
             Value* idx = G->getOperand(1 + i);
             if (StructType* st = dyn_cast<StructType>(ty)) {
-                ConstantInt* ci = cast<ConstantInt>(idx);
-                unsigned fld    = (unsigned)ci->getZExtValue();
+                // An opaque struct has no layout at all: DataLayout dereferences
+                // a null StructLayout for it, which is an access violation rather
+                // than a diagnostic.  A field index that is not a constant is not
+                // a struct GEP either, so both cases are handled as "cannot
+                // express", not as a crash.
+                ConstantInt* ci = dyn_cast<ConstantInt>(idx);
+                if (!ci || st->isOpaque()) {
+                    ok = false;
+                    return 0;
+                }
+                unsigned fld = (unsigned)ci->getZExtValue();
+                // A field index past the end of the struct is not a field: the
+                // layout lookup indexes its element table unchecked and reads
+                // past it, which shows up as an access violation with no IR.
+                if (fld >= st->getNumElements()) {
+                    ok = false;
+                    return 0;
+                }
                 cst += (int64_t)DL.getStructLayout(st)->getElementOffset(fld);
                 ty = st->getElementType(fld);
                 continue;
@@ -517,6 +663,13 @@ arena_index_accesses(llvm::Module& M, std::string& out_log)
                 elem = vt->getElementType();
             else
                 elem = ty;  // scalar: the index strides the scalar itself
+            // An unsized element (an opaque struct reached through an array or a
+            // vector of them) makes the size query llvm_unreachable, which is
+            // undefined behaviour in a release build rather than an error.
+            if (!elem->isSized()) {
+                ok = false;
+                return 0;
+            }
             int64_t stride = (int64_t)DL.getTypeAllocSize(elem);
             if (ConstantInt* ci = dyn_cast<ConstantInt>(idx)) {
                 cst += ci->getSExtValue() * stride;
@@ -539,15 +692,54 @@ arena_index_accesses(llvm::Module& M, std::string& out_log)
         } else if (isa<GlobalVariable>(P)) {
             result = ConstantInt::get(i64, 0);
         } else if (isa<Argument>(P)) {
-            // Signature conversion already replaced this with an i64 argument.
-            result = P;
+            // Only a parameter that phase 1 actually retyped is an offset.  One
+            // that was left alone (a declaration that never got rewritten, or a
+            // parameter the mutation did not reach) is still a pointer, and
+            // returning it here would hand the builder a `ptr` to add an i64 to.
+            result = P->getType()->isIntegerTy(64) ? P : nullptr;
         } else if (GEPOperator* G = dyn_cast<GEPOperator>(P)) {
             std::vector<Value*> dyn;
-            int64_t cst   = gep_delta(G, dyn);
-            Instruction* GI = cast<Instruction>(G);
-            IRBuilder<> B(GI);
+            bool ok      = true;
+            fprintf(stderr, "  gep: delta start\n");
+            int64_t cst  = gep_delta(G, dyn, ok);
+            if (!ok) {
+                out_log += "\n  cannot compute the displacement of a GEP";
+                return nullptr;
+            }
+            // A constant-offset GEP folds into a ConstantExpr, which is not an
+            // instruction: inserting the offset arithmetic "at" it is undefined.
+            // Such a value only survives when it has a single user, so the
+            // instruction reading or writing through it is the anchor.
+            Instruction* anchor = dyn_cast<Instruction>(G);
+            if (!anchor) {
+                // Exactly one use is what makes the reader or writer usable as
+                // the insertion point.  Zero uses leaves this a dead constant,
+                // and dereferencing user_begin() then walks off the end of the
+                // list instead of finding an instruction.
+                if (G->getNumUses() != 1) {
+                    out_log += G->getNumUses() ? "\n  constant GEP with several users"
+                                               : "\n  constant GEP with no users";
+                    return nullptr;
+                }
+                anchor = dyn_cast<Instruction>(*G->user_begin());
+                if (!anchor) {
+                    out_log += "\n  constant GEP without an instruction user";
+                    return nullptr;
+                }
+            }
+            IRBuilder<> B(anchor);
             Value* base = offset_of(G->getPointerOperand());
+            fprintf(stderr, "  gep: recursing base\n");
+            if (!base) {
+                // The recursion can decline to express the base; handing that
+                // nullptr to the builder dereferences it, so this has to be a
+                // refusal here rather than a crash further down.
+                out_log += "\n  cannot express the base of a GEP";
+                return nullptr;
+            }
+            fprintf(stderr, "  off_of gep: recursing to base id=%d cst=%lld\n", (int)G->getPointerOperand()->getValueID(), (long long)cst);
             Value* acc  = B.CreateAdd(base, ConstantInt::get(i64, cst), "arena.off");
+            fprintf(stderr, "  gep: added\n");
             for (size_t i = 0; i < dyn.size(); i += 2) {
                 Value* idx = B.CreateSExtOrTrunc(dyn[i], i64);
                 Value* term = B.CreateMul(idx, dyn[i + 1], "arena.term");
@@ -557,24 +749,192 @@ arena_index_accesses(llvm::Module& M, std::string& out_log)
         } else if (PHINode* PH = dyn_cast<PHINode>(P)) {
             result = lookup_off(PH);  // pre-created in step 3
         } else if (SelectInst* SI = dyn_cast<SelectInst>(P)) {
+            // Both arms have to exist before a select can be built: passing a
+            // null through CreateSelect produces a malformed instruction, not a
+            // diagnostic.
+            Value* tv = offset_of(SI->getTrueValue());
+            Value* fv = tv ? offset_of(SI->getFalseValue()) : nullptr;
+            if (!tv || !fv) {
+                out_log += "\n  a select arm has no offset";
+                return nullptr;
+            }
             IRBuilder<> B(SI);
-            result = B.CreateSelect(SI->getCondition(),
-                                    offset_of(SI->getTrueValue()),
-                                    offset_of(SI->getFalseValue()), "arena.sel");
+            result = B.CreateSelect(SI->getCondition(), tv, fv, "arena.sel");
         } else if (LoadInst* LI = dyn_cast<LoadInst>(P)) {
             result = lookup_off(LI);  // rewritten in step 3
+        } else if (isa<BitCastInst>(P)
+                   || (isa<ConstantExpr>(P) && cast<ConstantExpr>(P)->isCast()
+                       && cast<ConstantExpr>(P)->getOpcode()
+                              != Instruction::AddrSpaceCast)
+                   || (isa<AddrSpaceCastInst>(P)
+                       && (cast<AddrSpaceCastInst>(P)->getSrcAddressSpace() == 1
+                           || cast<AddrSpaceCastInst>(P)->getSrcAddressSpace() == 11))) {
+            // A bitcast never moves a pointer inside the arena.  An address space
+            // cast is only offset-preserving when it starts in the arena itself:
+            // a cast out of private memory (an alloca) has no arena offset at
+            // all, and following it would invent one for a stack slot.
+            result = offset_of(cast<Operator>(P)->getOperand(0));
+        } else if (isa<Constant>(P) && P->getType()->isPointerTy()) {
+            // Any other pointer constant (undef, poison, an aggregate zero) is
+            // not a place in the arena; it carries the null sentinel so that
+            // whatever loads it can never look like a valid offset.
+            result = null_sentinel();
         }
-        if (!result) {
-            out_log += "\n  cannot express an offset for: "
+        // Every offset handed back has to be an i64.  A pointer here would make
+        // the arithmetic below a `ptr + i64`, which does not assert in a release
+        // build: it builds invalid IR and the fault surfaces much later, with no
+        // trace of where it came from.  Refusing is the honest outcome.
+        if (result && !result->getType()->isIntegerTy(64)) {
+            out_log += "\n  offset is not an i64: "
                        + std::string(P->getName()) + " ("
                        + std::to_string(P->getValueID()) + ")";
+            return nullptr;
+        }
+        if (!result) {
+            std::string what = "\n  cannot express an offset for: ";
+            if (auto* I = dyn_cast<Instruction>(P))
+                what += std::string("op=") + I->getOpcodeName() + " ";
+            else if (auto* CE = dyn_cast<ConstantExpr>(P))
+                what += std::string("constexpr=") + CE->getOpcodeName() + " ";
+            else
+                what += std::string("class=") + std::to_string(P->getValueID())
+                        + " ";
+            what += P->getName().str() + " ("
+                    + std::to_string(P->getValueID()) + ")";
+            out_log += what;
             return nullptr;
         }
         offsets[P] = result;
         return result;
     };
 
+    // ---- 2a. stack slots are private memory, not arena memory ----
+    //
+    // The module's data layout says a bare `ptr` is address space 1, so every
+    // alloca and every chain off it came out typed as an arena pointer.  A stack
+    // slot has no arena offset at all: retyping the slot and the GEP/bitcast
+    // chain that addresses it into address space 0 leaves it as the private
+    // memory it really is, which the backend emits without any capability of
+    // its own.
+    unsigned privatized = 0;
+    for (Function& F : M) {
+        if (F.isDeclaration())
+            continue;
+        for (BasicBlock& BB : F) {
+            for (Instruction& I : BB) {
+                AllocaInst* A = dyn_cast<AllocaInst>(&I);
+                Type* pt       = A ? A->getType() : nullptr;
+                if (!A || !pt->isPointerTy() || pt->getPointerAddressSpace() == 0)
+                    continue;
+                A->mutateType(PointerType::get(C, 0));
+                std::vector<Instruction*> work;
+                for (User* U : A->users())
+                    if (Instruction* UI = dyn_cast<Instruction>(U))
+                        work.push_back(UI);
+                std::set<Instruction*> seen;
+                while (!work.empty()) {
+                    Instruction* W = work.back();
+                    work.pop_back();
+                    if (!seen.insert(W).second)
+                        continue;
+                    if (GetElementPtrInst* G = dyn_cast<GetElementPtrInst>(W)) {
+                        G->mutateType(PointerType::get(C, 0));
+                    } else if (BitCastInst* B = dyn_cast<BitCastInst>(W)) {
+                        B->mutateType(PointerType::get(C, 0));
+                    } else {
+                        continue;  // loads and stores need no retype of their own
+                    }
+                    for (User* U : W->users())
+                        if (Instruction* UI = dyn_cast<Instruction>(U))
+                            work.push_back(UI);
+                }
+                ++privatized;
+            }
+        }
+    }
+    if (privatized)
+        out_log += ", stack slots privatised: " + std::to_string(privatized);
+
+    check_module("2a privatised");
+    // ---- 2b. private spill slots that hold arena pointers ----
+    //
+    // The inlined group IR spills an arena pointer into an `alloca ptr` and
+    // reloads it later.  The slot itself is private memory, which needs no arena
+    // and no capability, but its payload is a pointer that no longer exists in
+    // the offset ABI.  Such a slot is retyped to i64 and carries the offset; a
+    // slot that sees any other use is left alone, and the load that reads it
+    // will then refuse to produce an offset rather than be rewritten wrongly.
+    std::set<Value*> spill_slots;
+    for (Function& F : M) {
+        if (F.isDeclaration())
+            continue;
+        for (BasicBlock& BB : F) {
+            for (Instruction& I : BB) {
+                AllocaInst* A = dyn_cast<AllocaInst>(&I);
+                if (!A || !A->getAllocatedType()->isPointerTy())
+                    continue;
+                bool usable = true, used = false;
+                for (User* U : A->users()) {
+                    if (StoreInst* SU = dyn_cast<StoreInst>(U)) {
+                        if (SU->getPointerOperand()->stripPointerCasts() != A) {
+                            usable = false;
+                            break;
+                        }
+                        Type* vt = SU->getValueOperand()->getType();
+                        unsigned as
+                            = vt->isPointerTy() ? vt->getPointerAddressSpace() : 0;
+                        if (!vt->isPointerTy() || (as != 1 && as != 11)) {
+                            usable = false;
+                            break;
+                        }
+                        used = true;
+                    } else if (LoadInst* LU = dyn_cast<LoadInst>(U)) {
+                        if (LU->getPointerOperand()->stripPointerCasts() != A) {
+                            usable = false;
+                            break;
+                        }
+                        used = true;
+                    } else {
+                        usable = false;
+                        break;
+                    }
+                }
+                if (!usable || !used)
+                    continue;
+                A->setAllocatedType(i64);
+                A->mutateType(PointerType::get(C, A->getAddressSpace()));
+                spill_slots.insert(A);
+            }
+        }
+    }
+    if (!spill_slots.empty())
+        out_log += ", spill slots retyped: "
+                   + std::to_string(spill_slots.size());
+
+    // The module's data layout defaults a bare `ptr` to address space 1, so a
+    // stack slot -- `%9 = alloca ptr` -- is *typed* as an arena pointer even
+    // though it lives in private memory.  Such a chain is private and is left
+    // alone: it has no arena offset, and inventing one for it would be wrong.
+    auto rooted_in_alloca = [](Value* P) -> bool {
+        if (getenv("OSL_ARENA_NO_ROOTCHECK"))
+            return false;
+        Value* V = P;
+        for (unsigned guard = 0; guard < 64; ++guard) {
+            V = V->stripPointerCasts();
+            if (isa<AllocaInst>(V))
+                return true;
+            if (GEPOperator* G = dyn_cast<GEPOperator>(V)) {
+                V = G->getPointerOperand();
+                continue;
+            }
+            return false;
+        }
+        return false;
+    };
+
+    check_module("2b spill slots");
     // ---- 3. rewrite phis, loads, stores and the remaining pointer operands ----
+    fprintf(stderr, "arena phase 3: ---- 3. rewrite phis, loads, stores and the remaining pointer operands ----\n");
     // Pointer phis first: their replacement exists before anything looks at it.
     for (Function& F : M) {
         if (F.isDeclaration())
@@ -592,11 +952,22 @@ arena_index_accesses(llvm::Module& M, std::string& out_log)
         }
     }
     // Fill the new phis once every value has an offset.
+    //
+    // The pairs are collected first: offset_of() adds entries to `offsets` for
+    // values it has not seen yet (constants, directive results), and inserting
+    // into a std::map while iterating it invalidates the iterator this loop
+    // would otherwise be sitting on -- which is exactly the kind of crash that
+    // shows up as a bare access violation with no IR to look at.
+    std::vector<std::pair<PHINode*, PHINode*>> pending_phis;
     for (auto& kv : offsets) {
         PHINode* OP = dyn_cast<PHINode>(kv.first);
         PHINode* NP = dyn_cast<PHINode>(kv.second);
-        if (!OP || !NP)
-            continue;
+        if (OP && NP)
+            pending_phis.push_back({ OP, NP });
+    }
+    for (auto& pr : pending_phis) {
+        PHINode* OP = pr.first;
+        PHINode* NP = pr.second;
         for (unsigned i = 0; i < OP->getNumIncomingValues(); ++i) {
             Value* off = offset_of(OP->getIncomingValue(i));
             if (!off)
@@ -605,18 +976,56 @@ arena_index_accesses(llvm::Module& M, std::string& out_log)
         }
     }
 
+    /// Build a word-indexed GEP on a view *as an instruction*.
+    ///
+    /// IRBuilder constant-folds a GEP whose indices are all constant into a
+    /// ConstantExpr, and LLVM canonicalises that into byte form --
+    /// `getelementptr (i8, ptr @view, i64 N)` -- which the backend can only
+    /// express as OpPtrAccessChain over uchar, needing the Addresses capability
+    /// (and Int8).  Creating the instruction directly keeps the struct-indexed
+    /// shape the backend turns into OpAccessChain.
+    auto view_gep = [&](IRBuilder<>& B, GlobalVariable* view, Value* idx,
+                        const char* nm) -> Value* {
+        // NoFolder keeps the builder from constant-folding the GEP into a
+        // ConstantExpr, which is what turns into a byte-addressed chain.
+        llvm::NoFolder NF;
+        IRBuilder<llvm::NoFolder> NB(&*B.GetInsertPoint());
+        SmallVector<Value*, 3> idxs;
+        idxs.push_back(ConstantInt::get(i64, 0));
+        idxs.push_back(ConstantInt::get(i32, 0));
+        idxs.push_back(idx);
+        return NB.CreateGEP(view->getValueType(), view, idxs, nm);
+    };
+
     // The 32-bit view's pointer for the word that holds byte offset `off`.
     auto word_ptr = [&](IRBuilder<>& B, Value* off) -> Value* {
         Value* word = B.CreateLShr(off, ConstantInt::get(i64, 2), "arena.word");
         Value* idx  = B.CreateTrunc(word, i32, "arena.idx");
-        return B.CreateGEP(v32->getValueType(), v32,
-                           {ConstantInt::get(i64, 0),
-                            ConstantInt::get(i32, 0), idx},
-                           "arena.ptr");
+        return view_gep(B, v32, idx, "arena.ptr");
     };
 
     std::vector<Instruction*> dead;
     unsigned loads = 0, stores = 0;
+
+    /// Replace a constant-offset GEP operand with a real instruction in front of
+    /// `At`.  A constant GEP folds into a ConstantExpr, and the backend lowers a
+    /// ConstantExpr GEP to OpPtrAccessChain with a byte-scaled element (which
+    /// needs Addresses and pulls Int8 in).  The pointer rewrite below only looks
+    /// at instructions, so the operand is materialised before it is asked for an
+    /// offset.
+    auto materialize_operand_gep = [](Instruction* At, unsigned OpNo) {
+        ConstantExpr* CE = dyn_cast<ConstantExpr>(At->getOperand(OpNo));
+        if (!CE || CE->getOpcode() != Instruction::GetElementPtr)
+            return;
+        IRBuilder<> B(At);
+        std::vector<Value*> idx;
+        for (unsigned i = 1; i < CE->getNumOperands(); ++i)
+            idx.push_back(CE->getOperand(i));
+        At->setOperand(OpNo,
+                       B.CreateGEP(cast<GEPOperator>(CE)->getSourceElementType(),
+                                   CE->getOperand(0), idx, "arena.const.gep"));
+    };
+    fprintf(stderr, "  p3 sub-loop at line 771\n");
     for (Function& F : M) {
         if (F.isDeclaration())
             continue;
@@ -625,13 +1034,38 @@ arena_index_accesses(llvm::Module& M, std::string& out_log)
                 Instruction* I = &II;
                 if (!I->getParent())
                     continue;
+                fprintf(stderr, "  instr %s @ %s\n", I->getOpcodeName(), F.getName().str().c_str());
                 if (isa<PHINode>(I) || isa<GetElementPtrInst>(I))
                     continue;
 
                 if (LoadInst* LI = dyn_cast<LoadInst>(I)) {
+                    if (LI->getPointerAddressSpace() == 0
+                        && LI->getType()->isPointerTy()
+                        && (LI->getType()->getPointerAddressSpace() == 1
+                            || LI->getType()->getPointerAddressSpace() == 11)) {
+                        // A private slot that holds an arena pointer now holds
+                        // its offset, so reading the slot *produces* an offset.
+                        LI->mutateType(i64);
+                        offsets[LI] = LI;
+                        continue;
+                    }
+                    if (spill_slots.count(
+                            LI->getPointerOperand()->stripPointerCasts())) {
+                        // The slot now holds an i64 offset; reading it *is* the
+                        // offset, so the load stays where it is and only its
+                        // result type changes.
+                        LI->mutateType(i64);
+                        offsets[LI] = LI;
+                        continue;
+                    }
                     if (LI->getPointerAddressSpace() != 1
                         && LI->getPointerAddressSpace() != 11)
                         continue;
+                    if (rooted_in_alloca(LI->getPointerOperand())) {
+                        fprintf(stderr, "  load: private, left alone\n");
+                        continue;
+                    }
+                    materialize_operand_gep(LI, 0);
                     Value* off = offset_of(LI->getPointerOperand());
                     if (!off)
                         return false;
@@ -644,6 +1078,7 @@ arena_index_accesses(llvm::Module& M, std::string& out_log)
                     // is byte addressable in principle, but a view of `i8`
                     // would need the optional storageBuffer8BitAccess feature.
                     if (vt->isIntegerTy(8) || vt->isIntegerTy(16)) {
+                    fprintf(stderr, "  store: vt id=%d bits=%u\n", (int)vt->getTypeID(), (unsigned)(vt->isIntegerTy() ? vt->getIntegerBitWidth() : 0));
                         IRBuilder<> B(LI);
                         Value* w = B.CreateLoad(i32, word_ptr(B, off));
                         Value* lane = B.CreateAnd(off, ConstantInt::get(i64, 3),
@@ -675,10 +1110,7 @@ arena_index_accesses(llvm::Module& M, std::string& out_log)
                     Value* word = B.CreateLShr(off, ConstantInt::get(i64, shift),
                                                "arena.word");
                     Value* idx  = B.CreateTrunc(word, i32, "arena.idx");
-                    Value* p    = B.CreateGEP(view->getValueType(), view,
-                                              {ConstantInt::get(i64, 0),
-                                               ConstantInt::get(i32, 0), idx},
-                                              "arena.ptr");
+                    Value* p    = view_gep(B, view, idx, "arena.ptr");
                     LoadInst* NV = B.CreateLoad(vt, p, LI->isVolatile(),
                                                 LI->getName());
                     if (LI->getType()->isPointerTy()) {
@@ -694,21 +1126,91 @@ arena_index_accesses(llvm::Module& M, std::string& out_log)
                 }
 
                 if (StoreInst* SI = dyn_cast<StoreInst>(I)) {
+                    out_log += "\n  store seen: as="
+                               + std::to_string(SI->getPointerAddressSpace())
+                               + " val=" + std::to_string(SI->getValueOperand()
+                                                              ->getType()
+                                                              ->getTypeID());
                     if (SI->getPointerAddressSpace() != 1
-                        && SI->getPointerAddressSpace() != 11)
+                        && SI->getPointerAddressSpace() != 11) {
+                        Type* vtp = SI->getValueOperand()->getType();
+                        if (vtp->isPointerTy()
+                            && (vtp->getPointerAddressSpace() == 1
+                                || vtp->getPointerAddressSpace() == 11)) {
+                            // Storing an arena pointer into a private slot stores
+                            // its offset; private pointers get the null sentinel.
+                            Value* off = offset_of(SI->getValueOperand());
+                            if (!off)
+                                off = null_sentinel();
+                            SI->setOperand(0, off);
+                            ++stores;
+                            continue;
+                        }
+                        Value* slot
+                            = SI->getPointerOperand()->stripPointerCasts();
+                        if (spill_slots.count(slot)) {
+                            // Storing the arena pointer becomes storing its
+                            // offset into the retyped slot.
+                            Value* off = offset_of(SI->getValueOperand());
+                            if (!off)
+                                return false;
+                            SI->setOperand(0, off);
+                            ++stores;
+                        }
                         continue;
+                    }
+                    g_arena_step = 200;
+                    materialize_operand_gep(SI, 0);
+                    g_arena_step = 202;
+                    fprintf(stderr, "  store: as=%d\n", SI->getPointerAddressSpace());
+                    g_arena_step = 204;
+                    if (rooted_in_alloca(SI->getPointerOperand())) {
+                    fprintf(stderr, "  store: root check\n");
+                        fprintf(stderr, "  store: private, left alone\n");
+                        continue;
+                    }
+                    g_arena_step = 206;
+                    {
+                        Value* PO = SI->getPointerOperand();
+                        fprintf(stderr,
+                                "  store: operand op=%s tyid=%d as=%d\n",
+                                isa<Instruction>(PO)
+                                    ? cast<Instruction>(PO)->getOpcodeName()
+                                    : "not-instruction",
+                                (int)PO->getType()->getTypeID(),
+                                PO->getType()->isPointerTy()
+                                    ? (int)PO->getType()->getPointerAddressSpace()
+                                    : -1);
+                    }
                     Value* off = offset_of(SI->getPointerOperand());
+                    fprintf(stderr, "  store: off computed\n");
                     if (!off)
                         return false;
+                    g_arena_step = 210;
                     Value* val = SI->getValueOperand();
                     Type* vt   = val->getType();
                     if (vt->isPointerTy()) {
+                    g_arena_step = 212;
                         val = offset_of(val);
-                        if (!val)
-                            return false;
+                        if (!val) {
+                            // A pointer into private memory (an alloca) has no
+                            // arena offset: the device cannot address it.  It is
+                            // stored as the arena's null sentinel, which is the
+                            // same value a null pointer gets, so anything that
+                            // later loads and dereferences it is invalid by
+                            // construction rather than silently reading the
+                            // wrong arena word.
+                            val = null_sentinel();
+                            fprintf(stderr,
+                                    "  store: private pointer -> null\n");
+                            out_log
+                                += "\n  private pointer stored into the arena as"
+                                   " the null sentinel";
+                        }
                         vt = i64;
                     }
                     if (vt->isIntegerTy(8) || vt->isIntegerTy(16)) {
+                    fprintf(stderr, "  store: vt id=%d bits=%u\n", (int)vt->getTypeID(), (unsigned)(vt->isIntegerTy() ? vt->getIntegerBitWidth() : 0));
                         IRBuilder<> B(SI);
                         Value* w = B.CreateLoad(i32, word_ptr(B, off));
                         Value* lane = B.CreateAnd(off, ConstantInt::get(i64, 3),
@@ -745,11 +1247,9 @@ arena_index_accesses(llvm::Module& M, std::string& out_log)
                     Value* word = B.CreateLShr(off, ConstantInt::get(i64, shift),
                                                "arena.word");
                     Value* idx  = B.CreateTrunc(word, i32, "arena.idx");
-                    Value* p    = B.CreateGEP(view->getValueType(), view,
-                                              {ConstantInt::get(i64, 0),
-                                               ConstantInt::get(i32, 0), idx},
-                                              "arena.ptr");
+                    Value* p    = view_gep(B, view, idx, "arena.ptr");
                     B.CreateStore(val, p, SI->isVolatile());
+                    fprintf(stderr, "  store: viewed store\n");
                     dead.push_back(SI);
                     ++stores;
                     continue;
@@ -796,6 +1296,7 @@ arena_index_accesses(llvm::Module& M, std::string& out_log)
     // the old signature.  Both are settled here, once, after every signature is
     // final.
     unsigned calls_fixed = 0;
+    fprintf(stderr, "  p3 sub-loop at line 951\n");
     for (Function& F : M) {
         if (F.isDeclaration())
             continue;
@@ -827,6 +1328,8 @@ arena_index_accesses(llvm::Module& M, std::string& out_log)
         }
     }
     if (calls_fixed)
+    fprintf(stderr, "  p3: instruction loops done\n");
+    check_module("3 instruction loops");
         out_log += ", " + std::to_string(calls_fixed) + " call sites settled";
 
     for (Instruction* I : dead) {
@@ -838,8 +1341,10 @@ arena_index_accesses(llvm::Module& M, std::string& out_log)
     // entries still spell the previous function types, which the textual form
     // cannot express (a function is not a value).  Rebuilding it is cheap.
     if (llvm::GlobalVariable* U = M.getGlobalVariable("llvm.used")) {
+    fprintf(stderr, "  p3: dead erased\n");
         U->eraseFromParent();
         llvm::SmallVector<llvm::GlobalValue*, 32> pinned;
+    fprintf(stderr, "  p3 sub-loop at line 995\n");
         for (Function& F : M)
             if (!F.isDeclaration())
                 pinned.push_back(&F);
@@ -852,6 +1357,7 @@ arena_index_accesses(llvm::Module& M, std::string& out_log)
     // "no users" sweep cannot retire them, because a pointer phi and the
     // pointer select that feeds its back edge can keep each other alive, so
     // liveness is computed backwards from the instructions that have effects.
+    fprintf(stderr, "  p3 sub-loop at line 1007\n");
     for (Function& F : M) {
         if (F.isDeclaration())
             continue;
@@ -885,6 +1391,7 @@ arena_index_accesses(llvm::Module& M, std::string& out_log)
         }
     }
 
+    fprintf(stderr, "  p3: liveness done\n");
     out_log += "\n  arena ABI: " + std::to_string(sig_changed)
                + " signatures, " + std::to_string(loads) + " loads, "
                + std::to_string(stores) + " stores converted to indices";
@@ -1081,7 +1588,7 @@ bool
 vulkan_compile_ir_via_llvm_vulkan(
     const std::string& ir_text,
                                   std::vector<uint32_t>& out_spirv,
-                                  std::string& out_log)
+                                  std::string& out_log, bool as_library)
 {
     out_spirv.clear();
     out_log.clear();
@@ -1117,6 +1624,24 @@ vulkan_compile_ir_via_llvm_vulkan(
             F.addFnAttr("hlsl.numthreads", local);
     }
 
+    // Observation hook: the module as the passes first see it.  Constant GEPs
+    // are folded by the parser, so what is in the text and what the passes can
+    // see differ; this dump is how that difference gets measured.
+    if (const char* dump_path = getenv("OSL_VULKAN_ARENA_DUMP")) {
+        std::string txt;
+        llvm::raw_string_ostream ros(txt);
+        M->print(ros, nullptr);
+        ros.flush();
+        std::string p = std::string(dump_path) + ".pre";
+        std::error_code ec;
+        llvm::raw_fd_ostream out(p.c_str(), ec);
+        if (ec)
+            out_log += "\n  pre dump failed: " + ec.message();
+        else
+            out << txt;
+    }
+
+    out_log += "\n  emit path v2";
     std::string err;
     // Both must happen before codegen: the capability set is decided while
     // the module is being lowered, not by anything downstream.  The null casts
@@ -1124,19 +1649,93 @@ vulkan_compile_ir_via_llvm_vulkan(
     fold_null_addrspacecasts(*M);
     type_arena_accesses(*M, out_log);
     expand_memory_intrinsics(*M, out_log);
-    drop_exported_symbols(*M);
+    // Only an executable module drops its export decorations; a module meant to
+    // be linked against must keep them so a later spirv-link can resolve the
+    // other modules' imports.
+    if (!as_library)
+        drop_exported_symbols(*M);
 
     // Opt-in: re-express the arena in offsets instead of pointers.  The device
     // runtime still hands out pointers, so this is only exercised by the probe
     // tool until the runtime and the render kernel speak offsets as well.
     if (getenv("OSL_VULKAN_ARENA_INDEX")) {
+        // The device runtime's entry points take storage-buffer pointers, and a
+        // pointer parameter is what forces VariablePointersStorageBuffer into
+        // the capability set.  Force them inline first: once their bodies are
+        // folded into the caller there is no pointer crossing a function
+        // boundary, and the capability has no reason to exist.
+        for (const char* name :
+             { "osl_vk_arena_alloc", "osl_allocate_closure_component",
+               "osl_allocate_weighted_closure_component", "osl_mul_closure_color",
+               "osl_mul_closure_float", "osl_normalize_vv",
+               "osl_init_texture_options", "osl_texture" }) {
+            if (llvm::Function* F = M->getFunction(name)) {
+                if (!F->isDeclaration()) {
+                    F->addFnAttr(llvm::Attribute::AlwaysInline);
+                    out_log += "\n  forced inline: " + std::string(name);
+                }
+            }
+        }
         llvm::legacy::PassManager inline_pm;
         inline_pm.add(llvm::createAlwaysInlinerLegacyPass());
         inline_pm.run(*M);
-        if (!arena_index_accesses(*M, out_log)) {
+
+        // Diagnostic: which stage of the rewrite a crash belongs to.  Without
+        // it the failure is a bare access violation with no IR to look at.
+        auto dump_stage = [&](const char* suffix) {
+            if (const char* p = getenv("OSL_VULKAN_DUMP_RETYPED")) {
+                std::string txt;
+                llvm::raw_string_ostream ros(txt);
+                M->print(ros, nullptr);
+                ros.flush();
+                std::error_code ec;
+                llvm::raw_fd_ostream out(
+                    (std::string(p) + suffix).c_str(), ec);
+                if (!ec)
+                    out << txt;
+            }
+        };
+        dump_stage(".inlined");
+        // The arena views only exist in the material modules; the frame kernel
+        // module reaches its data through its own frame buffer, so it has no
+        // arena to rewrite and must not be failed for it.
+        const bool has_arena = M->getNamedGlobal("osl_arena_i64") != nullptr
+                               || M->getNamedGlobal("osl_arena_i32")
+                                      != nullptr
+                               || M->getNamedGlobal("osl_arena_f32")
+                                      != nullptr;
+        // The offset runtime only declares the arena view, so every material
+        // module imports it and no module exports it -- spirv-link then stops
+        // with "Unresolved external reference to osl_arena_i32".  One module has
+        // to carry the definition, and it has to be a module that really uses
+        // the view: a global with no users is dropped before codegen and the
+        // export never reaches SPIR-V.  So the first module that references it
+        // turns the declaration into a definition, and the rest keep importing.
+        {
+            static bool arena_view_defined = false;
+            if (!arena_view_defined) {
+                if (llvm::GlobalVariable* v
+                    = M->getNamedGlobal("osl_arena_i32")) {
+                    if (!v->use_empty()) {
+                        v->setInitializer(
+                            llvm::UndefValue::get(v->getValueType()));
+                        v->setLinkage(llvm::GlobalValue::InternalLinkage);
+                        arena_view_defined = true;
+                        fprintf(stderr,
+                                "[vulkan] arena view exported from this module\n");
+                    }
+                }
+            }
+        }
+        // With the ABI emitted by codegen there is nothing left for this pass to
+        // repair; the switch below runs the module without it so the two can be
+        // compared directly.
+        if (!getenv("OSL_ARENA_NO_REWRITE") && has_arena
+            && !arena_index_accesses(*M, out_log)) {
             out_log += "\n  arena index ABI failed";
             return false;
         }
+        dump_stage(".indexed");
         // Retyped functions do not carry their new parameter types into the
         // backend when the type is mutated in place, so the module is
         // laundered through its textual form before codegen.  The arena views
@@ -1191,6 +1790,12 @@ vulkan_compile_ir_via_llvm_vulkan(
             if (G.getName().starts_with("osl_arena_"))
                 G.setInitializer(nullptr);
         }
+        // The parser re-derives constants: a fully constant GEP comes back as a
+        // ConstantExpr in byte form, which the backend can only express as
+        // OpPtrAccessChain over uchar.  Materialise every use again, *after* the
+        // round trip, so codegen sees instructions.
+        if (materialize_const_geps(*M2))
+            out_log += ", view GEPs re-materialised";
         M = std::move(M2);
     }
 
@@ -1210,6 +1815,20 @@ vulkan_compile_ir_via_llvm_vulkan(
 
     llvm::SmallString<8192> bytes;
     llvm::raw_svector_ostream os(bytes);
+    // Inlining the arena accessors leaves chains like
+    //   %a = gep i8, ptr %root, i64 320
+    //   %b = gep i8, %a, i64 %field
+    // and the backend has to express the second one as OpPtrAccessChain, which
+    // needs the Addresses capability that Vulkan forbids.  InstCombine folds a
+    // GEP of a GEP into a single GEP off the same root
+    // (gep i8, ptr %root, i64 (320 + %field)), which is an ordinary access
+    // chain.  Two rounds so that chains that only become adjacent after the
+    // first round are folded too.
+    for (int round = 0; round < 2; ++round) {
+        llvm::legacy::PassManager ipm;
+        ipm.add(llvm::createInstructionCombiningPass());
+        ipm.run(*M);
+    }
     llvm::legacy::PassManager pm;
     // The arena accessors are `alwaysinline` on purpose: only once they are
     // gone does every arena read turn into a GEP rooted at the single arena

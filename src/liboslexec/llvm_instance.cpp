@@ -1313,7 +1313,9 @@ BackendLLVM::build_llvm_init()
                              ll.type_void_ptr(),  // userdata_base_ptr
                              ll.type_void_ptr(),  // output_base_ptr
                              ll.type_int(),
-                             ll.type_void_ptr(),  // FIXME: interactive params
+                             vulkan_offset_abi()
+                                 ? ll.type_int64()
+                                 : ll.type_void_ptr(),  // interactive params
                          }));
 
     if (ll.debug_is_enabled()) {
@@ -1580,7 +1582,14 @@ BackendLLVM::build_llvm_instance(bool groupentry)
             ll.type_void_ptr(),  // userdata_base_ptr
             ll.type_void_ptr(),  // output_base_ptr
             ll.type_int(),
-            ll.type_void_ptr(),  // FIXME: interactive_params
+            // LOCAL DEVIATION (2026-11-18): the Vulkan offset ABI carries the
+            // block position in this slot as an integer, exactly as the group
+            // init function does.  Leaving it a pointer here made the layer
+            // function's signature disagree with the kernel's declaration, which
+            // spirv-link reports as "Type mismatch on symbol ...".
+            vulkan_offset_abi()
+                ? ll.type_int64()
+                : ll.type_void_ptr(),  // FIXME: interactive_params
         }));
 
     if (ll.debug_is_enabled()) {

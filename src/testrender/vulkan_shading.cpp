@@ -233,11 +233,14 @@ bool VulkanShading::init(std::string& err)
     vkEnumerateDeviceExtensionProperties(I.phys, nullptr, &next, exts.data());
     bool has_8bit  = false;
     bool has_16bit = false;
+    bool has_varptr = false;
     for (auto& e : exts) {
         if (!strcmp(e.extensionName, VK_KHR_8BIT_STORAGE_EXTENSION_NAME))
             has_8bit = true;
         if (!strcmp(e.extensionName, VK_KHR_16BIT_STORAGE_EXTENSION_NAME))
             has_16bit = true;
+        if (!strcmp(e.extensionName, VK_KHR_VARIABLE_POINTERS_EXTENSION_NAME))
+            has_varptr = true;
     }
 
     std::vector<const char*> enabled_exts;
@@ -245,12 +248,27 @@ bool VulkanShading::init(std::string& err)
         enabled_exts.push_back(VK_KHR_8BIT_STORAGE_EXTENSION_NAME);
     if (has_16bit)
         enabled_exts.push_back(VK_KHR_16BIT_STORAGE_EXTENSION_NAME);
+    if (has_varptr)
+        enabled_exts.push_back(VK_KHR_VARIABLE_POINTERS_EXTENSION_NAME);
 
     VkPhysicalDevice8BitStorageFeatures s8 {};
     s8.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES;
     VkPhysicalDevice16BitStorageFeatures s16 {};
     s16.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+    VkPhysicalDeviceVariablePointersFeatures varptr {};
+    varptr.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VARIABLE_POINTERS_FEATURES;
     void* dev_pnext = nullptr;
+    if (has_varptr) {
+        // The LLVM SPIR-V backend's kernel takes its buffer through
+        // address_space(11) pointers (clspv instead turns the kernel argument
+        // into a descriptor), so the module declares
+        // VariablePointersStorageBuffer.  That capability is legal once this
+        // feature is enabled; without it the driver rejects the pipeline.
+        varptr.variablePointersStorageBuffer = VK_TRUE;
+        varptr.variablePointers              = VK_FALSE;
+        varptr.pNext                         = dev_pnext;
+        dev_pnext                            = &varptr;
+    }
     if (has_16bit) {
         // Declaring VK_KHR_16bit_storage is not enough: its storage features
         // default to false, and the generated modules do use 16-bit storage

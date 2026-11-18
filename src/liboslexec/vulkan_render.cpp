@@ -22,7 +22,13 @@
 // Address space 1 (shader storage buffer): what clspv turns into a storage
 // buffer descriptor.  A plain `void*` would be Private, i.e. unreachable from
 // the kernel argument.
-#define VK_GLOBAL __attribute__((opencl_global))
+//
+// Overridable: the LLVM SPIR-V backend has no clspv to map AS1 (CrossWorkgroup,
+// a kernel-only address space) onto a storage buffer, so that build defines
+// VK_GLOBAL as address_space(11) (StorageBuffer, the Vulkan storage class).
+#ifndef VK_GLOBAL
+#    define VK_GLOBAL __attribute__((opencl_global))
+#endif
 
 typedef VK_GLOBAL unsigned char* GlobalPtr;
 typedef VK_GLOBAL float* GlobalFloat;
@@ -192,7 +198,7 @@ struct Camera {
     int xres, yres;
     float invw, invh;
 
-    inline void setup(VK_GLOBAL const FrameParams* p)
+    __attribute__((always_inline)) inline void setup(VK_GLOBAL const FrameParams* p)
     {
         eye  = mk(p->eye[0], p->eye[1], p->eye[2]);
         dir  = normalize(mk(p->dir[0], p->dir[1], p->dir[2]));
@@ -360,7 +366,12 @@ inline float xorf_vk(float a, unsigned b)
 // (kz/kx/ky + shearDir), same watertight U/V/W test and the same
 // xorf(T,mask) sign trick, and the same skipID1/skipID2 semantics -- so a ray
 // reports the very triangle the CPU would report.
-inline Hit intersect_scene(const SceneView& s, const Ray& r, float tmax,
+// NOTE: this traversal must not carry `noinline`.  The legalize pass marks
+// every callee `alwaysinline` on purpose (clspv only attributes pointers to a
+// resource when the pointer chain from the kernel argument stays visible, so
+// the runtime has to be inlined before its resource passes run), and LLVM
+// rejects a module where both attributes sit on one function.
+Hit intersect_scene(const SceneView& s, const Ray& r, float tmax,
                            int skip_id, int skip_id_b = -1)
 {
     Hit h;
@@ -847,9 +858,10 @@ inline const ClosureComponentVK* closure_root(const void* ci)
 // Ray generation / shading point setup
 // ---------------------------------------------------------------------------
 
-inline void fill_globals(VK_GLOBAL ShaderGlobals* sg, const SceneView& s,
-                         VK_GLOBAL const FrameParams* p, const Ray& r,
-                         const Hit& hit, VK_GLOBAL const unsigned char* frame_base)
+__attribute__((always_inline)) inline void
+fill_globals(VK_GLOBAL ShaderGlobals* sg, const SceneView& s,
+             VK_GLOBAL const FrameParams* p, const Ray& r, const Hit& hit,
+             VK_GLOBAL const unsigned char* frame_base)
 
 {
     // Byte-wise zero: the shader may read fields the renderer does not set, and
@@ -968,7 +980,7 @@ static const long long kOffPool        = 320;
 // kTextureTableOffset in src/testrender/vulkan_shading.cpp.
 static const long long kTexTableOffsetVK = 64 * 1024;
 
-extern "C" void osl_vk_raytrace_frame(GlobalPtr base)
+extern "C" void osl_vk_raytrace_frame(GlobalPtr base, unsigned long long gid_arg)
 {
     VK_GLOBAL const FrameParams* p
         = (VK_GLOBAL const FrameParams*)(base + kFrameParamsOffset);
@@ -976,7 +988,13 @@ extern "C" void osl_vk_raytrace_frame(GlobalPtr base)
     // `gid` is the pointer-width builtin value (i64 here): keep the pixel index
     // arithmetic in that width and only narrow for the per-pixel coordinates,
     // so clspv never has to mix i32 and i64 operands.
-    const unsigned long long gid = get_global_id(0);
+    // LOCAL DEVIATION (2026-11-18): the invocation index arrives as a parameter
+    // instead of being read through the OpenCL builtin.  The kernel is compiled
+    // into its own SPIR-V module (LLVM backend), and calling get_global_id()
+    // there would make that module import a builtin from the entry module while
+    // the entry module imports this function -- a cycle spirv-link cannot
+    // resolve in one pass.  The entry reads gl_GlobalInvocationID and passes it.
+    const unsigned long long gid = gid_arg;
     const unsigned long long npix
         = (unsigned long long)p->width * (unsigned long long)p->height;
     if (gid >= npix)

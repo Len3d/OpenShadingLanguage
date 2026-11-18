@@ -222,6 +222,37 @@ BackendLLVM::llvm_global_symbol_ptr(ustring name)
 
 
 
+bool
+BackendLLVM::vulkan_offset_abi() const
+{
+    static const bool on = []() {
+        const char* v = getenv("OSL_VULKAN_ARENA_INDEX");
+        return v && atoi(v) != 0;
+    }();
+    return on;
+}
+
+
+llvm::Value*
+BackendLLVM::sg_off()
+{
+    // The block's position in the storage buffer is per-invocation, so it
+    // cannot be a compile-time constant: the kernel records the absolute offset
+    // at sg + kOffPool and the dispatch hands it back through a dedicated slot.
+    // Slot 5 (the "interactive params" placeholder) is used rather than a new
+    // leading argument, because every argument index in this backend is a hard
+    // coded 0..5 and an inserted parameter would silently shift them.
+    llvm::Function* F = ll.current_function();
+    if (F) {
+        if (F->arg_size() > 5 && F->getArg(5)->getType()->isIntegerTy(64))
+            return F->getArg(5);
+        if (F->arg_size() > 0 && F->getArg(0)->getType()->isIntegerTy(64))
+            return F->getArg(0);
+    }
+    return ll.constanti64((int64_t)0);
+}
+
+
 llvm::Value*
 BackendLLVM::getLLVMSymbolBase(const Symbol& sym)
 {
@@ -250,8 +281,24 @@ BackendLLVM::getLLVMSymbolBase(const Symbol& sym)
             && !can_treat_param_as_local(sym))) {
         // Special case for most params -- they live in the group data
         int fieldnum = m_param_order_map[&sym];
-        return groupdata_field_ptr(fieldnum,
-                                   sym.typespec().elementtype().simpletype());
+        TypeDesc elem = sym.typespec().elementtype().simpletype();
+        if (vulkan_offset_abi()) {
+            // Offset ABI: the field is reached as a byte offset from the arena
+            // base, then rebound onto the matching arena view.  The base of
+            // that address is a fixed global rather than something derived from
+            // a storage-buffer pointer, which is what keeps the backend from
+            // needing variablePointers for it.
+            llvm::Value* off = groupdata_field_off(fieldnum);
+            int disp = sym.dataoffset();
+            if (disp)
+                off = ll.op_add(off, ll.constanti64((int64_t)disp));
+            llvm::Value* addr = arena_view_addr(off, elem.size());
+            if (!addr)
+                return nullptr;  // arena view missing from this module
+            return llvm_ptr_cast(addr, llvm_typedesc(elem),
+                                 llnamefmt("{}_offptr", sym.name()));
+        }
+        return groupdata_field_ptr(fieldnum, elem);
     }
 
     std::string mangled_name         = dealiased->mangled();
@@ -642,6 +689,50 @@ BackendLLVM::llvm_store_component_value(llvm::Value* new_val, const Symbol& sym,
     return true;
 }
 
+
+
+llvm::Value*
+BackendLLVM::groupdata_field_off(int fieldnum)
+{
+    // The displacement is taken from the layout LLVM itself computes for the
+    // groupdata struct, so a change to the struct (a new field, a different
+    // alignment) cannot silently desynchronise this from what the device
+    // runtime assumes.
+    const llvm::StructLayout* layout = ll.module()->getDataLayout().getStructLayout(
+        llvm::cast<llvm::StructType>(llvm_type_groupdata()));
+    int64_t disp = (int64_t)layout->getElementOffset(fieldnum);
+    llvm::Value* base = (disp == 0) ? sg_off() : ll.op_add(sg_off(), ll.constanti64(disp));
+    return base;
+}
+
+
+llvm::Value*
+BackendLLVM::arena_view_addr(llvm::Value* byte_off, int width)
+{
+    // One buffer, one view: every width is reached as 32-bit words of
+    // osl_arena_i32, so there is exactly one descriptor to bind.
+    const char* view_name = "osl_arena_i32";
+    llvm::GlobalVariable* gv = ll.module()->getGlobalVariable(view_name);
+    if (!gv) {
+        // The views are declared by the device runtime, which may not be linked
+        // into the module yet at codegen time.  Say so instead of returning a
+        // null the callers dereference.
+        std::fprintf(stderr, "[vulkan] arena view '%s' missing at codegen\n",
+                     view_name);
+        return nullptr;
+    }
+    llvm::ArrayType* at = llvm::dyn_cast<llvm::ArrayType>(gv->getValueType());
+    if (!at)
+        return nullptr;
+    // Byte offset to element index; the shift amount is a constant, so the
+    // index stays cheap and the backend emits one OpAccessChain.
+    // Byte offset to 32-bit word index; the shift amount is a constant, so the
+    // index stays cheap and the backend emits one OpAccessChain.
+    llvm::Value* index = ll.op_shr(byte_off, ll.constanti64(2));
+    llvm::Value* elem = ll.GEP(at->getElementType(), gv, index,
+                               llnamefmt("{}_addr", view_name));
+    return ll.void_ptr(elem, llnamefmt("{}_addr_vp", view_name));
+}
 
 
 llvm::Value*

@@ -36,6 +36,14 @@
 extern unsigned char vulkan_shadeops_llvm_compiled_ops_block[];
 extern int vulkan_shadeops_llvm_compiled_ops_size;
 
+// Second variant of the same runtime, compiled with the offset ABI and
+// StorageBuffer pointers.  Picked when the batch module is built by LLVM's own
+// SPIR-V backend: the pointer runtime addresses the arena as "base + runtime
+// offset", which SPIR-V can only express as OpPtrAccessChain -- and that
+// instruction requires the `Addresses` capability, which Vulkan 1.3 forbids.
+extern unsigned char vulkan_shadeops_offset_llvm_compiled_ops_block[];
+extern int vulkan_shadeops_offset_llvm_compiled_ops_size;
+
 OSL_NAMESPACE_BEGIN
 
 namespace pvt {
@@ -109,6 +117,23 @@ llvm::Value* Retyper::arenaBase()
     return m_new_fn->getArg(0);
 }
 
+// LOCAL DEVIATION (2026-11-18): the storage buffer is reached through a
+// different address space depending on the link partner.  clspv compiles the
+// OpenCL model where buffers are CrossWorkgroup (address space 1); the
+// Vulkan-flavor LLVM backend wants StorageBuffer (address space 11), and its
+// modules are then merged with spirv-link instead of being handed to clspv.
+// The numeric content of a pointer is irrelevant in either case -- what changes
+// is only the storage class the module declares.
+static unsigned
+vk_global_address_space()
+{
+    static const unsigned as = []() {
+        const char* v = getenv("OSL_VULKAN_ARENA_INDEX");
+        return (v && atoi(v) != 0) ? 11u : 1u;
+    }();
+    return as;
+}
+
 llvm::Function* Retyper::arenaAllocFn()
 {
     // The definition arrives with the linked device runtime, so by the time a
@@ -122,7 +147,7 @@ llvm::Function* Retyper::arenaAllocFn()
             return it->second;
         return F;
     }
-    llvm::Type* ptr1 = llvm::PointerType::get(m_ctx, 1);
+    llvm::Type* ptr1 = llvm::PointerType::get(m_ctx, vk_global_address_space());
     llvm::Type* i64  = llvm::Type::getInt64Ty(m_ctx);
     llvm::Type* params[3] = { ptr1, i64, i64 };
     llvm::FunctionType* fty
@@ -158,8 +183,19 @@ llvm::Type* Retyper::mapType(llvm::Type* T)
         // that are stored into the buffer (the closure pool cursor, sg.Ci) are
         // the one form Vulkan needs a capability for, and that capability is
         // SPV_KHR_variable_pointers.
-        if (PT->getAddressSpace() == 0)
-            result = llvm::PointerType::get(m_ctx, 1);
+        const unsigned target = vk_global_address_space();
+        if (PT->getAddressSpace() == 0) {
+            result = llvm::PointerType::get(m_ctx, target);
+        } else if (PT->getAddressSpace() == 1 && target != 1) {
+            // The device runtime spells its buffer pointers `opencl_global`, i.e.
+            // address space 1, which is the same storage class under the OpenCL
+            // model clspv consumes.  When the module is instead built by the
+            // Vulkan-flavor LLVM backend that class is StorageBuffer (11), and a
+            // single module cannot mix the two -- `icmp` between an AS1 value and
+            // an AS11 null is not even parseable IR.  Canonicalise every buffer
+            // pointer to the target space.
+            result = llvm::PointerType::get(m_ctx, target);
+        }
     } else if (auto* FT = llvm::dyn_cast<llvm::FunctionType>(T)) {
         llvm::SmallVector<llvm::Type*, 8> params;
         for (auto* P : FT->params())
@@ -772,7 +808,9 @@ bool Retyper::run(std::string& log)
         // now takes a storage-buffer pointer.  (This is how the device runtime's
         // constant Vec3 tables broke llvm.memcpy: the declaration was rebuilt
         // as .p1.p1 while the global it points at was still .p0.)
-        unsigned NASA = (G->getAddressSpace() == 0) ? 1u : G->getAddressSpace();
+        unsigned NASA = (G->getAddressSpace() == 0)
+                            ? vk_global_address_space()
+                            : G->getAddressSpace();
         if (NT == G->getValueType() && NASA == G->getAddressSpace())
             continue;
         if (G->isDeclaration()) {
@@ -991,11 +1029,23 @@ std::string vulkan_legalize_summary ()
 
 bool vulkan_link_shadeops (llvm::Module& M, std::string& out_log)
 {
+    static const bool offset_abi = []() {
+        const char* v = getenv("OSL_VULKAN_ARENA_INDEX");
+        return v && atoi(v) != 0;
+    }();
+    const bool use_offset
+        = offset_abi && ::vulkan_shadeops_offset_llvm_compiled_ops_size > 0;
     llvm::StringRef content(
-        reinterpret_cast<const char*>(
-            ::vulkan_shadeops_llvm_compiled_ops_block),
-        (size_t)::vulkan_shadeops_llvm_compiled_ops_size);
-    llvm::MemoryBufferRef buf(content, "vulkan_shadeops.bc");
+        use_offset
+            ? reinterpret_cast<const char*>(
+                  ::vulkan_shadeops_offset_llvm_compiled_ops_block)
+            : reinterpret_cast<const char*>(
+                  ::vulkan_shadeops_llvm_compiled_ops_block),
+        (size_t)(use_offset ? ::vulkan_shadeops_offset_llvm_compiled_ops_size
+                            : ::vulkan_shadeops_llvm_compiled_ops_size));
+    llvm::MemoryBufferRef buf(
+        content,
+        use_offset ? "vulkan_shadeops_offset.bc" : "vulkan_shadeops.bc");
 
     llvm::Expected<std::unique_ptr<llvm::Module>> mod_or_err
         = llvm::parseBitcodeFile(buf, M.getContext());

@@ -40,10 +40,16 @@ bool vulkan_collect_entry_names (llvm::Module& M, std::vector<std::string>& out,
 /// Link the device frame renderer with every group of the scene and synthesise
 /// `osl_vk_shade_dispatch` plus the compute kernel.  Returns the module as IR
 /// text, ready for clspv `-x ir`.
+/// When `out_group_ir` is non-null the function runs in *split* mode: the
+/// groups are not linked into the kernel module, the dispatcher only declares
+/// the group entry points, and each group's IR text is returned in
+/// `out_group_ir` for a separate compile (Vulkan flavor SPIR-V backend).  The
+/// two halves are then merged with spirv-link instead of being joined here.
 OSL_DLL_EXPORT bool vulkan_build_render_module (
     const std::vector<std::string>& group_ir,
-                                 const std::vector<std::vector<std::string>>& entries,
-                                 std::string& out_ir, std::string& out_log);
+    const std::vector<std::vector<std::string>>& entries, std::string& out_ir,
+    std::string& out_log, std::vector<std::string>* out_group_ir = nullptr,
+    std::string* out_entry_ir = nullptr);
 
 }  // namespace pvt
 

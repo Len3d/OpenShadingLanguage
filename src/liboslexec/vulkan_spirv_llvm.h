@@ -31,9 +31,13 @@ namespace pvt {
 /// emits the module's words.
 ///
 /// Returns false with the reason in `out_log`.
+/// `as_library` keeps the definitions' export decorations instead of dropping
+/// them: a module that other modules will be linked against has to export the
+/// functions they import (spirv-link matches Export against Import), while the
+/// final executable module must not carry them.
 OSL_DLL_EXPORT bool vulkan_compile_ir_via_llvm_vulkan(
     const std::string& ir_text, std::vector<uint32_t>& out_spirv,
-    std::string& out_log);
+    std::string& out_log, bool as_library = false);
 
 }  // namespace pvt
 

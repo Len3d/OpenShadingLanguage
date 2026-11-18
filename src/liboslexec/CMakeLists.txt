@@ -309,6 +309,39 @@ if (VULKAN_SHADEOPS_CLANG)
                         ${vk_shadeops_bc} )
     list (APPEND lib_src ${CMAKE_CURRENT_BINARY_DIR}/vulkan_shadeops.bc.cpp)
 
+    # Second variant of the device runtime: the offset ABI, used when the batch
+    # module is compiled by LLVM's own SPIR-V backend instead of clspv.
+    #
+    # The pointer runtime reaches into the arena as "base pointer + runtime
+    # offset", which SPIR-V can only express as OpPtrAccessChain -- and that
+    # instruction requires the `Addresses` capability, which Vulkan 1.3 forbids.
+    # The offset runtime addresses the arena through three array views with
+    # arena_ld_*/arena_st_* accessors, so the emitted addressing is an ordinary
+    # OpAccessChain and no capability is needed.  It is compiled separately
+    # (rather than switched on a macro inside one bitcode) because the clspv
+    # path must keep the pointer form, which clspv alone can compile.
+    set (vk_shadeops_off_bc ${CMAKE_CURRENT_BINARY_DIR}/vulkan_shadeops_offset.bc)
+    add_custom_command (OUTPUT ${vk_shadeops_off_bc}
+        COMMAND ${VULKAN_SHADEOPS_CLANG}
+            # The OS component decides which SPIR-V environment the backend
+            # targets: with plain "spirv64" it is not the Vulkan flavour, and the
+            # resulting address spaces and capabilities disagree with the rest of
+            # the link ("Linking two modules of different target triples").
+            -target spirv64-unknown-vulkan -emit-llvm -c -O2
+            -fno-rtti -fno-exceptions
+            "-DVK_GLOBAL=__attribute__((address_space(11)))"
+            -I${CMAKE_CURRENT_SOURCE_DIR}
+            -o ${vk_shadeops_off_bc}
+            ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_shadeops_offset.cpp
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_shadeops_offset.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_types.h
+        COMMENT "Compiling Vulkan device runtime (offset ABI) to bitcode"
+        VERBATIM)
+    MAKE_EMBEDDED_CPP ( "vulkan_shadeops_offset_llvm_compiled_ops"
+                        ${CMAKE_CURRENT_BINARY_DIR}/vulkan_shadeops_offset.bc.cpp
+                        ${vk_shadeops_off_bc} )
+    list (APPEND lib_src ${CMAKE_CURRENT_BINARY_DIR}/vulkan_shadeops_offset.bc.cpp)
+
     # The whole-frame render kernel (camera/ray generation/sampling/intersection/
     # accumulation) is built the same way.  It is a second module because it is
     # only linked in when the scene is rendered frame-at-a-time on the device,
@@ -316,6 +349,12 @@ if (VULKAN_SHADEOPS_CLANG)
     set (vk_render_src ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_render.cpp)
     set (vk_render_bc ${CMAKE_CURRENT_BINARY_DIR}/vulkan_render.bc)
 
+    # LOCAL DEVIATION (2026-11-18): -O0 instead of -O2.  The kernel is compiled
+    # by LLVM's own SPIR-V backend, whose structurizer requires a reducible
+    # control-flow graph, and the -O1/-O2 pipeline turns intersect_scene's
+    # traversal loop into an irreducible one ("No valid candidate in the queue.
+    # Is the graph reducible?").  At -O0 the same source structurizes fine, so
+    # the kernel keeps its C++ form and the backend can compile it.
     add_custom_command (OUTPUT ${vk_render_bc}
         COMMAND ${VULKAN_SHADEOPS_CLANG}
             -target spirv64 -emit-llvm -c -O2
@@ -330,6 +369,26 @@ if (VULKAN_SHADEOPS_CLANG)
                         ${CMAKE_CURRENT_BINARY_DIR}/vulkan_render.bc.cpp
                         ${vk_render_bc} )
     list (APPEND lib_src ${CMAKE_CURRENT_BINARY_DIR}/vulkan_render.bc.cpp)
+
+    # Second variant of the same kernel for the LLVM SPIR-V backend: clspv maps
+    # AS1 (opencl_global) onto a storage buffer descriptor, but the LLVM backend
+    # keeps AS1 as CrossWorkgroup, which Vulkan has no storage class for.  This
+    # build re-declares VK_GLOBAL as address_space(11) (StorageBuffer) instead.
+    set (vk_render_sb_bc ${CMAKE_CURRENT_BINARY_DIR}/vulkan_render_sb.bc)
+    add_custom_command (OUTPUT ${vk_render_sb_bc}
+        COMMAND ${VULKAN_SHADEOPS_CLANG}
+            -target spirv64 -emit-llvm -c -O0
+            -fno-rtti -fno-exceptions
+            "-DVK_GLOBAL=__attribute__((address_space(11)))"
+            -I${CMAKE_CURRENT_SOURCE_DIR}
+            -o ${vk_render_sb_bc} ${vk_render_src}
+        DEPENDS ${vk_render_src} ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_types.h
+        COMMENT "Compiling Vulkan device render kernel to StorageBuffer bitcode"
+        VERBATIM)
+    MAKE_EMBEDDED_CPP ( "vulkan_render_sb_llvm_compiled_ops"
+                        ${CMAKE_CURRENT_BINARY_DIR}/vulkan_render_sb.bc.cpp
+                        ${vk_render_sb_bc} )
+    list (APPEND lib_src ${CMAKE_CURRENT_BINARY_DIR}/vulkan_render_sb.bc.cpp )
 else ()
     message (WARNING "VULKAN_SHADEOPS_CLANG not set: Vulkan backend will run "
                      "without a device runtime and its SPIR-V will not have an "
@@ -885,3 +944,4 @@ target_link_libraries (vulkan_legalize_test PRIVATE
                        ${LLVM_LIBRARIES} ${LLVM_LDFLAGS} ${LLVM_SYSTEM_LIBRARIES}
                        ${CMAKE_DL_LIBS})
 set_target_properties (vulkan_legalize_test PROPERTIES FOLDER "Unit Tests")
+

@@ -32,6 +32,7 @@ namespace pugi = OIIO::pugi;
 #    include "vulkan_module.h"
 #    include "clspv_util.h"
 #    include "vulkan_spirv_llvm.h"
+#    include "vulkan_spirv_link.h"
 #endif
 #include <algorithm>
 
@@ -1387,13 +1388,26 @@ SimpleRaytracer::init_vulkan_shading()
                         i);
         }
         std::string mod_ir, log;
-        if (!OSL::pvt::vulkan_build_render_module(irs, ents, mod_ir, log)) {
+        // Split mode (offset ABI): the arena views live in the material modules,
+        // which clspv rejects, so the groups are compiled on their own by the
+        // LLVM Vulkan flavor backend and merged with the kernel by spirv-link.
+        std::vector<std::string> gir;
+        std::string entry_ir;
+        const bool split = getenv("OSL_VULKAN_ARENA_INDEX") != nullptr;
+        if (!OSL::pvt::vulkan_build_render_module(irs, ents, mod_ir, log,
+                                                  split ? &gir : nullptr,
+                                                  split ? &entry_ir : nullptr)) {
             fprintf(stderr, "[vulkan] batch module assembly failed: %s\n",
                     log.c_str());
             return;
         }
         fprintf(stderr, "[vulkan] batch module: %zu group(s), %zu bytes of IR\n",
                 irs.size(), mod_ir.size());
+        if (split)
+            fprintf(stderr,
+                    "[vulkan] split mode: kernel %zu bytes, %zu material "
+                    "module(s)\n",
+                    mod_ir.size(), gir.size());
         if (const char* dump = getenv("OSL_VULKAN_DUMP_BATCH_IR")) {
             OIIO::ofstream f;
             OIIO::Filesystem::open(f, dump);
@@ -1411,13 +1425,100 @@ SimpleRaytracer::init_vulkan_shading()
             }
         }
         std::vector<uint32_t> spirv;
-        bool codegen_ok = getenv("OSL_VULKAN_LLVM_SPIRV")
-                              ? OSL::pvt::vulkan_compile_ir_via_llvm_vulkan(
-                                    mod_ir, spirv, log)
-                              : OSL::pvt::clspv_compile(
-                                    mod_ir,
-                                    "-x ir --arch=spirv64 --spv-version=1.4",
-                                    spirv, log);
+        bool codegen_ok;
+        if (split) {
+            // Both halves go through LLVM's Vulkan flavor backend: the kernel
+            // module now carries only vulkan_render.bc (the groups are
+            // declarations here), so it is as clean as the material modules and
+            // spirv-link resolves the group entry points across modules.
+            std::vector<std::vector<uint32_t>> mods;
+            codegen_ok = true;
+            {
+                std::vector<uint32_t> kernel_spv;
+                std::string klog;
+                if (OSL::pvt::vulkan_compile_ir_via_llvm_vulkan(mod_ir,
+                                                               kernel_spv,
+                                                               klog,
+                                                               /*as_library=*/true)) {
+                    fprintf(stderr,
+                            "[vulkan] kernel SPIR-V (LLVM backend): %zu words\n",
+                            kernel_spv.size());
+                    mods.push_back(std::move(kernel_spv));
+                } else {
+                    fprintf(stderr, "[vulkan] kernel codegen failed: %s\n",
+                            klog.c_str());
+                    codegen_ok = false;
+                }
+            }
+            if (codegen_ok && !entry_ir.empty()) {
+                std::vector<uint32_t> entry_spv;
+                std::string elog;
+                if (OSL::pvt::vulkan_compile_ir_via_llvm_vulkan(entry_ir,
+                                                               entry_spv,
+                                                               elog,
+                                                               /*as_library=*/true)) {
+                    fprintf(stderr,
+                            "[vulkan] entry SPIR-V (LLVM backend): %zu words\n",
+                            entry_spv.size());
+                    // The module that *exports* the entry's symbols has to come
+                    // first: the linker resolves imports against modules it has
+                    // already walked, so a library listed before the module that
+                    // defines get_global_id(0) leaves that import unresolved.
+                    mods.insert(mods.begin(), std::move(entry_spv));
+                } else {
+                    fprintf(stderr, "[vulkan] entry codegen failed: %s\n",
+                            elog.c_str());
+                    codegen_ok = false;
+                }
+            }
+            for (size_t i = 0; codegen_ok && i < gir.size(); ++i) {                std::vector<uint32_t> one;
+                std::string glog;
+                if (OSL::pvt::vulkan_compile_ir_via_llvm_vulkan(gir[i], one,
+                                                               glog,
+                                                               /*as_library=*/true)) {
+                    fprintf(stderr,
+                            "[vulkan] material SPIR-V #%zu: %zu words\n", i,
+                            one.size());
+                    mods.push_back(std::move(one));
+                } else {
+                    fprintf(stderr, "[vulkan] material codegen #%zu failed: %s\n",
+                            i, glog.c_str());
+                    codegen_ok = false;
+                }
+            }
+            // Diagnostic: keep every module on disk so a link failure can be
+            // inspected module by module instead of only seeing the merged text.
+            if (const char* moddir = getenv("OSL_VULKAN_DUMP_MODULES")) {
+                for (size_t i = 0; i < mods.size(); ++i) {
+                    std::string p = std::string(moddir) + "\\__mod"
+                                    + std::to_string(i) + ".spv";
+                    FILE* fp = fopen(p.c_str(), "wb");
+                    if (fp) {
+                        fwrite(mods[i].data(), sizeof(uint32_t), mods[i].size(),
+                               fp);
+                        fclose(fp);
+                    }
+                }
+            }
+            // Link order has to follow the dependency direction: the material
+            // modules export the group entry points the kernel imports, and the
+            // entry module imports osl_vk_raytrace_frame from the kernel.  The
+            // modules were produced entry-first, so rotate them into
+            // [materials..., kernel, entry].
+            if (codegen_ok && !entry_ir.empty() && mods.size() > 2)
+                std::rotate(mods.begin(), mods.begin() + 2, mods.end());
+            if (codegen_ok)
+                codegen_ok = OSL::pvt::vulkan_link_spirv_modules(mods, spirv,
+                                                                log);
+        } else {
+            codegen_ok = getenv("OSL_VULKAN_LLVM_SPIRV")
+                             ? OSL::pvt::vulkan_compile_ir_via_llvm_vulkan(
+                                   mod_ir, spirv, log)
+                             : OSL::pvt::clspv_compile(
+                                   mod_ir,
+                                   "-x ir --arch=spirv64 --spv-version=1.4",
+                                   spirv, log);
+        }
         if (!codegen_ok) {
             fprintf(stderr, "[vulkan] batch SPIR-V codegen failed: %s\n",
                     log.c_str());
