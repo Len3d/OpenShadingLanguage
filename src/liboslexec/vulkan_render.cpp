@@ -610,7 +610,15 @@ inline void to_unit_disk_vk(float& x, float& y)
 /// different basis is a different direction.
 inline void pixar_frame(const Vec3& n, Vec3& u, Vec3& v)
 {
-    const float sign = (n.z >= 0.0f) ? 1.0f : -1.0f;
+    // The CPU uses copysignf(1.0f, n.z), i.e. it reads the *sign bit* of n.z.
+    // A face normal whose z is a negative zero (the right wall of the cornell
+    // scene gives exactly that) therefore selects sign == -1 and a basis that
+    // is mirrored in u and v relative to `n.z >= 0 ? 1 : -1` (where -0.0
+    // compares equal to 0.0 and would pick +1).  Same numbers, different
+    // basis -- every cosine sample lands mirror-imaged, which is invisible on
+    // the first hit's colour but shows up as a completely different second
+    // bounce.  copysignf keeps the two implementations bit-identical.
+    const float sign = __builtin_copysignf(1.0f, n.z);
     const float a    = -1.0f / (sign + n.z);
     const float b    = n.x * n.y * a;
     u = mk(1.0f + sign * n.x * n.x * a, sign * b, -sign * n.x);
@@ -865,7 +873,11 @@ inline void fill_globals(VK_GLOBAL ShaderGlobals* sg, const SceneView& s,
 
     const float w0 = 1.0f - hit.u - hit.v;
     Vec3 P         = add(add(mul(va, w0), mul(vb, hit.u)), mul(vc, hit.v));
-    Vec3 Ng        = normalize(cross(sub(vb, va), sub(vc, va)));
+    // Same cross product as the CPU, in the same operand order
+    // (raytracer.h:270: (va-vb) x (va-vc)).  The equivalent form,
+    // (vb-va) x (vc-va), is not bit-identical: its z component comes out as
+    // +0.0 where the CPU has -0.0, and pixar_frame() reads that sign bit.
+    Vec3 Ng        = normalize(cross(sub(va, vb), sub(va, vc)));
     Vec3 N         = Ng;
     if (s.tri_n) {
         TriangleIndices ni = load_tri(&s.tri_n[hit.id]);
