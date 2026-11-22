@@ -33,6 +33,7 @@
 #include <llvm/AsmParser/Parser.h>
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <llvm/Linker/Linker.h>
@@ -406,6 +407,103 @@ bool vulkan_build_render_module (const std::vector<std::string>& group_ir,
             if (!vulkan_legalize_summary().empty())
                 legalize_log = vulkan_legalize_summary();
             (void)legalize_log;
+        }
+
+        // clspv has no lowering for the fused `llvm.sincos` intrinsic, which
+        // LLVM creates when a shader calls sin(x) and cos(x) on the same value
+        // -- envmap.osl's spherical mapping does exactly that, and the failure
+        // is fatal: clspv rejects the whole kernel with `undefined reference to
+        // 'llvm.sincos.f32'` so the frame never reaches the device.
+        //
+        // Splitting the call back into `llvm.sin`/`llvm.cos` is not enough.  In
+        // a module large enough to pull in clspv's builtin library, LLVM's
+        // libcall simplifier sees those two intrinsics as the libc pair and
+        // folds them straight back into sincos.  Emitting the OpenCL builtin
+        // entry points (`_Z3sinf` / `_Z3cosf`) instead is what works: clspv
+        // replaces those with GLSL `Sin`/`Cos` before any folding can look at
+        // them.
+        {
+            std::vector<llvm::CallInst*> calls;
+            for (auto& F : *render)
+                for (auto& BB : F)
+                    for (auto& I : BB)
+                        if (auto* ci = llvm::dyn_cast<llvm::CallInst>(&I))
+                            if (auto* callee = ci->getCalledFunction())
+                                if (callee->getIntrinsicID()
+                                    == llvm::Intrinsic::sincos)
+                                    calls.push_back(ci);
+
+            auto ocl_builtin = [&](const char* name,
+                                   llvm::Type* ty) -> llvm::Function* {
+                if (!ty->isFloatTy())
+                    return nullptr;
+                llvm::Function* f = render->getFunction(name);
+                if (!f) {
+                    f = llvm::Function::Create(
+                        llvm::FunctionType::get(ty, { ty }, false),
+                        llvm::GlobalValue::ExternalLinkage, name, *render);
+                    f->setCallingConv(llvm::CallingConv::SPIR_FUNC);
+                }
+                return f;
+            };
+
+            for (auto* ci : calls) {
+                llvm::IRBuilder<> b(ci);
+                llvm::Value* x  = ci->getArgOperand(0);
+                llvm::Type* ty  = x->getType();
+                llvm::Function* sinf = ocl_builtin("_Z3sinf", ty);
+                llvm::Function* cosf = ocl_builtin("_Z3cosf", ty);
+                if (!sinf || !cosf) {
+                    // Non-float overloads keep the intrinsics; the shaders this
+                    // module is built from only ever produce float sincos.
+                    sinf = llvm::Intrinsic::getOrInsertDeclaration(
+                        render.get(), llvm::Intrinsic::sin, { ty });
+                    cosf = llvm::Intrinsic::getOrInsertDeclaration(
+                        render.get(), llvm::Intrinsic::cos, { ty });
+                }
+                llvm::Value* s = b.CreateCall(
+                    sinf, { x });
+                llvm::Value* c = b.CreateCall(cosf, { x });
+                // IRBuilder emits calls in the default C convention; the
+                // builtins are declared spir_func, and a call whose convention
+                // disagrees with the callee crashes clspv outright.
+                llvm::cast<llvm::CallInst>(s)->setCallingConv(
+                    sinf->getCallingConv());
+                llvm::cast<llvm::CallInst>(c)->setCallingConv(
+                    cosf->getCallingConv());
+                // Callers only ever pull the pair apart with extractvalue.  Feed
+                // those the sin/cos results directly: rebuilding the aggregate
+                // with insertvalue would let the simplifier recognise the
+                // pattern again.
+                bool paired = !ci->use_empty();
+                for (auto* u : ci->users())
+                    if (!llvm::isa<llvm::ExtractValueInst>(u))
+                        paired = false;
+                if (paired) {
+                    std::vector<llvm::ExtractValueInst*> ex;
+                    for (auto* u : ci->users())
+                        ex.push_back(llvm::cast<llvm::ExtractValueInst>(u));
+                    for (auto* e : ex) {
+                        e->replaceAllUsesWith(e->getIndices()[0] == 0 ? s : c);
+                        e->eraseFromParent();
+                    }
+                } else {
+                    llvm::Value* v = llvm::UndefValue::get(ci->getType());
+                    v = b.CreateInsertValue(v, s, 0);
+                    v = b.CreateInsertValue(v, c, 1);
+                    ci->replaceAllUsesWith(v);
+                }
+                ci->eraseFromParent();
+            }
+            // Drop the unreferenced declaration, so clspv never sees the name.
+            std::vector<llvm::Function*> dead;
+            for (auto& F : *render)
+                if (F.isDeclaration() && F.getIntrinsicID()
+                                              == llvm::Intrinsic::sincos
+                    && F.use_empty())
+                    dead.push_back(&F);
+            for (auto* F : dead)
+                F->eraseFromParent();
         }
 
         llvm::raw_string_ostream os(out_ir);
