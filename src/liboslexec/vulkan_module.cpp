@@ -87,8 +87,8 @@ void strip_alias_metadata (llvm::Module& M)
 
 // Pick the functions a caller has to invoke for one group.
 //
-// A compiled group can carry two shapes (see vulkan_add_kernel_entry): a
-// non-trivial `osl_init_group_<group>` that runs the layers itself, or a set of
+// A compiled group can carry two shapes: a non-trivial
+// `osl_init_group_<group>` that runs the layers itself, or a set of
 // `osl_layer_...` functions when the init function was folded to `ret void`.  In
 // the second case the layers have to be called in order, which is what the
 // switch below does.

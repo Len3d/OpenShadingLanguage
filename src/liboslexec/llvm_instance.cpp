@@ -2532,142 +2532,51 @@ BackendLLVM::run()
 
 #if OSL_USE_CLSPV
     if (shadingsys().use_vulkan()) {
-        // Lower this group to Vulkan-flavor SPIR-V: OSL IR -> legalization
-        // pass -> clspv's IR entry point.  The whole thing runs on a *clone*
-        // of the module: the original still has to reach the CPU JIT below.
+        // Lower this group far enough to become part of the whole-frame device
+        // module: OSL IR -> device runtime link -> legalization.  The frame
+        // kernel has to be able to call *every* material, and SPIR-V has no
+        // cross-module calls, so the legalised IR and the names of its entry
+        // functions are kept, linked together with the frame renderer later,
+        // and compiled once (see vulkan_module.cpp).  The work runs on a
+        // *clone* of the module: the original still has to reach the CPU JIT
+        // below.
         std::string vk_log;
-        std::string vk_entry_name = "osl_kernel";
-        std::vector<uint32_t> spirv;
-        ustring entry("osl_kernel");
-        {
-            std::unique_ptr<llvm::Module> vk_module(
-                llvm::CloneModule(*ll.module()));
+        std::unique_ptr<llvm::Module> vk_module(
+            llvm::CloneModule(*ll.module()));
 
-            // Match the device runtime's target *before* linking it in; otherwise
-            // the two modules disagree about layout and the link leaves the
-            // cloned module unverifiable.
-            pvt::vulkan_set_module_target(*vk_module);
+        // Match the device runtime's target *before* linking it in; otherwise
+        // the two modules disagree about layout and the link leaves the cloned
+        // module unverifiable.
+        pvt::vulkan_set_module_target(*vk_module);
 
-            // The compiled group only declares the shadeops; bring the device
-            // implementations in before legalization so every call has a body.
-            if (!pvt::vulkan_link_shadeops(*vk_module, vk_log)) {
+        // The compiled group only declares the shadeops; bring the device
+        // implementations in before legalization so every call has a body.
+        if (!pvt::vulkan_link_shadeops(*vk_module, vk_log)) {
+            shadingsys().errorfmt(
+                "Vulkan device runtime link failed for group '{}': {}",
+                group().name(), vk_log);
+        } else if (!pvt::vulkan_legalize_module(*vk_module, vk_log)) {
+            shadingsys().errorfmt(
+                "Vulkan legalization failed for group '{}': {}", group().name(),
+                vk_log);
+        } else {
+            llvm::raw_string_ostream ir_os(group().m_vulkan_ir);
+            vk_module->print(ir_os, nullptr);
+            ir_os.flush();
+            group().m_vulkan_entry_names.clear();
+            if (!pvt::vulkan_collect_entry_names(*vk_module,
+                                                 group().m_vulkan_entry_names,
+                                                 vk_log)) {
                 shadingsys().errorfmt(
-                    "Vulkan device runtime link failed for group '{}': {}",
+                    "Vulkan entry collection failed for group '{}': {}",
                     group().name(), vk_log);
-            } else if (!pvt::vulkan_legalize_module(*vk_module, vk_log)) {
-                shadingsys().errorfmt(
-                    "Vulkan legalization failed for group '{}': {}", group().name(),
-                    vk_log);
-            } else if (getenv("OSL_VULKAN_BATCH")) {
-                // Batch mode: keep the legalised IR (and the names of the entry
-                // functions) instead of lowering it on its own.  A whole-frame
-                // device kernel has to be able to call *every* material, and
-                // SPIR-V has no cross-module calls, so the frame renderer and
-                // all the groups are linked into one module later and compiled
-                // once (see vulkan_module.cpp).
-                llvm::raw_string_ostream ir_os(group().m_vulkan_ir);
-                vk_module->print(ir_os, nullptr);
-                ir_os.flush();
-                group().m_vulkan_entry_names.clear();
-                if (!pvt::vulkan_collect_entry_names(*vk_module,
-                                                     group().m_vulkan_entry_names,
-                                                     vk_log)) {
-                    shadingsys().errorfmt(
-                        "Vulkan entry collection failed for group '{}': {}",
-                        group().name(), vk_log);
-                } else if (getenv("OSL_VULKAN_LEGALIZE_TRACE")) {
-                    fprintf(stderr,
-                            "[vulkan] batch: group '%s' kept %zu entry point(s), "
-                            "%zu bytes of IR\n",
-                            group().name().c_str(),
-                            group().m_vulkan_entry_names.size(),
-                            group().m_vulkan_ir.size());
-                }
-            } else if (!pvt::vulkan_add_kernel_entry(*vk_module, vk_entry_name,
-                                                     vk_log)) {
-                shadingsys().errorfmt(
-                    "Vulkan kernel entry failed for group '{}': {}", group().name(),
-                    vk_log);
-            } else {
-                entry = ustring(vk_entry_name);
-
-                // clspv's in-process C API takes source text; with "-x ir"
-                // that text is parsed as LLVM IR by clspv's own LLVM, so this
-                // reaches the IR path without a temporary file.
-                std::string ir_text;
-                {
-                    llvm::raw_string_ostream ir_os(ir_text);
-                    vk_module->print(ir_os, nullptr);
-                    ir_os.flush();
-                }
-                if (const char* dump_path = getenv("OSL_VULKAN_DUMP_IR")) {
-                    // The IR handed to clspv is textual and parsed by clspv's
-                    // own (different) LLVM, so when that fails to parse, the
-                    // only way to see the offending lines is to keep a copy.
-                    std::string path = std::string(dump_path);
-                    if (path.find('%') != std::string::npos) {
-                        path = Strutil::replace(path, "%g", group().name().string());
-                        path = Strutil::replace(
-                            path, "%t",
-                            std::to_string(std::hash<std::thread::id>()(
-                                std::this_thread::get_id())));
-                    }
-                    OIIO::ofstream dfile;
-                    OIIO::Filesystem::open(dfile, path);
-                    if (dfile)
-                        dfile << ir_text;
-                }
-                if (getenv("OSL_VULKAN_SKIP_CLSPV")) {
-                    if (getenv("OSL_VULKAN_LEGALIZE_TRACE"))
-                        fprintf(stderr,
-                                "[vulkan] skipping clspv lowering of group '%s'\n",
-                                group().name().c_str());
-                // --spv-version=1.4: the legalised module compares pointers
-                // (closure roots, arena cursors) against null, and clspv only
-                // accepts that from SPIR-V 1.4 on.  The batch path in
-                // testrender uses the same version.
-                } else if (!pvt::clspv_compile(ir_text,
-                                               "-x ir --arch=spirv64 --spv-version=1.4",
-                                               spirv, vk_log)) {
-                    shadingsys().errorfmt("clspv failed for group '{}': {}",
-                                          group().name(), vk_log);
-                } else {
-                    group().m_vulkan_spirv       = spirv;
-                    group().m_vulkan_entry_point = entry;
-                    shadingsys().infofmt(
-                        "Vulkan SPIR-V group '{}': entry '{}', {} bytes",
-                        group().name(), entry, spirv.size() * 4);
-                    if (getenv("OSL_VULKAN_LEGALIZE_TRACE"))
-                        fprintf(stderr,
-                                "[vulkan] group '%s' -> %zu words, entry '%s'\n",
-                                group().name().c_str(), spirv.size(),
-                                entry.c_str());
-
-                    if (const char* spv_path = getenv("OSL_VULKAN_DUMP_SPV")) {
-                        // A serial counter is what makes a multi-group dump
-                        // readable: group name and thread id both collapse for
-                        // every group compiled on the same thread, so without
-                        // it each dump silently overwrites the previous one
-                        // and a failed group hides behind a successful one.
-                        static std::atomic<unsigned long long> s_dump_seq(0);
-                        std::string path = std::string(spv_path);
-                        if (path.find('%') != std::string::npos) {
-                            path = Strutil::replace(path, "%g",
-                                                    group().name().string());
-                            path = Strutil::replace(
-                                path, "%t",
-                                std::to_string(std::hash<std::thread::id>()(
-                                    std::this_thread::get_id())));
-                            path = Strutil::replace(
-                                path, "%n",
-                                std::to_string(s_dump_seq.fetch_add(1)));
-                        }
-                        OIIO::ofstream sfile(path, std::ios::binary);
-                        if (sfile)
-                            sfile.write((const char*)spirv.data(),
-                                        (std::streamsize)(spirv.size() * 4));
-                    }
-                }
+            } else if (getenv("OSL_VULKAN_LEGALIZE_TRACE")) {
+                fprintf(stderr,
+                        "[vulkan] group '%s' kept %zu entry point(s), "
+                        "%zu bytes of IR\n",
+                        group().name().c_str(),
+                        group().m_vulkan_entry_names.size(),
+                        group().m_vulkan_ir.size());
             }
         }
         group().m_vulkan_compile_log = vk_log;

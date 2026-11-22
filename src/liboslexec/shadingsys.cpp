@@ -2398,18 +2398,6 @@ ShadingSystemImpl::getattribute(ShaderGroup* group, string_view name,
         *(std::string*)val = exists ? group->m_llvm_ptx_compiled_version : "";
         return true;
     }
-    if (name == "vulkan_spirv_size" && type == TypeInt) {
-        *(int*)val = (int)(group->m_vulkan_spirv.size() * 4);
-        return true;
-    }
-    if (name == "vulkan_spirv" && type.basetype == TypeDesc::PTR) {
-        *(const std::vector<uint32_t>**)val = &group->m_vulkan_spirv;
-        return true;
-    }
-    if (name == "vulkan_entry_point" && type == TypeDesc::STRING) {
-        *(ustring*)val = group->m_vulkan_entry_point;
-        return true;
-    }
     if (name == "vulkan_log" && type == TypeDesc::STRING) {
         *(ustring*)val = ustring(group->m_vulkan_compile_log);
         return true;

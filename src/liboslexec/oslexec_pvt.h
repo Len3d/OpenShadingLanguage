@@ -2156,21 +2156,18 @@ private:
     // PTX assembly for compiled ShaderGroup
     std::string m_llvm_ptx_compiled_version;
 
-    // Vulkan-flavor SPIR-V for the compiled ShaderGroup, and the log of the
-    // legalization + clspv lowering that produced it.  Empty unless the group
-    // was compiled with the Vulkan backend enabled.
-    std::vector<uint32_t> m_vulkan_spirv;
-    std::string m_vulkan_compile_log;
-    ustring m_vulkan_entry_point;
-
-    // Batch mode (OSL_VULKAN_BATCH=1): instead of compiling this group to its
-    // own SPIR-V, keep the legalised IR text and the names of the functions a
-    // caller has to invoke.  A whole-frame render kernel has to be able to call
-    // *any* material, and SPIR-V modules cannot call across modules, so all the
-    // groups plus the render kernel are linked into one module and compiled
-    // once -- see vulkan_module.cpp.
+    // Vulkan device lowering for the compiled ShaderGroup: the legalised IR
+    // text, the names of the functions a caller has to invoke, and the log of
+    // the link + legalization that produced them.  Empty unless the group was
+    // compiled with the Vulkan backend enabled.
+    //
+    // A whole-frame render kernel has to be able to call *any* material, and
+    // SPIR-V modules cannot call across modules, so every group plus the render
+    // kernel is linked into one module and compiled once -- see
+    // vulkan_module.cpp.
     std::string m_vulkan_ir;
     std::vector<std::string> m_vulkan_entry_names;
+    std::string m_vulkan_compile_log;
 
     ParamValueList m_pending_params;          // Pending Parameter() values
     std::vector<ParamHints> m_pending_hints;  // ParamHints of pending params

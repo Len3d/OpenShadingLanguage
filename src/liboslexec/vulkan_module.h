@@ -25,15 +25,18 @@ class ShaderGroup;
 
 namespace pvt {
 
-/// Legalised IR text kept by a group compiled with OSL_VULKAN_BATCH=1.
+/// Legalised IR text kept by a group compiled with the Vulkan backend enabled
+/// (OSL_USE_VULKAN=1).
 OSL_DLL_EXPORT std::string vulkan_group_ir (const ShaderGroup& group);
 
 /// Names of the functions a caller has to invoke for that group (one per
 /// material layer, in order).
 OSL_DLL_EXPORT std::vector<std::string> vulkan_group_entry_names (const ShaderGroup& group);
 
-/// Same target selection as vulkan_add_kernel_entry, exposed so the batch path
-/// can record entry names without building a kernel.
+/// Which functions a caller has to invoke for this module (a non-trivial
+/// osl_init_group_*, or the osl_layer_* functions when that one was folded to
+/// an empty body).  Run on the legalised group module so the whole-frame
+/// assembly knows what to call.
 bool vulkan_collect_entry_names (llvm::Module& M, std::vector<std::string>& out,
                                  std::string& out_log);
 

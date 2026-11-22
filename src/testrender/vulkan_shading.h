@@ -12,14 +12,10 @@
 /// Host side of the Vulkan compute path.
 ///
 /// One instance owns the logical device, the storage buffer and the command
-/// machinery; each OSL shader group becomes one compute pipeline on it
-/// (`add_shader()`), because every group has its own Vulkan SPIR-V module.
-///
-/// `shade()` runs one shading point: the caller hands over a ShadeBlock (see
-/// liboslexec/vulkan_types.h for its layout), already filled with that point's
-/// ShaderGlobals; the block is copied into the storage buffer, one workgroup of
-/// one invocation is dispatched, and the block is read back so the caller can
-/// read the closure root the shader wrote.
+/// machinery.  The whole frame is one pipeline (`add_shader()`), dispatched
+/// once (`dispatch()`): every material, the ray generation, the intersection
+/// and the accumulation live in that single module, because SPIR-V modules
+/// cannot call across modules.
 ///
 /// Vulkan types stay out of this header on purpose, so the rest of testrender
 /// never has to include vulkan.h.
@@ -31,15 +27,10 @@ public:
     /// Create the device for the first compute-capable physical device.
     bool init(std::string& err);
 
-    /// Build a compute pipeline from one group's SPIR-V module.  Returns a
-    /// non-negative id to pass to shade(), or -1 on failure.
+    /// Build a compute pipeline from one SPIR-V module.  Returns a non-negative
+    /// id to pass to dispatch(), or -1 on failure.
     int add_shader(const uint32_t* spirv, size_t word_count, const char* entry,
                    std::string& err);
-
-    /// Run shader `id` for one shading point.  `block` is input (the
-    /// ShaderGlobals the host prepared) and output (whatever the shader wrote,
-    /// including its closure arena).
-    bool shade(int id, void* block, size_t block_bytes, std::string& err);
 
     /// One decoded texture: RGBA32F, the whole mip chain, largest level first.
     /// `hash` is the ustring hash of the filename, which is exactly what the

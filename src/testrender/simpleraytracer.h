@@ -164,31 +164,25 @@ private:
     // Vulkan shading path
     // ------------------------------------------------------------------
     //
-    // When the shading system was asked to also lower groups to Vulkan
-    // SPIR-V (OSL_USE_VULKAN=1), each shading point is evaluated by dispatching
-    // that group's compute shader instead of running the group on the CPU.
-    // The ray tracing, closure evaluation and image accumulation all stay on
-    // the host -- what moves to the GPU is exactly the OSL shader execution.
-    //
-    // One pipeline per surface group, plus one ShadeBlock scratch buffer per
-    // thread (the block must outlive the closure evaluation, because `sg.Ci`
-    // points into it).
+    // When the shading system was asked to lower groups to Vulkan SPIR-V
+    // (OSL_USE_VULKAN=1), one module is assembled out of every surface group
+    // plus the device frame renderer and dispatched once per image: ray
+    // generation, intersection, shading, closure sampling and accumulation all
+    // run on the device.  There is no per-material pipeline -- a whole-frame
+    // kernel has to call any material and SPIR-V cannot call across modules --
+    // so the host render loop only runs when the device path was not requested.
     std::unique_ptr<::VulkanShading> m_vk;
-    std::vector<int> m_vk_pipeline;  // one pipeline id per material, -1 = CPU
-    // Batch mode: which case of the synthesised `osl_vk_shade_dispatch` runs a
-    // given material.  The dispatch numbers the groups it was handed in order,
-    // skipping materials without a surface group, so it is *not* necessarily the
-    // material index -- and the kernel needs this number, not the index, for the
-    // background shader.
+    // Which case of the synthesised material dispatch runs a given material.
+    // The dispatch numbers the groups it was handed in order, skipping
+    // materials without a surface group, so it is *not* necessarily the
+    // material index -- and the kernel needs this number, not the index, for
+    // the background shader.
     std::vector<int> m_vk_dispatch_id;
-    // Whole-frame pipeline (batch mode): one dispatch per image, doing the
-    // ray generation, intersection, shading and accumulation on the device.
+    // The whole-frame pipeline: one dispatch per image.
     int m_vk_frame = -1;
     // Textures the shaders referenced while compiling; recorded by the
     // get_texture_handle() override and uploaded to the device.
     std::vector<ustring> m_vk_texture_names;
-    bool m_vulkan_ready  = false;
-    bool m_vulkan_failed = false;
     /// OSL_USE_VULKAN was set: the caller wants the device path, so a device
     /// failure must be reported instead of quietly becoming a CPU render.
     bool m_vulkan_requested = false;
@@ -207,7 +201,6 @@ private:
     /// allowed.  Also marks the render as a hard failure.
     void vulkan_report_failure(const char* what, const char* detail);
 
-    bool shade_vulkan(ShaderGlobals& sg, int shaderID, ShadingContext* ctx);
     /// Decode and upload every recorded texture into the device buffer.
     void upload_vulkan_textures();
     /// Render the whole image with the batch pipeline: lay the scene out in the

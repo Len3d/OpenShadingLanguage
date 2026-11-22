@@ -78,20 +78,6 @@ std::string vulkan_legalize_summary ();
 /// be parsed or the link rejected a type mismatch.
 bool vulkan_link_shadeops (llvm::Module& M, std::string& out_log);
 
-/// Add the compute kernel entry point: `spir_kernel void @osl_kernel(ptr addrspace(1))`.
-///
-/// The kernel is the one thing clspv insists on: without a kernel function there
-/// is no `OpEntryPoint` at all and the module is not a dispatchable shader.  It
-/// bodies the group entry (the function named `osl_init_group_<group>`), passing
-/// the ShaderGlobals pointer derived from the storage buffer and NULL for
-/// groupdata / userdata / output (see vulkan_types.h for why those are dead).
-///
-/// Must run *after* vulkan_legalize_module: the kernel argument stays in
-/// address space 1 so that clspv turns it into a storage buffer descriptor,
-/// while everything it calls is already generic.
-bool vulkan_add_kernel_entry (llvm::Module& M, std::string& out_entry_name,
-                              std::string& out_log);
-
 /// Which functions a caller has to invoke for this module (a non-trivial
 /// osl_init_group_*, or the osl_layer_* functions when that one was folded
 /// to an empty body).  Used by the batch path, which keeps the IR instead of

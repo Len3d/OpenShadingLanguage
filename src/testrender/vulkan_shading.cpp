@@ -498,55 +498,6 @@ int VulkanShading::add_shader(const uint32_t* spirv, size_t word_count,
 }
 
 
-bool VulkanShading::shade(int id, void* block, size_t block_bytes,
-                          std::string& err)
-{
-    Impl& I = *m_impl;
-    // One queue, one command buffer, one fence, shared by every rendering
-    // thread: the submit/wait pair has to be serialized.
-    std::lock_guard<std::mutex> lock(I.submit_mutex);
-    if (!I.inited) {
-        err = "VulkanShading::shade before init";
-        return false;
-    }
-    if (id < 0 || id >= (int)I.pipelines.size()) {
-        err = "VulkanShading::shade with an unknown pipeline id";
-        return false;
-    }
-    if (block_bytes > I.buffer_bytes) {
-        err = "ShadeBlock does not fit in the storage buffer";
-        return false;
-    }
-
-    memcpy(I.mapped, block, block_bytes);
-
-    VK_TRY(vkResetFences(I.device, 1, &I.fence), err);
-    VK_TRY(vkResetCommandBuffer(I.cmdbuf, 0), err);
-
-    VkCommandBufferBeginInfo cbbi {};
-    cbbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    VK_TRY(vkBeginCommandBuffer(I.cmdbuf, &cbbi), err);
-    vkCmdBindPipeline(I.cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE,
-                      I.pipelines[id].pipe);
-    vkCmdBindDescriptorSets(I.cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            I.pipelines[id].layout, 0, 1, &I.dset, 0, nullptr);
-    // One workgroup of one invocation: the module's gl_WorkGroupSize is
-    // (1,1,1) and the kernel takes the address of a single ShadeBlock.
-    vkCmdDispatch(I.cmdbuf, 1, 1, 1);
-    VK_TRY(vkEndCommandBuffer(I.cmdbuf), err);
-
-    VkSubmitInfo si {};
-    si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    si.commandBufferCount = 1;
-    si.pCommandBuffers    = &I.cmdbuf;
-    VK_TRY(vkQueueSubmit(I.queue, 1, &si, I.fence), err);
-    VK_TRY(vkWaitForFences(I.device, 1, &I.fence, VK_TRUE, UINT64_MAX), err);
-
-    memcpy(block, I.mapped, block_bytes);
-    return true;
-}
-
 
 bool VulkanShading::set_textures(const std::vector<Texture>& textures,
                                  std::string& err)

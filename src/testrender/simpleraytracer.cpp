@@ -1065,21 +1065,12 @@ SimpleRaytracer::subpixel_radiance(float x, float y, Sampler& sampler,
             break;  // no shader attached? done
 
         // execute shader and process the resulting list of closures
-        if (!m_vulkan_ready || !shade_vulkan(sg, shaderID, ctx)) {
-            // When the device path was explicitly requested and shading it on
-            // the CPU is not allowed, leave this path unshaded: computing it
-            // here would produce a frame that looks plausible while having
-            // come from the CPU.  shade_vulkan() has already reported the
-            // failure.
-            if (m_vulkan_requested && !vulkan_fallback_allowed())
-                break;
-            shadingsys->execute(*ctx, *m_shaders[shaderID].surf, sg);
-            if (getenv("OSL_VULKAN_SHADE_TRACE") && sg.Ci) {
-                const int* id = &sg.Ci->id;
-                const float* w = (const float*)(id + 1);
-                fprintf(stderr, "[cpu] material %d root id=%d w=(%g,%g,%g)\n",
-                        shaderID, *id, w[0], w[1], w[2]);
-            }
+        shadingsys->execute(*ctx, *m_shaders[shaderID].surf, sg);
+        if (getenv("OSL_VULKAN_SHADE_TRACE") && sg.Ci) {
+            const int* id = &sg.Ci->id;
+            const float* w = (const float*)(id + 1);
+            fprintf(stderr, "[cpu] material %d root id=%d w=(%g,%g,%g)\n",
+                    shaderID, *id, w[0], w[1], w[2]);
         }
 #else
         if (shaderID < 0)
@@ -1272,20 +1263,11 @@ SimpleRaytracer::antialias_pixel(int x, int y, ShadingContext* ctx)
 
 namespace {
 
-// Offsets inside one ShadeBlock.  liboslexec/vulkan_types.h is the authority
-// (vulkan_abi_check.cpp static_asserts every one of these against
-// OSL::ShaderGlobals at build time); they are repeated here because that
-// header is internal to liboslexec and not installed.
-const size_t kShadeBlockStride     = 640;  // one invocation
-const size_t kShadeBlockCursorOff  = 216;  // sg.renderstate: arena offset
-const size_t kShadeBlockCiOff      = 288;  // sg.Ci: root closure offset
-const size_t kShadeBlockGlobalsEnd = 320;  // start of the closure arena
-// The group-data block (the `groupdata` argument of every layer entry) lives
-// past the 256-byte closure pool, so it can never collide with the bump allocator
-// that grows upward from the pool.  A shader whose parameter block is not
-// SROA-promoted to SSA values -- any body with a branch, i.e. checkerboard -- keeps
-// its layer params there and its first word is the "already initialised" flag.
-const size_t kShadeBlockGroupDataOff = 576;
+// The stride of one invocation's ShadeBlock.  liboslexec/vulkan_types.h is the
+// authority (vulkan_abi_check.cpp static_asserts it against OSL::ShaderGlobals
+// at build time); it is repeated here because that header is internal to
+// liboslexec and not installed.
+const size_t kShadeBlockStride = 640;
 
 }  // namespace
 
@@ -1293,60 +1275,6 @@ const size_t kShadeBlockGroupDataOff = 576;
 static bool
 decode_texture(const std::string& filename, VulkanShading::Texture& out);
 
-// Structural comparison of two closure trees, walking the same way
-// process_closure() does.  Pointers only ever point inside the ShadeBlock that
-// produced them, so a mismatch of shape, id or weight is all we need to report.
-static bool
-closure_equal(const ClosureColor* a, const ClosureColor* b, int depth)
-{
-    if (a == b)
-        return true;
-    if (!a || !b || depth > 16)
-        return false;
-    if (a->id != b->id)
-        return false;
-    if (a->id == ClosureColor::MUL) {
-        const ClosureMul *am = a->as_mul(), *bm = b->as_mul();
-        for (int i = 0; i < 3; ++i)
-            if (fabsf(am->weight[i] - bm->weight[i]) > 1e-6f)
-                return false;
-        return closure_equal(am->closure, bm->closure, depth + 1);
-    }
-    if (a->id == ClosureColor::ADD)
-        return closure_equal(a->as_add()->closureA, b->as_add()->closureA,
-                             depth + 1)
-            && closure_equal(a->as_add()->closureB, b->as_add()->closureB,
-                             depth + 1);
-    const ClosureComponent* ac = a->as_comp();
-    const ClosureComponent* bc = b->as_comp();
-    for (int i = 0; i < 3; ++i)
-        if (fabsf(ac->w[i] - bc->w[i]) > 1e-5f)
-            return false;
-    return true;
-}
-
-static void
-dump_closure(const char* tag, const ClosureColor* c, int depth)
-{
-    if (!c || depth > 8) {
-        fprintf(stderr, "%s (nil)\n", tag);
-        return;
-    }
-    if (c->id == ClosureColor::MUL) {
-        fprintf(stderr, "%s mul w=(%.6g,%.6g,%.6g)\n", tag,
-                c->as_mul()->weight[0], c->as_mul()->weight[1],
-                c->as_mul()->weight[2]);
-        dump_closure(tag, c->as_mul()->closure, depth + 1);
-    } else if (c->id == ClosureColor::ADD) {
-        fprintf(stderr, "%s add\n", tag);
-        dump_closure(tag, c->as_add()->closureA, depth + 1);
-        dump_closure(tag, c->as_add()->closureB, depth + 1);
-    } else {
-        const ClosureComponent* cc = c->as_comp();
-        fprintf(stderr, "%s id=%d w=(%.6g,%.6g,%.6g)\n", tag, cc->id, cc->w[0],
-                cc->w[1], cc->w[2]);
-    }
-}
 
 bool
 SimpleRaytracer::vulkan_fallback_allowed() const
@@ -1379,13 +1307,11 @@ SimpleRaytracer::vulkan_report_failure(const char* what, const char* detail)
 void
 SimpleRaytracer::init_vulkan_shading()
 {
-    m_vulkan_ready            = false;
-    m_vulkan_failed           = false;
     m_vulkan_requested        = false;
     m_vulkan_hard_failure     = false;
     m_vulkan_failure_reported = false;
+    m_vk_frame                = -1;
     m_vk.reset();
-    m_vk_pipeline.assign(m_shaders.size(), -1);
 
     const char* enable = getenv("OSL_USE_VULKAN");
     m_vulkan_requested = enable && OIIO::Strutil::stoi(std::string(enable)) != 0;
@@ -1395,7 +1321,6 @@ SimpleRaytracer::init_vulkan_shading()
     m_vk.reset(new VulkanShading);
     std::string err;
     if (!m_vk->init(err)) {
-        m_vulkan_failed = true;
         m_vk.reset();
         fprintf(stderr, "[vulkan] device init failed: %s\n", err.c_str());
         vulkan_report_failure("device init failed", err.c_str());
@@ -1403,140 +1328,94 @@ SimpleRaytracer::init_vulkan_shading()
     }
     fprintf(stderr, "[vulkan] device: %s\n", m_vk->device_name().c_str());
 
-    int nok = 0, nfail = 0;
-
-    // Batch path: instead of compiling each material on its own, assemble one
-    // module out of every group plus the device frame renderer, so the whole
-    // frame (ray generation, sampling, intersection, accumulation) can run in
-    // one dispatch.  See src/liboslexec/vulkan_module.cpp.
-    if (getenv("OSL_VULKAN_BATCH")) {
-        std::vector<std::string> irs;
-        std::vector<std::vector<std::string>> ents;
-        m_vk_dispatch_id.assign(m_shaders.size(), -1);
-        for (size_t i = 0; i < m_shaders.size(); ++i) {
-            if (!m_shaders[i].surf)
-                continue;
-            shadingsys->optimize_group(&*m_shaders[i].surf, nullptr);
-            // The dispatch numbers the groups it is handed in order, so the
-            // material's case index is the position just before this push.
-            m_vk_dispatch_id[i] = (int)irs.size();
-            irs.push_back(OSL::pvt::vulkan_group_ir(*m_shaders[i].surf));
-            ents.push_back(
-                OSL::pvt::vulkan_group_entry_names(*m_shaders[i].surf));
-            if (irs.back().empty()) {
-                fprintf(stderr,
-                        "[vulkan] material %zu kept no Vulkan IR "
-                        "(is OSL_VULKAN_BATCH set before compiling?)\n",
-                        i);
-                vulkan_report_failure("a material kept no Vulkan IR", nullptr);
-            }
-        }
-        std::string mod_ir, log;
-        if (!OSL::pvt::vulkan_build_render_module(irs, ents, mod_ir, log)) {
-            fprintf(stderr, "[vulkan] batch module assembly failed: %s\n",
-                    log.c_str());
-            vulkan_report_failure("batch module assembly failed", log.c_str());
-            return;
-        }
-        fprintf(stderr, "[vulkan] batch module: %zu group(s), %zu bytes of IR\n",
-                irs.size(), mod_ir.size());
-        if (const char* dump = getenv("OSL_VULKAN_DUMP_BATCH_IR")) {
-            OIIO::ofstream f;
-            OIIO::Filesystem::open(f, dump);
-            if (f)
-                f << mod_ir;
-            // Also write each group's own IR, so a per-group bisect of a clspv
-            // failure does not need a debugger.
-            for (size_t i = 0; i < irs.size(); ++i) {
-                std::string one = std::string(dump) + ".g" + std::to_string(i)
-                                  + ".ll";
-                OIIO::ofstream gf;
-                OIIO::Filesystem::open(gf, one);
-                if (gf)
-                    gf << irs[i];
-            }
-        }
-        std::vector<uint32_t> spirv;
-        if (!OSL::pvt::clspv_compile(mod_ir, "-x ir --arch=spirv64 --spv-version=1.4", spirv,
-                                     log)) {
-            fprintf(stderr, "[vulkan] batch clspv failed: %s\n", log.c_str());
-            vulkan_report_failure("clspv failed", log.c_str());
-            return;
-        }
-        fprintf(stderr, "[vulkan] batch SPIR-V: %zu words\n", spirv.size());
-        if (const char* spvpath = getenv("OSL_VULKAN_DUMP_SPV")) {
-            FILE* fp = fopen(spvpath, "wb");
-            if (fp) {
-                fwrite(spirv.data(), sizeof(uint32_t), spirv.size(), fp);
-                fclose(fp);
-                fprintf(stderr, "[vulkan] wrote %s\n", spvpath);
-            }
-        }
-        // One pipeline for the whole frame: entry `osl_kernel` sits at the top
-        // of the module and calls osl_vk_raytrace_frame, which reaches every
-        // material through the synthesised dispatch.
-        int frame_id = m_vk->add_shader(spirv.data(), spirv.size(), "osl_kernel",
-                                        err);
-        if (frame_id < 0) {
-            fprintf(stderr, "[vulkan] frame pipeline failed: %s\n",
-                    err.c_str());
-            vulkan_report_failure("frame pipeline failed", err.c_str());
-            return;
-        }
-        m_vk_frame = frame_id;
-        upload_vulkan_textures();
-        fprintf(stderr,
-                "[vulkan] whole-frame pipeline ready (pipeline %d): raytracing, "
-                "sampling and accumulation run on the device\n",
-                frame_id);
-        return;
-    }
-
+    // Assemble one module out of every group plus the device frame renderer,
+    // so the whole frame (ray generation, sampling, intersection,
+    // accumulation) runs in one dispatch.  A whole-frame kernel has to be able
+    // to call *any* material, and SPIR-V modules cannot call across modules,
+    // which is why this is the only device path: there is no per-material
+    // pipeline to dispatch a single shading point through.  See
+    // src/liboslexec/vulkan_module.cpp.
+    std::vector<std::string> irs;
+    std::vector<std::vector<std::string>> ents;
+    m_vk_dispatch_id.assign(m_shaders.size(), -1);
     for (size_t i = 0; i < m_shaders.size(); ++i) {
         if (!m_shaders[i].surf)
             continue;
         // Groups are compiled lazily (OSL's ShaderGroupEnd only builds the
-        // group data; the LLVM/clspv work happens on demand), so the SPIR-V
-        // does not exist yet when the renderer sets up.  Force the compile,
-        // exactly like the OptiX renderer does before it asks for PTX.
+        // group data; the LLVM/clspv work happens on demand), so the IR does
+        // not exist yet when the renderer sets up.  Force the compile, exactly
+        // like the OptiX renderer does before it asks for PTX.
         shadingsys->optimize_group(&*m_shaders[i].surf, nullptr);
-        const std::vector<uint32_t>* spv = nullptr;
-        if (!shadingsys->getattribute(&*m_shaders[i].surf, "vulkan_spirv",
-                                      TypeDesc(TypeDesc::PTR), &spv)
-            || !spv || spv->empty()) {
-            ++nfail;
+        // The dispatch numbers the groups it is handed in order, so the
+        // material's case index is the position just before this push.
+        m_vk_dispatch_id[i] = (int)irs.size();
+        irs.push_back(OSL::pvt::vulkan_group_ir(*m_shaders[i].surf));
+        ents.push_back(OSL::pvt::vulkan_group_entry_names(*m_shaders[i].surf));
+        if (irs.back().empty()) {
             fprintf(stderr,
-                    "[vulkan] material %zu has no SPIR-V; keeping it on the "
-                    "CPU path\n",
+                    "[vulkan] material %zu kept no Vulkan IR (was the group "
+                    "compiled with the Vulkan backend enabled?)\n",
                     i);
-            vulkan_report_failure("material has no SPIR-V", nullptr);
-            continue;
+            vulkan_report_failure("a material kept no Vulkan IR", nullptr);
         }
-        ustring entry;
-        shadingsys->getattribute(&*m_shaders[i].surf, "vulkan_entry_point",
-                                 TypeDesc::STRING, &entry);
-        int id = m_vk->add_shader(spv->data(), spv->size(), entry.c_str(),
-                                  err);
-        if (id < 0) {
-            ++nfail;
-            fprintf(stderr, "[vulkan] material %zu pipeline failed: %s\n", i,
-                    err.c_str());
-            vulkan_report_failure("material pipeline failed", err.c_str());
-            continue;
-        }
-        m_vk_pipeline[i] = id;
-        ++nok;
     }
-
-    m_vulkan_ready = nok > 0;
-
-    // Textures the shaders asked for, decoded once and uploaded into the same
-    // storage buffer the kernels read their ShadeBlock from.
-    if (nok > 0)
-        upload_vulkan_textures();
-
-    fprintf(stderr, "[vulkan] %d pipeline(s) ready, %d material(s) on CPU\n",
-            nok, nfail);
+    std::string mod_ir, log;
+    if (!OSL::pvt::vulkan_build_render_module(irs, ents, mod_ir, log)) {
+        fprintf(stderr, "[vulkan] module assembly failed: %s\n", log.c_str());
+        vulkan_report_failure("module assembly failed", log.c_str());
+        return;
+    }
+    fprintf(stderr, "[vulkan] module: %zu group(s), %zu bytes of IR\n",
+            irs.size(), mod_ir.size());
+    if (const char* dump = getenv("OSL_VULKAN_DUMP_BATCH_IR")) {
+        OIIO::ofstream f;
+        OIIO::Filesystem::open(f, dump);
+        if (f)
+            f << mod_ir;
+        // Also write each group's own IR, so a per-group bisect of a clspv
+        // failure does not need a debugger.
+        for (size_t i = 0; i < irs.size(); ++i) {
+            std::string one
+                = std::string(dump) + ".g" + std::to_string(i) + ".ll";
+            OIIO::ofstream gf;
+            OIIO::Filesystem::open(gf, one);
+            if (gf)
+                gf << irs[i];
+        }
+    }
+    std::vector<uint32_t> spirv;
+    if (!OSL::pvt::clspv_compile(mod_ir,
+                                 "-x ir --arch=spirv64 --spv-version=1.4",
+                                 spirv, log)) {
+        fprintf(stderr, "[vulkan] clspv failed: %s\n", log.c_str());
+        vulkan_report_failure("clspv failed", log.c_str());
+        return;
+    }
+    fprintf(stderr, "[vulkan] SPIR-V: %zu words\n", spirv.size());
+    if (const char* spvpath = getenv("OSL_VULKAN_DUMP_SPV")) {
+        FILE* fp = fopen(spvpath, "wb");
+        if (fp) {
+            fwrite(spirv.data(), sizeof(uint32_t), spirv.size(), fp);
+            fclose(fp);
+            fprintf(stderr, "[vulkan] wrote %s\n", spvpath);
+        }
+    }
+    // Entry `osl_kernel` sits at the top of the module and calls
+    // osl_vk_raytrace_frame, which reaches every material through the
+    // synthesised dispatch.
+    int frame_id
+        = m_vk->add_shader(spirv.data(), spirv.size(), "osl_kernel", err);
+    if (frame_id < 0) {
+        fprintf(stderr, "[vulkan] frame pipeline failed: %s\n", err.c_str());
+        vulkan_report_failure("frame pipeline failed", err.c_str());
+        return;
+    }
+    m_vk_frame = frame_id;
+    upload_vulkan_textures();
+    fprintf(stderr,
+            "[vulkan] whole-frame pipeline ready (pipeline %d): raytracing, "
+            "sampling and accumulation run on the device\n",
+            frame_id);
 }
 
 
@@ -1621,102 +1500,6 @@ decode_texture(const std::string& filename, VulkanShading::Texture& out)
 }
 
 
-bool
-SimpleRaytracer::shade_vulkan(ShaderGlobals& sg, int shaderID, ShadingContext* ctx)
-{
-    if (!m_vulkan_ready || shaderID < 0
-        || shaderID >= (int)m_vk_pipeline.size()
-        || m_vk_pipeline[shaderID] < 0)
-        return false;
-
-    // One block per thread: the renderer shades pixels from several threads at
-    // once, and a shared block would have one thread's dispatch overwrite the
-    // closure another thread is about to evaluate.  It has to stay alive
-    // until process_closure() returns, so it cannot be a local.
-    static thread_local std::vector<unsigned char> tls_block;
-    std::vector<unsigned char>& blk = tls_block;
-
-    blk.assign(kShadeBlockStride, 0);
-    memcpy(blk.data(), &sg, kShadeBlockGlobalsEnd);
-    // The two fields the shader treats as *offsets* must start clean, and the
-    // stale host pointers in the rest of the runtime part of ShaderGlobals
-    // (tracedata, objdata, context, ...) are meaningless on the device.
-    memset(blk.data() + kShadeBlockCursorOff, 0,
-           kShadeBlockGlobalsEnd - kShadeBlockCursorOff);
-    // Offset 0 is a perfectly valid arena offset -- it is where the *first*
-    // component lands, which is exactly what a simple shader like matte
-    // produces.  So the root field cannot use 0 to mean "no closure": mark it
-    // with -1 instead, and the shader only ever writes a non-negative offset.
-    long long no_root = -1;
-    memcpy(blk.data() + kShadeBlockCiOff, &no_root, sizeof(no_root));
-
-    std::string err;
-    if (getenv("OSL_VULKAN_SHADE_TRACE")) {
-        static std::atomic<unsigned long long> s_n(0);
-        fprintf(stderr, "[vulkan] #%llu dispatch material %d\n",
-                s_n.fetch_add(1), shaderID);
-    }
-    if (!m_vk->shade(m_vk_pipeline[shaderID], blk.data(), kShadeBlockStride,
-                     err)) {
-        m_vulkan_failed = true;
-        fprintf(stderr, "[vulkan] shade failed: %s\n", err.c_str());
-        vulkan_report_failure("shade dispatch failed", err.c_str());
-        return false;
-    }
-
-    // The shader stored the root closure as an offset into the block's arena;
-    // point the host evaluator at it.  blk outlives this call because
-    // process_closure() runs right after it, while sg.Ci is still live.
-    long long ci = -1;
-    memcpy(&ci, blk.data() + kShadeBlockCiOff, sizeof(ci));
-    if (getenv("OSL_VULKAN_SHADE_TRACE"))
-        fprintf(stderr, "[vulkan]   ci offset = %lld\n", ci);
-    if (getenv("OSL_VULKAN_SHADE_TRACE") && ci >= 0) {
-        const int* id = (const int*)(blk.data() + kShadeBlockGlobalsEnd + ci);
-        const float* w = (const float*)(id + 1);
-        fprintf(stderr, "[vulkan]     root id=%d w=(%g,%g,%g)\n", *id, w[0],
-                w[1], w[2]);
-    }
-    sg.Ci = (ci >= 0) ? (ClosureColor*)(blk.data() + kShadeBlockGlobalsEnd + ci)
-                      : nullptr;
-
-    // Verification hook: run the same shading point through the CPU path and
-    // compare the two closure trees.  A difference here is a *shader*
-    // difference, not a filtering/esimation difference, which makes "why do
-    // the images differ" answerable without staring at pixels.
-    if (getenv("OSL_VULKAN_VERIFY")) {
-        static thread_local std::atomic<unsigned long long> s_mismatch(0);
-        ShaderGlobals cpu_sg = sg;
-        // Leave whatever closure the alias already held: this object belongs
-        // to the render loop, and clearing Ci makes matching shaders look like
-        // mismatches (the matte path never assigns if the texture is what set
-        // the color).
-        if (m_vk_pipeline[shaderID] >= 0)
-            shadingsys->execute(*ctx, *m_shaders[shaderID].surf, cpu_sg);
-        if (!closure_equal(sg.Ci, cpu_sg.Ci, 0)) {
-            long long n = s_mismatch.fetch_add(1);
-            if (n < 12) {
-                fprintf(stderr, "[verify] material %d mismatch:\n", shaderID);
-                dump_closure("  gpu", sg.Ci, 0);
-                dump_closure("  cpu", cpu_sg.Ci, 0);
-                long long cursor = 0;
-                memcpy(&cursor, blk.data() + kShadeBlockCursorOff,
-                       sizeof(cursor));
-                fprintf(stderr, "  arena cursor = %lld, root ci = %lld\n",
-                        cursor, ci);
-                for (int i = 0; i < 3; ++i) {
-                    const int* c = (const int*)(blk.data() + kShadeBlockGlobalsEnd
-                                                + 16 * i);
-                    fprintf(stderr,
-                            "  pool[%d] id=%d w=(%.6g,%.6g,%.6g)\n", i, c[0],
-                            ((const float*)c)[1], ((const float*)c)[2],
-                            ((const float*)c)[3]);
-                }
-            }
-        }
-    }
-    return true;
-}
 
 
 void
