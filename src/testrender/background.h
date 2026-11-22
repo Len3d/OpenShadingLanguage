@@ -138,6 +138,16 @@ struct Background {
         return values[y * res + x];
     }
 
+    /// Read-only access to the precomputed table, for a renderer that wants to
+    /// evaluate the background somewhere other than the host (the Vulkan path
+    /// uploads it so its indirect rays can use the same importance-sampled
+    /// estimate, and the same MIS weight, as the CPU).
+    OSL_HOSTDEVICE const Vec3* table_values() const { return values; }
+    OSL_HOSTDEVICE const float* table_rows() const { return rows; }
+    OSL_HOSTDEVICE const float* table_cols() const { return cols; }
+    OSL_HOSTDEVICE int table_res() const { return res; }
+    OSL_HOSTDEVICE float table_invjacobian() const { return invjacobian; }
+
 #ifdef __CUDACC__
     OSL_HOSTDEVICE
     void set_variables(Vec3* values_in, float* rows_in, float* cols_in,

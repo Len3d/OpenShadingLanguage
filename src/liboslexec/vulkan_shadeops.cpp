@@ -315,6 +315,53 @@ osl_mul_closure_float(GlobalPtr sg_, GlobalPtr a, float w)
 
 
 // ---------------------------------------------------------------------------
+// Closure addition
+// ---------------------------------------------------------------------------
+//
+// `a + b` for closures, which OSL emits for every shader that builds more than
+// one closure (envmap's `Kb*c*color(1,1,0)*background() + Kb*c*color(0,0,1)*
+// background()` is the shortest example).
+//
+// The CPU version (opclosure.cpp:19) allocates a ClosureAdd node holding two
+// `ClosureColor*`.  That shape -- a pointer stored in memory -- is exactly what
+// clspv cannot compile (see the arena comment above), so the node keeps the two
+// *arena offsets* instead.  Nothing outside this file and vulkan_render.cpp ever
+// looks inside an ADD node, so the encoding stays internal: the kernel's
+// background evaluator walks it with offsets, the same way it walks a
+// component.  The node keeps the CPU's 24-byte layout (id at 0, then the two
+// 8-byte fields) so an offset is stored exactly where a pointer would be.
+struct ClosureAddVK {
+    int id;
+    long long closureA;  // arena offset, not a pointer
+    long long closureB;  // arena offset, not a pointer
+};
+static_assert(sizeof(ClosureAddVK) == 24, "add node keeps the CPU layout");
+
+GlobalPtr
+osl_add_closure_closure(GlobalPtr sg_, GlobalPtr a, GlobalPtr b)
+{
+    if (a == (GlobalPtr)0)
+        return b;
+    if (b == (GlobalPtr)0)
+        return a;
+
+    // 24 bytes rounded up to 32: arena_bump() assumes every allocation is a
+    // multiple of 16 so the next component keeps its 16-byte alignment.
+    long long off       = 0;
+    GlobalPtr p         = arena_bump(sg_, (24 + 15) & ~15ll, &off);
+    ClosureAddVK* node  = (ClosureAddVK*)p;
+    node->id            = kClosureAddID;
+    node->closureA = (long long)((GlobalPtr)a - ((GlobalPtr)sg_ + kOffPool));
+    node->closureB = (long long)((GlobalPtr)b - ((GlobalPtr)sg_ + kOffPool));
+    // Same root re-publish as the MUL paths: this call is typically the last
+    // operation before the shader stores its Ci, and the offset of a value
+    // returned by a call is otherwise untraceable in the IR.
+    arena_set_root(sg_, off);
+    return p;
+}
+
+
+// ---------------------------------------------------------------------------
 // normalize(vector)
 // ---------------------------------------------------------------------------
 

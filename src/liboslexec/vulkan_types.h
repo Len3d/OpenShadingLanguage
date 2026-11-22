@@ -287,6 +287,20 @@ struct FrameParams {
     /// against the CPU path without rebuilding the device shaders.
     float tex_foot_scale;
     float tex_lod_bias;
+    /// Background importance table, uploaded from testrender's Background
+    /// (src/testrender/background.h Background::prepare): `values` is res*res
+    /// Vec3 already divided by the entry's own pdf, `rows` is res floats and
+    /// `cols` is res*res floats.  Indirect rays that miss the scene go through
+    /// it exactly like the CPU's Background::eval() -- including the MIS weight
+    /// against the bsdf pdf -- because evaluating the shader directly there
+    /// gives the right mean but the wrong weight, which lights every path up by
+    /// 1/mis.  bg_res == 0 means the scene has no importance table.
+    int bg_res;
+    float bg_invjacobian;
+    int bg_pad0, bg_pad1;
+    long long bg_values_offset;
+    long long bg_rows_offset;
+    long long bg_cols_offset;
 };
 
 /// Where FrameParams sits: the first bytes of the buffer, so the kernel can

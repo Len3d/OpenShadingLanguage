@@ -166,6 +166,12 @@ private:
     // points into it).
     std::unique_ptr<::VulkanShading> m_vk;
     std::vector<int> m_vk_pipeline;  // one pipeline id per material, -1 = CPU
+    // Batch mode: which case of the synthesised `osl_vk_shade_dispatch` runs a
+    // given material.  The dispatch numbers the groups it was handed in order,
+    // skipping materials without a surface group, so it is *not* necessarily the
+    // material index -- and the kernel needs this number, not the index, for the
+    // background shader.
+    std::vector<int> m_vk_dispatch_id;
     // Whole-frame pipeline (batch mode): one dispatch per image, doing the
     // ray generation, intersection, shading and accumulation on the device.
     int m_vk_frame = -1;

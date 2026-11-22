@@ -1372,10 +1372,14 @@ SimpleRaytracer::init_vulkan_shading()
     if (getenv("OSL_VULKAN_BATCH")) {
         std::vector<std::string> irs;
         std::vector<std::vector<std::string>> ents;
+        m_vk_dispatch_id.assign(m_shaders.size(), -1);
         for (size_t i = 0; i < m_shaders.size(); ++i) {
             if (!m_shaders[i].surf)
                 continue;
             shadingsys->optimize_group(&*m_shaders[i].surf, nullptr);
+            // The dispatch numbers the groups it is handed in order, so the
+            // material's case index is the position just before this push.
+            m_vk_dispatch_id[i] = (int)irs.size();
             irs.push_back(OSL::pvt::vulkan_group_ir(*m_shaders[i].surf));
             ents.push_back(
                 OSL::pvt::vulkan_group_entry_names(*m_shaders[i].surf));
@@ -1678,8 +1682,10 @@ SimpleRaytracer::prepare_render()
     show_albedo_scale = options.get_float("show_albedo_scale");
     show_globals      = options.get_int("show_globals");
 
-    init_vulkan_shading();
-    // prepare background importance table (if requested)
+    // Prepare the background importance table (if requested) *before*
+    // init_vulkan_shading(): executing the background shader is what makes the
+    // renderer see the texture it samples (get_texture_handle records the name),
+    // and the Vulkan path can only upload textures it learned about.
     if (backgroundResolution > 0 && backgroundShaderID >= 0) {
         // get a context so we can make several background shader calls
         OSL::PerThreadInfo* thread_info = shadingsys->create_thread_info();
@@ -1698,6 +1704,8 @@ SimpleRaytracer::prepare_render()
         // we aren't directly evaluating the background
         backgroundResolution = 0;
     }
+
+    init_vulkan_shading();
 
     prepare_geometry();
 
@@ -1964,6 +1972,18 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
     }
     size_t out_off  = take(npix * sizeof(float) * 4);
     size_t arena_off = take(npix * (size_t)kShadeBlockStride);
+    /// The background importance table (Background::prepare), uploaded so the
+    /// device's *indirect* rays can evaluate the background the way the CPU
+    /// does: table lookup plus the MIS weight against the bsdf pdf.  Evaluating
+    /// the shader directly on those bounces is the right mean but the wrong
+    /// weight, and it lights every path up by 1/mis.
+    size_t bg_res = 0, bg_vals_off = 0, bg_rows_off = 0, bg_cols_off = 0;
+    if (backgroundShaderID >= 0 && backgroundResolution > 0) {
+        bg_res      = (size_t)background.table_res();
+        bg_vals_off = take(bg_res * bg_res * sizeof(Vec3));
+        bg_rows_off = take(bg_res * sizeof(float));
+        bg_cols_off = take(bg_res * bg_res * sizeof(float));
+    }
 
     std::function<void()> verify_geometry;  // filled in by the debug block below
     if (cursor > m_vk->capacity()) {
@@ -2133,7 +2153,15 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
     fp.invh  = camera.invh;
     fp.num_triangles = (int)ntris;
     fp.num_vertices  = (int)nverts;
-    fp.bg_shader_id  = -1;  // no background shader: black, like the CPU path
+    // A background shader runs on the device through the batch dispatch, and the
+    // number the kernel needs is the dispatch *case* the group was given, not
+    // the material index.  Outside batch mode there is no dispatch table at all
+    // (the kernel does not run either), so -1 keeps the flat bg_color.
+    fp.bg_shader_id = -1;
+    if (backgroundShaderID >= 0
+        && backgroundShaderID < (int)m_vk_dispatch_id.size()
+        && m_vk_frame >= 0)
+        fp.bg_shader_id = m_vk_dispatch_id[backgroundShaderID];
     fp.bg_color[0] = fp.bg_color[1] = fp.bg_color[2] = 0.0f;
     fp.tri_offset        = (long long)tri_off;
     fp.vert_offset       = (long long)vert_off;
@@ -2168,6 +2196,12 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
     // Russian roulette depth, same attribute the CPU tracer uses
     // (simpleraytracer.cpp:1092 passes absorb = b >= rr_depth).
     fp.rr_depth = rr_depth;
+    // Background importance table (allocated above, once the layout was known).
+    fp.bg_res           = (int)bg_res;
+    fp.bg_invjacobian   = bg_res ? background.table_invjacobian() : 0.0f;
+    fp.bg_values_offset = (long long)bg_vals_off;
+    fp.bg_rows_offset   = (long long)bg_rows_off;
+    fp.bg_cols_offset   = (long long)bg_cols_off;
     fp.pad_light         = getenv("OSL_VULKAN_DEBUG_PIXEL") ? 1 : 0;
     if (const char* dm = getenv("OSL_VULKAN_DEBUG_MODE"))
         fp.pad_light = atoi(dm);
@@ -2195,6 +2229,22 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
                 scene.shaderids.size() * sizeof(int))
         || !put(area_off, tri_area.data(), tri_area.size() * sizeof(float)))
         return false;
+
+    if (bg_res) {
+        if (!put(bg_vals_off, background.table_values(),
+                 bg_res * bg_res * sizeof(Vec3))
+            || !put(bg_rows_off, background.table_rows(),
+                    bg_res * sizeof(float))
+            || !put(bg_cols_off, background.table_cols(),
+                    bg_res * bg_res * sizeof(float)))
+            return false;
+        fprintf(stderr,
+                "[vulkan] background importance table uploaded: %zux%zu "
+                "(%zu KB values, %zu KB cols)\n",
+                bg_res, bg_res,
+                bg_res * bg_res * sizeof(Vec3) / 1024,
+                bg_res * bg_res * sizeof(float) / 1024);
+    }
 
     // The acceleration structure.  Layout is shared with the CPU (BVHNode ==
     // BvhNodeVK: six bounds floats then child/nprims), so this is a raw copy.

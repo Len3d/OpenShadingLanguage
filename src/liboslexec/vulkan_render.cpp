@@ -851,6 +851,233 @@ inline const ClosureComponentVK* closure_root(const void* ci)
     return (const ClosureComponentVK*)ci;
 }
 
+
+// An ADD node as vulkan_shadeops.cpp lays it down: same 24-byte header the CPU
+// uses, but the two closure fields hold arena *offsets* (a pointer stored in
+// memory is the one thing clspv cannot compile).
+struct ClosureAddVK {
+    int id;
+    long long closureA;
+    long long closureB;
+};
+
+/// The closure pool's start inside a ShadeBlock, mirroring kOffPool in
+/// vulkan_shadeops.cpp.  The kernel section below defines its own copy for the
+/// frame body, so this one carries a distinct name.
+static const long long kOffPoolClosure = 320;
+
+
+/// Sum a background shader's closure tree the way the CPU's
+/// process_background_closure() does (src/testrender/shading.cpp:1711): MUL
+/// folds a colour into the branch weight, ADD splits the branch, and a
+/// BACKGROUND component contributes `weight * colour`.  Anything else is
+/// ignored, exactly like the CPU evaluator -- a background shader's Ci is a set
+/// of BACKGROUND closures, and an emitter that happens to sit in the tree
+/// contributes nothing there.
+inline Vec3 background_closure_color(VK_GLOBAL ShaderGlobals* sg, long long root)
+{
+    Vec3 acc = mk(0.0f, 0.0f, 0.0f);
+    if (root < 0)
+        return acc;
+
+    long long stack_off[16];
+    Vec3 stack_w[16];
+    int sp        = 0;
+    long long cur = root;
+    Vec3 branch   = mk(1.0f, 1.0f, 1.0f);
+    for (;;) {
+        if (cur >= 0) {
+            GlobalCPtr node = (GlobalCPtr)sg + kOffPoolClosure + cur;
+            const int id    = *(VK_GLOBAL const int*)node;
+            if (id == -2) {  // ADD
+                if (sp < 16) {
+                    stack_off[sp] = *(VK_GLOBAL const long long*)(node + 16);
+                    stack_w[sp]   = branch;
+                    ++sp;
+                }
+                cur = *(VK_GLOBAL const long long*)(node + 8);
+                continue;
+            }
+            if (id == -1) {  // MUL
+                branch = mulv(branch, load_vec((GlobalCVec3)(node + 4)));
+                cur    = *(VK_GLOBAL const long long*)(node + 16);
+                continue;
+            }
+            if (id == BACKGROUND_ID_VK)
+                acc = add(acc, mulv(branch, load_vec((GlobalCVec3)(node + 4))));
+            cur = -1;  // a component is a leaf
+        }
+        if (sp == 0)
+            break;
+        --sp;
+        cur    = stack_off[sp];
+        branch = stack_w[sp];
+    }
+    return acc;
+}
+
+
+/// MIS::power_heuristic<MIS::WEIGHT_WEIGHT> (src/testrender/sampling.h:131),
+/// verbatim including the "inf is ok" case: the other pdf is the one that gets
+/// multiplied in.  Both the bsdf pdf (inf on a camera ray) and the background
+/// pdf (0 wherever the table has no probability mass) reach the extremes.
+inline float power_heuristic_weight_weight(float sampled_pdf, float other_pdf)
+{
+    float r, mis;
+    if (sampled_pdf > other_pdf) {
+        r   = other_pdf / sampled_pdf;
+        mis = 1.0f / (1.0f + r * r);
+    } else if (sampled_pdf < other_pdf) {
+        r   = sampled_pdf / other_pdf;
+        mis = 1.0f - 1.0f / (1.0f + r * r);
+    } else {
+        mis = 0.5f;
+    }
+    const float MAXF = 3.4028234663852886e+38f;
+    return (other_pdf < MAXF ? other_pdf : MAXF) * mis;
+}
+
+
+/// The CPU's Background::eval (src/testrender/background.h:102), on the table
+/// uploaded from Background::prepare: map the direction to the unit square,
+/// take the nearest entry, and return the already-pdf-divided value together
+/// with that entry's solid-angle pdf.
+inline Vec3 background_table_eval(VK_GLOBAL const FrameParams* p,
+                                  VK_GLOBAL const unsigned char* base,
+                                  const Vec3& dir, float& pdf)
+{
+    pdf            = 0.0f;
+    const int res  = p->bg_res;
+    if (res <= 0)
+        return mk(0.0f, 0.0f, 0.0f);
+
+    VK_GLOBAL const Vec3* values
+        = (VK_GLOBAL const Vec3*)(base + p->bg_values_offset);
+    VK_GLOBAL const float* rows
+        = (VK_GLOBAL const float*)(base + p->bg_rows_offset);
+    VK_GLOBAL const float* cols
+        = (VK_GLOBAL const float*)(base + p->bg_cols_offset);
+
+    // 1/(2*pi); the CPU goes through OIIO::fast_atan2, the device through the
+    // libm entry point -- they differ in the last bits, which matters only for
+    // a direction that lands exactly on a texel boundary.
+    float u = __builtin_atan2f(dir.y, dir.x) * 0.15915494309189535f;
+    if (u < 0.0f)
+        u += 1.0f;
+    float v = (1.0f - dir.z) * 0.5f;
+    int x   = (int)(u * (float)res);
+    if (x < 0)
+        x = 0;
+    else if (x >= res)
+        x = res - 1;
+    int y = (int)(v * (float)res);
+    if (y < 0)
+        y = 0;
+    else if (y >= res)
+        y = res - 1;
+    const int i    = y * res + x;
+    const float row_pdf = rows[y] - (y > 0 ? rows[y - 1] : 0.0f);
+    const float col_pdf = cols[i] - (x > 0 ? cols[i - 1] : 0.0f);
+    const float pd      = row_pdf * col_pdf * p->bg_invjacobian;
+    pdf                 = pd > 0.0f ? pd : 0.0f;
+    // Read the three floats through the global lvalue: the element type is
+    // address-space-qualified, so copying the whole Vec3 is not well formed.
+    return mk(values[i].x, values[i].y, values[i].z);
+}
+
+
+/// Background::sample (src/testrender/background.h:128): draw a row from its
+/// cumulative pdf, then a column inside that row, map the sample back to a
+/// direction, and return the pre-pdf-divided value with the solid-angle pdf.
+/// This is the background *as a light* -- the CPU's explicit background
+/// sampling in the NEE block (simpleraytracer.cpp:1138-1155), without which a
+/// matte sphere is only lit by the much noisier bsdf-sampling path.
+inline Vec3 background_sample(VK_GLOBAL const FrameParams* p,
+                              VK_GLOBAL const unsigned char* base, float rx,
+                              float ry, Vec3& dir, float& pdf)
+{
+    dir           = mk(0.0f, 0.0f, 1.0f);
+    pdf           = 0.0f;
+    const int res = p->bg_res;
+    if (res <= 0)
+        return mk(0.0f, 0.0f, 0.0f);
+
+    VK_GLOBAL const Vec3* values
+        = (VK_GLOBAL const Vec3*)(base + p->bg_values_offset);
+    VK_GLOBAL const float* rows
+        = (VK_GLOBAL const float*)(base + p->bg_rows_offset);
+    VK_GLOBAL const float* cols
+        = (VK_GLOBAL const float*)(base + p->bg_cols_offset);
+    const float invres = 1.0f / (float)res;
+
+    // Background::sample_cdf, twice: first over the rows, then over the chosen
+    // row's columns.  upper_bound() semantics (first entry strictly greater),
+    // done inline because the table lives in the storage buffer.
+    float row_pdf = 0.0f, col_pdf = 0.0f;
+    int y = res - 1;
+    {
+        int lo = 0, hi = res;
+        while (lo < hi) {
+            const int mid = (lo + hi) >> 1;
+            if (ry < rows[mid])
+                hi = mid;
+            else
+                lo = mid + 1;
+        }
+        y = lo < res ? lo : res - 1;
+        if (y == 0) {
+            row_pdf = rows[0];
+            ry      = rows[0] > 0.0f ? ry / rows[0] : 0.0f;
+        } else {
+            const float prev = rows[y - 1];
+            row_pdf          = rows[y] - prev;
+            ry               = row_pdf > 0.0f ? (ry - prev) / row_pdf : 0.0f;
+        }
+    }
+    int x = res - 1;
+    {
+        VK_GLOBAL const float* row = cols + (long long)y * (long long)res;
+        int lo = 0, hi = res;
+        while (lo < hi) {
+            const int mid = (lo + hi) >> 1;
+            if (rx < row[mid])
+                hi = mid;
+            else
+                lo = mid + 1;
+        }
+        x = lo < res ? lo : res - 1;
+        if (x == 0) {
+            col_pdf = row[0];
+            rx      = row[0] > 0.0f ? rx / row[0] : 0.0f;
+        } else {
+            const float prev = row[x - 1];
+            col_pdf          = row[x] - prev;
+            rx               = col_pdf > 0.0f ? (rx - prev) / col_pdf : 0.0f;
+        }
+    }
+    // Keep the fraction in [0,1), like the CPU's std::min(scaled, 0.99999994).
+    if (rx > 0.99999994f)
+        rx = 0.99999994f;
+    if (ry > 0.99999994f)
+        ry = 0.99999994f;
+
+    // Background::map: (x,y) from texel coordinates to a unit direction.
+    const float u        = ((float)x + rx) * invres;
+    const float v        = ((float)y + ry) * invres;
+    const float theta    = u * 6.283185307179586f;
+    const float cos_phi  = 1.0f - 2.0f * v;
+    const float sin_phi2 = 1.0f - cos_phi * cos_phi;
+    const float sin_phi  = sin_phi2 > 0.0f ? __builtin_sqrtf(sin_phi2) : 0.0f;
+    dir = mk(sin_phi * __builtin_cosf(theta), sin_phi * __builtin_sinf(theta),
+             cos_phi);
+
+    const float pd = row_pdf * col_pdf * p->bg_invjacobian;
+    pdf            = pd > 0.0f ? pd : 0.0f;
+    return mk(values[(long long)y * (long long)res + x].x,
+              values[(long long)y * (long long)res + x].y,
+              values[(long long)y * (long long)res + x].z);
+}
+
 // ---------------------------------------------------------------------------
 // Ray generation / shading point setup
 // ---------------------------------------------------------------------------
@@ -1184,11 +1411,49 @@ extern "C" void osl_vk_raytrace_frame(GlobalPtr base)
                 }
             }
             if (hit.id < 0) {
-                // Miss. A compiled background shader is not reachable from the
-                // device yet, so use the scene's background color -- the same
-                // value the CPU path falls back to.
-                L = add(L, mulv(w, mk(p->bg_color[0], p->bg_color[1],
-                                     p->bg_color[2])));
+                if (p->bg_shader_id < 0) {
+                    // No background shader: the scene's flat colour, which is the
+                    // value the CPU path falls back to as well.
+                    L = add(L, mulv(w, mk(p->bg_color[0], p->bg_color[1],
+                                         p->bg_color[2])));
+                } else if (b > 0 && p->bg_res > 0) {
+                    // Indirect ray: the CPU does NOT run the shader here.  It
+                    // looks the direction up in the importance table and
+                    // multiplies by the MIS weight against the bsdf pdf
+                    // (simpleraytracer.cpp:1017-1023).  Running the shader
+                    // instead would give the right mean but the wrong weight --
+                    // 1/mis too bright on every bounce -- and the table lookup is
+                    // also what keeps the CPU's background noise free at these
+                    // depths.
+                    float bg_pdf = 0.0f;
+                    Vec3 bg = background_table_eval(p, base, r.direction, bg_pdf);
+                    const float k
+                        = power_heuristic_weight_weight(bsdf_pdf, bg_pdf);
+                    L = add(L, mulv(w, mk(bg.x * k, bg.y * k, bg.z * k)));
+                } else {
+                    // Primary ray: the shader itself, exactly like the CPU's
+                    // eval_background() (simpleraytracer.cpp:971).  The globals
+                    // are zero except for I (the ray direction) and raytype, the
+                    // group runs, and its BACKGROUND closures are summed.  The
+                    // arena cursor and root are reset first because this shares
+                    // the sample's ShadeBlock with the surface shading that may
+                    // have run in an earlier bounce.  The two words the kernel
+                    // parked at the head of the pool (sg_abs and the
+                    // texture-table offset) live at offset 0, which the allocator
+                    // starts past, so they survive.
+                    GlobalPtr raw = (GlobalPtr)sg;
+                    for (unsigned int i = 0; i < sizeof(ShaderGlobals); ++i)
+                        raw[i] = 0;
+                    store_vec(&sg->I, r.direction);
+                    // Ray::CAMERA = 1, Ray::DIFFUSE = 16 (raytracer.h).
+                    sg->raytype = (b > 0) ? 16 : 1;
+                    *(GlobalI64)((GlobalPtr)sg + kOffRenderstate) = 16;
+                    *(GlobalI64)((GlobalPtr)sg + kOffCi)          = -1;
+                    osl_vk_shade_dispatch((GlobalPtr)sg, p->bg_shader_id);
+                    const Vec3 Le = background_closure_color(
+                        sg, *(GlobalI64)((GlobalPtr)sg + kOffCi));
+                    L = add(L, mulv(w, Le));
+                }
                 break;
             }
 
@@ -1383,6 +1648,52 @@ extern "C" void osl_vk_raytrace_frame(GlobalPtr base)
             // The CPU hands the closure -sg.I as the outgoing direction; every
             // closure here (diffuse, Ward, mirror) is evaluated the same way.
             Vec3 wov = mul(r.direction, -1.0f);
+
+            // ---- explicit background sampling (NEE) -------------------------
+            // Mirrors simpleraytracer.cpp:1137-1155: sample a direction from the
+            // background importance table, evaluate the closure toward it,
+            // MIS-weight it against the closure's own pdf, and shoot a shadow
+            // ray.  The CPU does this before the light NEE and reuses the same
+            // random pair (xi, yi), so the sample assignment matches.  Without
+            // it a matte surface only sees the background through the (much
+            // noisier) bsdf-sampling path, which is why the sphere came out an
+            // order of magnitude dark.
+            if (p->bg_res > 0 && !is_mirror) {
+                Vec3 bg_dir;
+                float bg_pdf = 0.0f;
+                Vec3 bgv
+                    = background_sample(p, base, xsv, ysv, bg_dir, bg_pdf);
+                float bpdf = 0.0f;
+                float bwt  = 0.0f;
+                if (is_ward) {
+                    // Same anisotropic lobe eval the light NEE uses.
+                    Vec3 wv;
+                    ward_eval_vk(wardp, wov, bg_dir, wv, bpdf);
+                    bwt = wv.x;
+                } else {
+                    // Diffuse: BSDF::eval gives weight = cos/pi and the same
+                    // value as its pdf (the albedo is the closure weight, which
+                    // is already in ar/ag/ab).
+                    const float NLd = dot(n, bg_dir);
+                    bpdf = (NLd > 0.0f ? NLd : 0.0f) * 0.31830988618f;
+                    bwt  = bpdf;
+                }
+                // The CPU weights with WEIGHT_WEIGHT against the *bsdf pdf*,
+                // which folds that pdf into the weight -- hence bpdf here.
+                const float mis = power_heuristic_weight_weight(bg_pdf, bpdf);
+                Vec3 contrib = mulv(mulv(w, mk(ar * bwt, ag * bwt, ab * bwt)),
+                                    mk(bgv.x * mis, bgv.y * mis, bgv.z * mis));
+                if (contrib.x + contrib.y + contrib.z > 0.0f) {
+                    Ray sray;
+                    sray.origin    = P;
+                    sray.direction = bg_dir;
+                    sray.radius    = r.radius;
+                    sray.spread    = r.spread;
+                    Hit sh         = intersect_scene(scene, sray, inf(), hit.id);
+                    if (sh.id < 0)  // nothing between the point and the sky
+                        L = add(L, contrib);
+                }
+            }
 
             // ---- explicit light sampling (NEE) -----------------------------
             // Mirrors simpleraytracer.cpp:1129-1187: pick a light primitive
