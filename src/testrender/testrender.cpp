@@ -359,7 +359,9 @@ main(int argc, const char* argv[])
                                    "sRGB", false, "", "");
     }
     rend->pixelbuf.set_write_format(TypeDesc::HALF);
-    if (!rend->pixelbuf.write(imagefile))
+    // An image is only written when the render actually produced one: a failed
+    // device path must not leave a black (or CPU-derived) frame on disk.
+    if (!rend->vulkan_hard_failure() && !rend->pixelbuf.write(imagefile))
         rend->errhandler().errorfmt("Unable to write output image: {}",
                                     rend->pixelbuf.geterror());
     double writetime = timer.lap();
@@ -413,9 +415,14 @@ main(int argc, const char* argv[])
         }
     }
 
+    // A device path that was requested and failed is a failure, not a licence
+    // to keep the image the CPU would have produced: exit non-zero so the
+    // caller (and the testsuite) cannot mistake it for a pass.
+    bool failed = rend->vulkan_hard_failure();
+
     // We're done with the shading system now, destroy it
     rend->clear();
     delete shadingsys;
     delete rend;
-    return EXIT_SUCCESS;
+    return failed ? EXIT_FAILURE : EXIT_SUCCESS;
 }

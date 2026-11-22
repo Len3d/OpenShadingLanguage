@@ -1066,6 +1066,13 @@ SimpleRaytracer::subpixel_radiance(float x, float y, Sampler& sampler,
 
         // execute shader and process the resulting list of closures
         if (!m_vulkan_ready || !shade_vulkan(sg, shaderID, ctx)) {
+            // When the device path was explicitly requested and shading it on
+            // the CPU is not allowed, leave this path unshaded: computing it
+            // here would produce a frame that looks plausible while having
+            // come from the CPU.  shade_vulkan() has already reported the
+            // failure.
+            if (m_vulkan_requested && !vulkan_fallback_allowed())
+                break;
             shadingsys->execute(*ctx, *m_shaders[shaderID].surf, sg);
             if (getenv("OSL_VULKAN_SHADE_TRACE") && sg.Ci) {
                 const int* id = &sg.Ci->id;
@@ -1341,16 +1348,48 @@ dump_closure(const char* tag, const ClosureColor* c, int depth)
     }
 }
 
+bool
+SimpleRaytracer::vulkan_fallback_allowed() const
+{
+    const char* allow = getenv("OSL_VULKAN_ALLOW_CPU_FALLBACK");
+    return allow && OIIO::Strutil::stoi(std::string(allow)) != 0;
+}
+
+
+void
+SimpleRaytracer::vulkan_report_failure(const char* what, const char* detail)
+{
+    // Nothing to report when the device path was not asked for, or when the
+    // caller explicitly opted back into the CPU fallback.
+    if (!m_vulkan_requested || vulkan_fallback_allowed())
+        return;
+    m_vulkan_hard_failure = true;
+    if (m_vulkan_failure_reported.exchange(true))
+        return;  // first failure only, no stderr flood from every thread
+    const char* tail = ". The CPU fallback is disabled because OSL_USE_VULKAN "
+                       "was set; export OSL_VULKAN_ALLOW_CPU_FALLBACK=1 to "
+                       "permit it";
+    if (detail && *detail)
+        errhandler().errorfmt("[vulkan] {}: {}{}", what, detail, tail);
+    else
+        errhandler().errorfmt("[vulkan] {}{}", what, tail);
+}
+
+
 void
 SimpleRaytracer::init_vulkan_shading()
 {
-    m_vulkan_ready  = false;
-    m_vulkan_failed = false;
+    m_vulkan_ready            = false;
+    m_vulkan_failed           = false;
+    m_vulkan_requested        = false;
+    m_vulkan_hard_failure     = false;
+    m_vulkan_failure_reported = false;
     m_vk.reset();
     m_vk_pipeline.assign(m_shaders.size(), -1);
 
     const char* enable = getenv("OSL_USE_VULKAN");
-    if (!enable || OIIO::Strutil::stoi(std::string(enable)) == 0)
+    m_vulkan_requested = enable && OIIO::Strutil::stoi(std::string(enable)) != 0;
+    if (!m_vulkan_requested)
         return;
 
     m_vk.reset(new VulkanShading);
@@ -1359,6 +1398,7 @@ SimpleRaytracer::init_vulkan_shading()
         m_vulkan_failed = true;
         m_vk.reset();
         fprintf(stderr, "[vulkan] device init failed: %s\n", err.c_str());
+        vulkan_report_failure("device init failed", err.c_str());
         return;
     }
     fprintf(stderr, "[vulkan] device: %s\n", m_vk->device_name().c_str());
@@ -1383,16 +1423,19 @@ SimpleRaytracer::init_vulkan_shading()
             irs.push_back(OSL::pvt::vulkan_group_ir(*m_shaders[i].surf));
             ents.push_back(
                 OSL::pvt::vulkan_group_entry_names(*m_shaders[i].surf));
-            if (irs.back().empty())
+            if (irs.back().empty()) {
                 fprintf(stderr,
                         "[vulkan] material %zu kept no Vulkan IR "
                         "(is OSL_VULKAN_BATCH set before compiling?)\n",
                         i);
+                vulkan_report_failure("a material kept no Vulkan IR", nullptr);
+            }
         }
         std::string mod_ir, log;
         if (!OSL::pvt::vulkan_build_render_module(irs, ents, mod_ir, log)) {
             fprintf(stderr, "[vulkan] batch module assembly failed: %s\n",
                     log.c_str());
+            vulkan_report_failure("batch module assembly failed", log.c_str());
             return;
         }
         fprintf(stderr, "[vulkan] batch module: %zu group(s), %zu bytes of IR\n",
@@ -1417,6 +1460,7 @@ SimpleRaytracer::init_vulkan_shading()
         if (!OSL::pvt::clspv_compile(mod_ir, "-x ir --arch=spirv64 --spv-version=1.4", spirv,
                                      log)) {
             fprintf(stderr, "[vulkan] batch clspv failed: %s\n", log.c_str());
+            vulkan_report_failure("clspv failed", log.c_str());
             return;
         }
         fprintf(stderr, "[vulkan] batch SPIR-V: %zu words\n", spirv.size());
@@ -1436,6 +1480,7 @@ SimpleRaytracer::init_vulkan_shading()
         if (frame_id < 0) {
             fprintf(stderr, "[vulkan] frame pipeline failed: %s\n",
                     err.c_str());
+            vulkan_report_failure("frame pipeline failed", err.c_str());
             return;
         }
         m_vk_frame = frame_id;
@@ -1464,6 +1509,7 @@ SimpleRaytracer::init_vulkan_shading()
                     "[vulkan] material %zu has no SPIR-V; keeping it on the "
                     "CPU path\n",
                     i);
+            vulkan_report_failure("material has no SPIR-V", nullptr);
             continue;
         }
         ustring entry;
@@ -1475,6 +1521,7 @@ SimpleRaytracer::init_vulkan_shading()
             ++nfail;
             fprintf(stderr, "[vulkan] material %zu pipeline failed: %s\n", i,
                     err.c_str());
+            vulkan_report_failure("material pipeline failed", err.c_str());
             continue;
         }
         m_vk_pipeline[i] = id;
@@ -1613,6 +1660,7 @@ SimpleRaytracer::shade_vulkan(ShaderGlobals& sg, int shaderID, ShadingContext* c
                      err)) {
         m_vulkan_failed = true;
         fprintf(stderr, "[vulkan] shade failed: %s\n", err.c_str());
+        vulkan_report_failure("shade dispatch failed", err.c_str());
         return false;
     }
 
@@ -2799,8 +2847,22 @@ void
 SimpleRaytracer::render(int xres, int yres)
 {
     OIIO::Timer timer;
-    if (m_vk_frame >= 0 && render_vulkan_frame(xres, yres))
-        return;
+    if (m_vk_frame >= 0) {
+        if (render_vulkan_frame(xres, yres))
+            return;
+        // The whole-frame pipeline was requested and produced nothing.  Re-
+        // rendering on the CPU here would report a pass for a device path that
+        // never ran, which is exactly how a broken kernel used to look healthy.
+        if (m_vulkan_requested && !vulkan_fallback_allowed()) {
+            vulkan_report_failure("device frame rendering produced no image",
+                                  nullptr);
+            return;
+        }
+        if (m_vulkan_requested)
+            errhandler().warningfmt(
+                "[vulkan] falling back to the CPU because "
+                "OSL_VULKAN_ALLOW_CPU_FALLBACK is set");
+    }
     ShadingSystem* shadingsys = this->shadingsys;
     OIIO::parallel_for_chunked(
         0, yres, 0, [&, this](int64_t ybegin, int64_t yend) {

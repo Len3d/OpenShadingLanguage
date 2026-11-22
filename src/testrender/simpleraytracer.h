@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <unordered_map>
@@ -111,6 +112,14 @@ public:
 
     OIIO::ErrorHandler& errhandler() const { return *m_errhandler; }
 
+    /// True when the device path was explicitly requested (OSL_USE_VULKAN) and
+    /// failed in a way that would otherwise have been papered over by
+    /// re-rendering on the CPU.  The caller should treat the render as failed
+    /// rather than keep an image the CPU produced.  Setting
+    /// OSL_VULKAN_ALLOW_CPU_FALLBACK=1 restores the old, silent behaviour
+    /// (useful when debugging the device path itself).
+    bool vulkan_hard_failure() const { return m_vulkan_hard_failure; }
+
     const std::vector<bool>& shader_is_light() { return m_shader_is_light; }
     const std::vector<unsigned>& lightprims() { return m_lightprims; }
 
@@ -180,8 +189,24 @@ private:
     std::vector<ustring> m_vk_texture_names;
     bool m_vulkan_ready  = false;
     bool m_vulkan_failed = false;
+    /// OSL_USE_VULKAN was set: the caller wants the device path, so a device
+    /// failure must be reported instead of quietly becoming a CPU render.
+    bool m_vulkan_requested = false;
+    /// A failure that has already been reported as fatal; render() then emits
+    /// no image and testrender exits non-zero (see vulkan_hard_failure()).
+    bool m_vulkan_hard_failure = false;
+    /// Only the first failure is reported, so a per-pixel dispatch failure does
+    /// not flood stderr from every thread.
+    std::atomic<bool> m_vulkan_failure_reported { false };
 
     void init_vulkan_shading();
+    /// OSL_VULKAN_ALLOW_CPU_FALLBACK=1: opt back into the CPU fallback.
+    bool vulkan_fallback_allowed() const;
+    /// Report a device failure that would otherwise have fallen back to the
+    /// CPU, once.  No-op when Vulkan was not requested or the fallback is
+    /// allowed.  Also marks the render as a hard failure.
+    void vulkan_report_failure(const char* what, const char* detail);
+
     bool shade_vulkan(ShaderGlobals& sg, int shaderID, ShadingContext* ctx);
     /// Decode and upload every recorded texture into the device buffer.
     void upload_vulkan_textures();
