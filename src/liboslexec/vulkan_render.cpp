@@ -1671,12 +1671,16 @@ extern "C" void osl_vk_raytrace_frame(GlobalPtr base)
                     ward_eval_vk(wardp, wov, bg_dir, wv, bpdf);
                     bwt = wv.x;
                 } else {
-                    // Diffuse: BSDF::eval gives weight = cos/pi and the same
-                    // value as its pdf (the albedo is the closure weight, which
-                    // is already in ar/ag/ab).
+                    // Diffuse: Diffuse<trans>::eval (shading.cpp:305) returns
+                    // weight = Color3(1) and pdf = max(N.wi,0)/pi, so the two
+                    // halves are different numbers.  The albedo is the closure
+                    // weight the caller already folded into ar/ag/ab, so the
+                    // weight side is exactly 1 and the pdf side is cos/pi.
+                    // (Using the pdf as the weight as well made the background
+                    // NEE contribute only cos/pi of what it should.)
                     const float NLd = dot(n, bg_dir);
                     bpdf = (NLd > 0.0f ? NLd : 0.0f) * 0.31830988618f;
-                    bwt  = bpdf;
+                    bwt  = 1.0f;
                 }
                 // The CPU weights with WEIGHT_WEIGHT against the *bsdf pdf*,
                 // which folds that pdf into the weight -- hence bpdf here.
