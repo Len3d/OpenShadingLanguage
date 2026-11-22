@@ -30,6 +30,7 @@
 #include <vector>
 
 #include <llvm/ADT/StringRef.h>
+#include <llvm/Analysis/ConstantFolding.h>
 #include <llvm/AsmParser/Parser.h>
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/IR/IRBuilder.h>
@@ -40,6 +41,7 @@
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/SourceMgr.h>
 #include <llvm/Support/raw_ostream.h>
+#include <llvm/Transforms/Utils/Cloning.h>
 
 #include <OSL/oslconfig.h>
 
@@ -154,6 +156,71 @@ bool collect_entry_names (llvm::Module& M, std::vector<std::string>& out,
     }
     return true;
 }
+
+
+/// The module-scope constant a pointer resolves to, looking through the
+/// getelementptr / bitcast / addrspacecast chain a shader constant picks up on
+/// its way to a shadeop argument.
+const llvm::GlobalVariable*
+pointed_constant (const llvm::Value* v)
+{
+    using namespace llvm;
+    while (v) {
+        if (auto* GV = dyn_cast<GlobalVariable>(v))
+            return (GV->isConstant() && GV->hasInitializer()) ? GV : nullptr;
+        if (auto* ce = dyn_cast<ConstantExpr>(v)) {
+            switch (ce->getOpcode()) {
+            case Instruction::GetElementPtr:
+            case Instruction::BitCast:
+            case Instruction::AddrSpaceCast: v = ce->getOperand(0); continue;
+            default: return nullptr;
+            }
+        }
+        if (auto* gep = dyn_cast<GetElementPtrInst>(v)) {
+            v = gep->getPointerOperand();
+            continue;
+        }
+        return nullptr;
+    }
+    return nullptr;
+}
+
+
+/// The same pointer, as a Constant, so a load through it can be folded.  A
+/// getelementptr written as an instruction is rebuilt as its ConstantExpr
+/// equivalent; anything with a non-constant index stays unrepresentable and
+/// returns null.
+llvm::Constant*
+constant_pointer (llvm::Value* v)
+{
+    using namespace llvm;
+    if (isa<GlobalVariable>(v))
+        return cast<Constant>(v);
+    if (auto* ce = dyn_cast<ConstantExpr>(v)) {
+        switch (ce->getOpcode()) {
+        case Instruction::GetElementPtr:
+        case Instruction::BitCast:
+        case Instruction::AddrSpaceCast: return ce;
+        default: return nullptr;
+        }
+    }
+    if (auto* gep = dyn_cast<GetElementPtrInst>(v)) {
+        auto* base = dyn_cast<Constant>(gep->getPointerOperand());
+        if (!base)
+            return nullptr;
+        SmallVector<Constant*, 8> idx;
+        for (auto& u : gep->indices()) {
+            auto* ci = dyn_cast<Constant>(u.get());
+            if (!ci)
+                return nullptr;
+            idx.push_back(ci);
+        }
+        return ConstantExpr::getGetElementPtr(gep->getSourceElementType(),
+                                              base, idx, gep->isInBounds());
+    }
+    return nullptr;
+}
+
 
 }  // namespace
 
@@ -366,6 +433,90 @@ bool vulkan_build_render_module (const std::vector<std::string>& group_ir,
             if (F.getCallingConv() == llvm::CallingConv::SPIR_KERNEL)
                 continue;
             F.addFnAttr(llvm::Attribute::AlwaysInline);
+        }
+
+        // A shader constant handed to a shadeop -- `noise(vector(0.3,0.5,0.2))`
+        // is the case that exposed this -- arrives as a pointer to a
+        // module-scope constant.  Legalization moves every constant global to
+        // address space 1 so it can be passed where the shadeop signature now
+        // wants a storage-buffer pointer, but clspv has no way to place a
+        // constant in the storage-buffer space: the load survives as a read of
+        // the bound buffer at an offset nobody wrote, so the shadeop sees
+        // whatever the frame data happens to hold there and the result changes
+        // from pixel to pixel (measured on render-bumptest: noise went from a
+        // constant 0.5 to values between -2.5 and 11).
+        //
+        // The value belongs in the instruction stream, so inline the call that
+        // takes such a pointer and fold the resulting load back to a constant.
+        // Only calls with a constant argument are inlined, so the module does
+        // not grow any further than clspv's own AlwaysInliner would take it.
+        {
+            const llvm::DataLayout& DL = render->getDataLayout();
+            bool changed               = false;
+            int ninline                = 0;
+            int nfold                  = 0;
+
+            for (auto& F : *render) {
+                for (auto& BB : F) {
+                    for (auto it = BB.begin(); it != BB.end();) {
+                        auto* cb = llvm::dyn_cast<llvm::CallBase>(&*it);
+                        ++it;  // InlineFunction can destroy the instruction
+                        if (!cb)
+                            continue;
+                        bool takes_constant = false;
+                        for (auto& a : cb->args()) {
+                            if (pointed_constant(a.get())) {
+                                takes_constant = true;
+                                break;
+                            }
+                        }
+                        if (!takes_constant)
+                            continue;
+                        llvm::Function* callee = cb->getCalledFunction();
+                        if (!callee || callee->isDeclaration())
+                            continue;
+                        if (callee->getCallingConv()
+                            == llvm::CallingConv::SPIR_KERNEL)
+                            continue;
+                        llvm::InlineFunctionInfo ifi;
+                        auto result = llvm::InlineFunction(*cb, ifi);
+                        if (result.isSuccess()) {
+                            ++ninline;
+                            changed = true;
+                        } else if (getenv("OSL_VULKAN_LEGALIZE_TRACE")) {
+                            fprintf(stderr,
+                                    "[const-arg] inline of %s failed: %s\n",
+                                    callee->getName().str().c_str(),
+                                    result.getFailureReason());
+                        }
+                    }
+                }
+            }
+
+            for (auto& F : *render) {
+                for (auto& BB : F) {
+                    for (auto& I : BB) {
+                        auto* li = llvm::dyn_cast<llvm::LoadInst>(&I);
+                        if (!li || li->isVolatile() || li->isAtomic())
+                            continue;
+                        llvm::Constant* ptr = constant_pointer(li->getPointerOperand());
+                        if (!ptr)
+                            continue;
+                        llvm::Constant* val
+                            = llvm::ConstantFoldLoadFromConstPtr(ptr, li->getType(),
+                                                                 DL);
+                        if (val) {
+                            li->replaceAllUsesWith(val);
+                            ++nfold;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if (getenv("OSL_VULKAN_LEGALIZE_TRACE"))
+                fprintf(stderr, "[const-arg] inlined=%d folded=%d\n", ninline,
+                        nfold);
+            (void)changed;
         }
 
         // The last step the per-group path runs before clspv, and the batch

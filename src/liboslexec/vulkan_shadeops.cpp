@@ -163,6 +163,230 @@ inline GlobalPtr closure_component_allot(GlobalPtr sg, int id, long long prim_si
     return p;
 }
 
+// ---------------------------------------------------------------------------
+// Perlin noise with derivatives
+// ---------------------------------------------------------------------------
+//
+// A shader that feeds `noise()` into `calculatenormal()` -- the render-bumptest
+// materials -- is emitted as a call to `osl_noise_dfdv(char*, char*)`: a
+// Dual2<float> result and a Dual2<Vec3> input.  The host implementation lives in
+// <OSL/oslnoise.h>, which a spirv64 translation unit cannot include (that target
+// has no C++ standard library, and the very first header dies at
+// <initializer_list>), so the scalar non-SIMD path of oslnoise.h is reproduced
+// here with a hand written dual.
+//
+// Provenance of each piece, because the lattice hashes have to match the CPU
+// bit for bit:
+//   * `bjmix`/`bjfinal` -- OIIO's bjhash (Bob Jenkins lookup3),
+//     OpenImageIO/hash.h:167-189.
+//   * `inthash(k0,k1,k2)` -- oslnoise.h:251.
+//   * `grad(hash,x,y,z)` -- oslnoise.h:954, gradients pointing at the cube
+//     edges, `select`/`negate_if` already flattened into ternaries because both
+//     pick a whole component rather than a lane.
+//   * `fade` -- oslnoise.h:909.
+//   * the 3D lattice and its interpolation order -- oslnoise.h:1637 (trilerp
+//     from OpenImageIO/fmath.h:469) followed by `scale3` = 0.9820f.
+// The derivative arithmetic mirrors OSL/dual.h's chain rule, whose dual product
+// is `a.val*b.d + a.d*b.val` -- the same order is kept below.
+
+struct VKDual {
+    float val, dx, dy;
+};
+
+// The dual is a plain three-float value; the helpers below only stay scalar
+// (and inside registers) when clang inlines them all the way into the
+// shadeop.  A dual that survives as a struct argument or return value gets a
+// byval/sret slot instead, i.e. an `alloca`, and the legalizer rewrites every
+// alloca in this translation unit into `osl_vk_arena_alloc(<first argument of
+// the enclosing function>, ...)` -- which for a shadeop is its data pointer,
+// not the ShaderGlobals.  Measured: the arena pointer and the noise lattice
+// corners then alias the shader's constant data and the noise output changes
+// with the pixel.
+#define VK_NOISE_INLINE __attribute__((always_inline)) inline
+
+VK_NOISE_INLINE VKDual
+vk_dual (float val, float dx, float dy)
+{
+    VKDual d;
+    d.val = val;
+    d.dx  = dx;
+    d.dy  = dy;
+    return d;
+}
+
+VK_NOISE_INLINE VKDual
+vk_dual_add (VKDual a, VKDual b)
+{
+    return vk_dual (a.val + b.val, a.dx + b.dx, a.dy + b.dy);
+}
+
+VK_NOISE_INLINE VKDual
+vk_dual_sub (VKDual a, VKDual b)
+{
+    return vk_dual (a.val - b.val, a.dx - b.dx, a.dy - b.dy);
+}
+
+VK_NOISE_INLINE VKDual
+vk_dual_mul (VKDual a, VKDual b)
+{
+    return vk_dual (a.val * b.val, a.val * b.dx + a.dx * b.val,
+                    a.val * b.dy + a.dy * b.val);
+}
+
+// Multiplication by a non-dual scalar: every component is scaled, as
+// Dual2::operator*(Dual, T) does.
+VK_NOISE_INLINE VKDual
+vk_dual_mulf (VKDual a, float k)
+{
+    return vk_dual (a.val * k, a.dx * k, a.dy * k);
+}
+
+VK_NOISE_INLINE VKDual
+vk_dual_neg (VKDual a)
+{
+    return vk_dual (-a.val, -a.dx, -a.dy);
+}
+
+// Dual minus a non-dual scalar: only the value moves.
+VK_NOISE_INLINE VKDual
+vk_dual_subf (VKDual a, float k)
+{
+    return vk_dual (a.val - k, a.dx, a.dy);
+}
+
+VK_NOISE_INLINE VKDual
+vk_dual_addf (VKDual a, float k)
+{
+    return vk_dual (a.val + k, a.dx, a.dy);
+}
+
+// Non-dual scalar minus a dual: the derivatives flip sign.
+VK_NOISE_INLINE VKDual
+vk_dual_fsub (float k, VKDual a)
+{
+    return vk_dual (k - a.val, -a.dx, -a.dy);
+}
+
+// OIIO::ifloor without libm.
+VK_NOISE_INLINE int
+vk_ifloor (float x)
+{
+    int i = (int)x;
+    return (x < (float)i) ? i - 1 : i;
+}
+
+VK_NOISE_INLINE unsigned
+vk_rotl32 (unsigned x, int k)
+{
+    return (x << k) | (x >> (32 - k));
+}
+
+VK_NOISE_INLINE unsigned
+vk_bjfinal (unsigned a, unsigned b, unsigned c)
+{
+    c ^= b;
+    c -= vk_rotl32 (b, 14);
+    a ^= c;
+    a -= vk_rotl32 (c, 11);
+    b ^= a;
+    b -= vk_rotl32 (a, 25);
+    c ^= b;
+    c -= vk_rotl32 (b, 16);
+    a ^= c;
+    a -= vk_rotl32 (c, 4);
+    b ^= a;
+    b -= vk_rotl32 (a, 14);
+    c ^= b;
+    c -= vk_rotl32 (b, 24);
+    return c;
+}
+
+// HashScalar::operator()(int,int,int) on top of the hand-unrolled 3-key inthash.
+VK_NOISE_INLINE int
+vk_lattice_hash (int x, int y, int z)
+{
+    unsigned start_val = 0xdeadbeefu + (3u << 2) + 13u;
+    unsigned a         = start_val + (unsigned)x;
+    unsigned b         = start_val + (unsigned)y;
+    unsigned c         = start_val + (unsigned)z;
+    return (int)vk_bjfinal (a, b, c);
+}
+
+VK_NOISE_INLINE VKDual
+vk_noise_grad (int hash, VKDual x, VKDual y, VKDual z)
+{
+    int h    = hash & 15;
+    VKDual u = (h < 8) ? x : y;
+    VKDual v = (h < 4) ? y : (((h == 12) || (h == 14)) ? x : z);
+    VKDual uu = (h & 1) ? vk_dual_neg (u) : u;
+    VKDual vv = (h & 2) ? vk_dual_neg (v) : v;
+    return vk_dual_add (uu, vv);
+}
+
+VK_NOISE_INLINE VKDual
+vk_noise_fade (VKDual t)
+{
+    VKDual t2    = vk_dual_mul (t, t);
+    VKDual t3    = vk_dual_mul (t2, t);
+    VKDual inner = vk_dual_addf (
+        vk_dual_mul (t, vk_dual_subf (vk_dual_mulf (t, 6.0f), 15.0f)), 10.0f);
+    return vk_dual_mul (t3, inner);
+}
+
+// OIIO::trilerp, verbatim in its float order.
+VK_NOISE_INLINE VKDual
+vk_noise_trilerp (VKDual v0, VKDual v1, VKDual v2, VKDual v3, VKDual v4,
+                  VKDual v5, VKDual v6, VKDual v7, VKDual s, VKDual t,
+                  VKDual r)
+{
+    VKDual s1 = vk_dual_fsub (1.0f, s);
+    VKDual t1 = vk_dual_fsub (1.0f, t);
+    VKDual r1 = vk_dual_fsub (1.0f, r);
+    VKDual f0 = vk_dual_add (vk_dual_mul (v0, s1), vk_dual_mul (v1, s));
+    VKDual f1 = vk_dual_add (vk_dual_mul (v2, s1), vk_dual_mul (v3, s));
+    VKDual f2 = vk_dual_add (vk_dual_mul (v4, s1), vk_dual_mul (v5, s));
+    VKDual f3 = vk_dual_add (vk_dual_mul (v6, s1), vk_dual_mul (v7, s));
+    VKDual a  = vk_dual_add (vk_dual_mul (t1, f0), vk_dual_mul (t, f1));
+    VKDual b  = vk_dual_add (vk_dual_mul (t1, f2), vk_dual_mul (t, f3));
+    return vk_dual_add (vk_dual_mul (r1, a), vk_dual_mul (r, b));
+}
+
+// The 3D perlin kernel of NoiseImpl, i.e. oslnoise.h:1631-1646.
+VK_NOISE_INLINE VKDual
+vk_noise_perlin3 (VKDual x, VKDual y, VKDual z)
+{
+    int X          = vk_ifloor (x.val);
+    int Y          = vk_ifloor (y.val);
+    int Z          = vk_ifloor (z.val);
+    VKDual fx      = vk_dual (x.val - (float)X, x.dx, x.dy);
+    VKDual fy      = vk_dual (y.val - (float)Y, y.dx, y.dy);
+    VKDual fz      = vk_dual (z.val - (float)Z, z.dx, z.dy);
+    VKDual fx1     = vk_dual_subf (fx, 1.0f);
+    VKDual fy1     = vk_dual_subf (fy, 1.0f);
+    VKDual fz1     = vk_dual_subf (fz, 1.0f);
+    VKDual u       = vk_noise_fade (fx);
+    VKDual v       = vk_noise_fade (fy);
+    VKDual w       = vk_noise_fade (fz);
+
+    VKDual v000 = vk_noise_grad (vk_lattice_hash (X, Y, Z), fx, fy, fz);
+    VKDual v100 = vk_noise_grad (vk_lattice_hash (X + 1, Y, Z), fx1, fy, fz);
+    VKDual v010 = vk_noise_grad (vk_lattice_hash (X, Y + 1, Z), fx, fy1, fz);
+    VKDual v110 = vk_noise_grad (vk_lattice_hash (X + 1, Y + 1, Z), fx1, fy1,
+                                 fz);
+    VKDual v001 = vk_noise_grad (vk_lattice_hash (X, Y, Z + 1), fx, fy, fz1);
+    VKDual v101 = vk_noise_grad (vk_lattice_hash (X + 1, Y, Z + 1), fx1, fy,
+                                 fz1);
+    VKDual v011 = vk_noise_grad (vk_lattice_hash (X, Y + 1, Z + 1), fx, fy1,
+                                 fz1);
+    VKDual v111 = vk_noise_grad (vk_lattice_hash (X + 1, Y + 1, Z + 1), fx1,
+                                 fy1, fz1);
+
+    return vk_dual_mulf (
+        vk_noise_trilerp (v000, v100, v010, v110, v001, v101, v011, v111, u,
+                          v, w),
+        0.9820f);
+}
+
 }  // namespace
 
 
@@ -700,6 +924,40 @@ osl_texture(GlobalPtr sg, unsigned long long namehash, GlobalPtr opt,
     (void)derivs;
 
     return 1;
+}
+
+/// `noise()` with derivatives: Dual2<float> out, Dual2<Vec3> in.  Matches
+/// opnoise.cpp's NOISE_IMPL_DERIV body (`impl(DFLOAT(r), DVEC(x))`), whose
+/// NoiseImpl::operator() ends with `0.5f*(perlin + 1.0f)`.
+void
+osl_noise_dfdv (GlobalPtr r_, GlobalPtr x_)
+{
+    // Dual2<Vec3> is value, dx, dy -- nine contiguous floats.
+    const GlobalFloatCPtr x = (const GlobalFloatCPtr)x_;
+    VKDual px = vk_dual (x[0], x[3], x[6]);
+    VKDual py = vk_dual (x[1], x[4], x[7]);
+    VKDual pz = vk_dual (x[2], x[5], x[8]);
+
+    VKDual p = vk_noise_perlin3 (px, py, pz);
+
+    GlobalFloatPtr r = (GlobalFloatPtr)r_;
+    r[0]             = 0.5f * (p.val + 1.0f);
+    r[1]             = 0.5f * p.dx;
+    r[2]             = 0.5f * p.dy;
+}
+
+
+/// `noise()` value form, vec3 argument (`osl_noise_fv` in opnoise.cpp).
+/// Same lattice as the derivative form, so a shader that uses both sees one
+/// consistent field.
+float
+osl_noise_fv (GlobalPtr x_)
+{
+    const GlobalFloatCPtr x = (const GlobalFloatCPtr)x_;
+    VKDual p = vk_noise_perlin3 (vk_dual (x[0], 0.0f, 0.0f),
+                                 vk_dual (x[1], 0.0f, 0.0f),
+                                 vk_dual (x[2], 0.0f, 0.0f));
+    return 0.5f * (p.val + 1.0f);
 }
 
 }  // extern "C"

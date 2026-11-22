@@ -819,6 +819,11 @@ static const int WARD_ID_VK       = 7;
 /// so no importance sampling is needed to reproduce them.
 static const int REFLECTION_ID_VK         = 9;
 static const int FRESNEL_REFLECTION_ID_VK = 10;
+/// `refraction(N, eta)` bends the ray through the surface and carries the
+/// complementary Fresnel term; `transparent()` passes it straight through.  Like
+/// the mirrors these are delta closures -- one outgoing direction, infinite pdf.
+static const int REFRACTION_ID_VK  = 11;
+static const int TRANSPARENT_ID_VK = 12;
 
 /// testrender/optics.h:13, verbatim.  TIR returns 1, eta == 0 means "no Fresnel".
 inline float fresnel_dielectric_vk(float cosi, float eta)
@@ -865,6 +870,149 @@ struct ClosureAddVK {
 /// vulkan_shadeops.cpp.  The kernel section below defines its own copy for the
 /// frame body, so this one carries a distinct name.
 static const long long kOffPoolClosure = 320;
+
+
+/// A flattened closure component: the branch weight already folded in (MUL
+/// multiplies it, ADD splits it, a component is a leaf -- the same walk
+/// testrender's process_bsdf_closure does at shading.cpp:1480-1690).
+struct ClosureEntryVK {
+    int id;
+    Vec3 w;      ///< component weight, MUL folds included
+    Vec3 N;      ///< reflection / refraction plane normal
+    float eta;   ///< reflection / refraction index of refraction
+    long long off;  ///< arena offset of the node, for parameters read on demand
+};
+
+
+/// Flatten `Ci` into at most two components.
+///
+/// Two is enough for the closures a render-* material produces: matte and Ward
+/// are a single component, and glass is exactly
+/// `reflection(N, eta) + refraction(N, eta)`.  A larger tree is truncated to
+/// the first two, which dims a path rather than corrupting it.  Deliberately
+/// not an array: a local array is an `alloca`, and the legalizer rewrites every
+/// alloca in the device runtime into `osl_vk_arena_alloc(<enclosing function's
+/// first argument>, ...)` -- inside the frame kernel that pointer is the
+/// ShadeBlock itself, so the allocation would land in the closure pool.
+inline __attribute__((always_inline)) int
+collect_closure_entries (VK_GLOBAL ShaderGlobals* sg, long long root,
+                         ClosureEntryVK& first, ClosureEntryVK& second)
+{
+    if (root < 0)
+        return 0;
+
+    long long stack_off[8];
+    Vec3 stack_w[8];
+    int sp        = 0;
+    long long cur = root;
+    Vec3 branch   = mk (1.0f, 1.0f, 1.0f);
+    int n         = 0;
+
+    for (;;) {
+        if (cur >= 0) {
+            GlobalCPtr node = (GlobalCPtr)sg + kOffPoolClosure + cur;
+            const int id    = *(VK_GLOBAL const int*)node;
+            if (id == -2) {  // ADD
+                if (sp < 8) {
+                    stack_off[sp] = *(VK_GLOBAL const long long*)(node + 16);
+                    stack_w[sp]   = branch;
+                    ++sp;
+                }
+                cur = *(VK_GLOBAL const long long*)(node + 8);
+                continue;
+            }
+            if (id == -1) {  // MUL
+                branch = mulv (branch, load_vec ((GlobalCVec3)(node + 4)));
+                cur    = *(VK_GLOBAL const long long*)(node + 16);
+                continue;
+            }
+            if (n < 2) {
+                ClosureEntryVK& e = (n == 0) ? first : second;
+                e.id              = id;
+                e.off             = cur;
+                e.w = mulv (branch, load_vec ((GlobalCVec3)(node + 4)));
+                e.N   = mk (0.0f, 0.0f, 0.0f);
+                e.eta = 0.0f;
+                if (id == FRESNEL_REFLECTION_ID_VK
+                    || id == REFRACTION_ID_VK) {
+                    // ReflectionParams / RefractionParams { Vec3 N; float eta }
+                    e.N   = load_vec ((GlobalCVec3)(node + 16));
+                    e.eta = *(VK_GLOBAL const float*)(node + 28);
+                } else if (id == REFLECTION_ID_VK) {
+                    e.N = load_vec ((GlobalCVec3)(node + 16));
+                }
+                ++n;
+            }
+            cur = -1;
+        }
+        if (sp == 0)
+            break;
+        --sp;
+        cur    = stack_off[sp];
+        branch = stack_w[sp];
+    }
+    return n;
+}
+
+
+/// Is this component a delta closure (a single outgoing direction)?  Those are
+/// the ones whose pdf is infinite, which is what the CPU tests for to suppress
+/// NEE on the next bounce.
+inline bool closure_entry_is_delta (const ClosureEntryVK& e)
+{
+    return e.id == REFLECTION_ID_VK || e.id == FRESNEL_REFLECTION_ID_VK
+           || e.id == REFRACTION_ID_VK || e.id == TRANSPARENT_ID_VK;
+}
+
+
+/// `get_albedo(wo)` for one component (shading.cpp:1083-1118 and :1114-1118):
+/// mirror carries the Fresnel term, refraction the complement, a matte
+/// component its own weight.
+inline Vec3 closure_entry_albedo (const ClosureEntryVK& e, const Vec3& wo)
+{
+    if (e.id == REFLECTION_ID_VK || e.id == FRESNEL_REFLECTION_ID_VK) {
+        float cosNO = dot (e.N, wo);
+        if (cosNO > 0.0f) {
+            float F = fresnel_dielectric_vk (cosNO, e.eta);
+            return mk (e.w.x * F, e.w.y * F, e.w.z * F);
+        }
+        return e.w;  // shading.cpp:1088 returns Color3(1) times the weight
+    }
+    if (e.id == REFRACTION_ID_VK) {
+        float cosNO = dot (e.N, wo);
+        float F     = 1.0f - fresnel_dielectric_vk (cosNO, e.eta);
+        return mk (e.w.x * F, e.w.y * F, e.w.z * F);
+    }
+    return e.w;
+}
+
+
+/// optics.h:34, verbatim: the refracted direction and its Fresnel term, with
+/// the total-internal-reflection case returning zero weight.
+inline float
+fresnel_refraction_vk (const Vec3& I, const Vec3& N, float eta, Vec3& T)
+{
+    float cosi = -dot (I, N);
+    Vec3 Nn;
+    float neta;
+    if (cosi > 0.0f) {
+        neta = 1.0f / eta;
+        Nn   = N;
+    } else {
+        cosi = -cosi;
+        neta = eta;
+        Nn   = mul (N, -1.0f);
+    }
+    float arg = 1.0f - (neta * neta * (1.0f - cosi * cosi));
+    if (arg >= 0.0f) {
+        float dnp = __builtin_sqrtf (arg);
+        float nK  = (neta * cosi) - dnp;
+        T         = add (mul (I, neta), mul (Nn, nK));
+        return 1.0f - fresnel_dielectric_vk (cosi, eta);
+    }
+    T = mk (0.0f, 0.0f, 0.0f);
+    return 0.0f;
+}
 
 
 /// Sum a background shader's closure tree the way the CPU's
@@ -1121,13 +1269,13 @@ inline void fill_globals(VK_GLOBAL ShaderGlobals* sg, const SceneView& s,
     // (simpleraytracer.cpp:946-950).  Skipping that flip leaves a whole
     // silhouette band shaded with an inward normal -- visible as stripes.
     const bool backface = dot(N, r.direction) > 0.0f;
+    const Vec3 Ns       = backface ? mul(N, -1.0f) : N;
     store_vec(&sg->Ng, backface ? mul(Ng, -1.0f) : Ng);
-    store_vec(&sg->N, backface ? mul(N, -1.0f) : N);
+    store_vec(&sg->N, Ns);
     store_vec(&sg->I, r.direction);
     sg->raytype        = 0;
     sg->backfacing     = backface ? 1 : 0;
 
-    sg->flipHandedness = 0;
     sg->time           = 0.0f;
     sg->dtime          = 0.0f;
 
@@ -1169,20 +1317,38 @@ inline void fill_globals(VK_GLOBAL ShaderGlobals* sg, const SceneView& s,
     sg->v    = vv;
     store_vec(&sg->dPdu, dPdu);
     store_vec(&sg->dPdv, dPdv);
-    // The camera ray does not carry a reliable screen-space footprint after the
-    // tent-filter jitter, so derive one from the uv parameterisation (a one-pixel
-    // step), which is what the mip selection in osl_texture() consumes.
-    Vec3 dPdx       = mul(dPdu, 1.0f / (float)p->width);
-    Vec3 dPdy       = mul(dPdv, 1.0f / (float)p->height);
+    // Screen-space footprint, built exactly like Ray::point(Dual2<float>) and
+    // Scene::project do on the CPU (raytracer.h:89-98 and :284-296): the
+    // derivatives of a ray point are the two directions perpendicular to the
+    // ray scaled by (radius + spread*t), then slid along the view vector onto
+    // the surface so they stay tangent to it.  calculatenormal() takes their
+    // cross product, so the previous approximation (dPdu/width) tilted every
+    // bump away from the reference image.
+    Vec3 orthox, orthoy;
+    ortho(r.direction, orthox, orthoy);
+    const float rds = r.radius + r.spread * hit.t;
+    Vec3 dPdx       = mul(orthox, rds);
+    Vec3 dPdy       = mul(orthoy, rds);
+    const Vec3 nI   = normalize(r.direction);
+    const float cosI = -dot(nI, N);
+    const float fcos = cosI < 0.0f ? -cosI : cosI;
+    if (fcos > 1e-3f) {
+        dPdx = add(dPdx, mul(nI, dot(dPdx, N) / cosI));
+        dPdy = add(dPdy, mul(nI, dot(dPdy, N) / cosI));
+    }
     store_vec(&sg->dPdx, dPdx);
     store_vec(&sg->dPdy, dPdy);
     store_vec(&sg->dPdz, mk(0.0f, 0.0f, 0.0f));
+    // Same test the CPU runs after it has flipped N: with a negative
+    // handedness `calculatenormal` crosses dy with dx instead of dx with dy
+    // (llvm_ops.cpp:919-926), which turns the bumped normal inside out.
+    sg->flipHandedness = dot(cross(dPdx, dPdy), Ns) < 0.0f ? 1 : 0;
     sg->dudx  = 1.0f / (float)p->width;
     sg->dudy  = 0.0f;
     sg->dvdx  = 0.0f;
     sg->dvdy  = 1.0f / (float)p->height;
-    store_vec(&sg->dIdx, mul(dPdx, 1.0f / (float)p->width));
-    store_vec(&sg->dIdy, mul(dPdy, 1.0f / (float)p->height));
+    store_vec(&sg->dIdx, mul(orthox, r.spread));
+    store_vec(&sg->dIdy, mul(orthoy, r.spread));
     // Surface area of the whole mesh this primitive belongs to.  emitter.osl
     // computes radiance as power / (M_PI * surfacearea()), so a zero here makes
     // every light in the scene emit nothing at all (and osl_safe_div_fff turns
@@ -1496,60 +1662,70 @@ extern "C" void osl_vk_raytrace_frame(GlobalPtr base)
             float ar = 0.0f, ag = 0.0f, ab = 0.0f;  // albedo / closure weight
             int is_mirror = 0;
             int is_ward   = 0;
+            // All the closures this material produced are delta closures (mirror
+            // / refraction / transparent).  Then the BSDF has exactly one
+            // outgoing direction per component, the pdf is infinite, and NEE has
+            // nothing to evaluate toward -- the CPU suppresses its next-bounce
+            // NEE for exactly this case (shading.cpp:1102 returns pdf = inf).
+            int all_delta = 0;
             WardVK wardp;
             long long ci = *(GlobalI64)((GlobalPtr)sg + kOffCi);
-            if (ci >= 0) {
-                const VK_GLOBAL ClosureComponentVK* comp
-                    = (VK_GLOBAL const ClosureComponentVK*)(arena + kOffPool
-                                                            + ci);
-                if (comp->id == EMISSION_ID_VK || comp->id == BACKGROUND_ID_VK) {
-                    er = comp->w.x;
-                    eg = comp->w.y;
-                    eb = comp->w.z;
-                } else if (comp->id == DIFFUSE_ID_VK) {
-                    ar = comp->w.x;
-                    ag = comp->w.y;
-                    ab = comp->w.z;
-                } else if (comp->id == WARD_ID_VK) {
-                    // shading.cpp:73 WardParams { Vec3 N; Vec3 T; float ax;
-                    // float ay; } -- 32 bytes right after the 16-byte header:
-                    // N at +16, T at +28, ax at +40, ay at +44.
-                    GlobalCPtr wp = (GlobalCPtr)comp + 16;
-                    wardp.N       = load_vec((GlobalCVec3)wp);
-                    wardp.T       = load_vec((GlobalCVec3)(wp + 12));
-                    wardp.ax      = *(GlobalFloatCPtr)(wp + 24);
-                    wardp.ay      = *(GlobalFloatCPtr)(wp + 28);
-                    // The closure weight is what CompositeBSDF::prepare folds
-                    // into pdfs[0]; BSDF::get_albedo is the default Color3(1),
-                    // so the albedo *is* the closure weight, exactly like matte.
-                    ar = comp->w.x;
-                    ag = comp->w.y;
-                    ab = comp->w.z;
-                    is_ward = 1;
-                } else if (comp->id == REFLECTION_ID_VK
-                           || comp->id == FRESNEL_REFLECTION_ID_VK) {
-                    // shading.cpp:1134 -- ReflectionParams { Vec3 N; float eta; }
-                    // sits directly after the { int id; Vec3 w; } header
-                    // (llvm_gen.cpp:3912 copies it there at compile time).
-                    GlobalCPtr mp = (GlobalCPtr)comp + 16;
-                    Vec3 mN = load_vec((GlobalCVec3)mp);
-                    float eta = (comp->id == FRESNEL_REFLECTION_ID_VK)
-                                    ? *(GlobalFloatCPtr)(mp + 12)
-                                    : 0.0f;
-                    float cosNO = dot(mN, mul(r.direction, -1.0f));
-                    if (cosNO > 0.0f) {
-                        // Reflection::sample: one direction only, weight =
-                        // closure weight * Fresnel, i.e. exactly the "albedo"
-                        // CompositeBSDF folds into the throughput.
-                        float F = fresnel_dielectric_vk(cosNO, eta);
-                        ar      = comp->w.x * F;
-                        ag      = comp->w.y * F;
-                        ab      = comp->w.z * F;
-                        is_mirror = 1;
+            // Flatten ADD/MUL: glass is `Ks*reflection(N,eta) +
+            // Cs*refraction(N,eta)`, i.e. two components, and until now the
+            // device only ever looked at a single one (ci >= 0), so every
+            // glass sphere came out black.
+            ClosureEntryVK ce0, ce1;
+            ce0.id   = -1;
+            ce1.id   = -1;
+            ce0.off  = 0;
+            ce1.off  = 0;
+            int ncomp = collect_closure_entries(sg, ci, ce0, ce1);
+            Vec3 alb0 = mk(0.0f, 0.0f, 0.0f);
+            Vec3 alb1 = mk(0.0f, 0.0f, 0.0f);
+            if (ncomp > 0) {
+                Vec3 wov0     = mul(r.direction, -1.0f);
+                all_delta     = ncomp;
+                for (int k = 0; k < ncomp; ++k) {
+                    const ClosureEntryVK& e = (k == 0) ? ce0 : ce1;
+                    if (e.id == EMISSION_ID_VK || e.id == BACKGROUND_ID_VK) {
+                        er += e.w.x;
+                        eg += e.w.y;
+                        eb += e.w.z;
+                        all_delta = 0;  // an emitter is not a delta BSDF
+                        continue;
                     }
-                    // cosNO <= 0 leaves all three at zero: the CPU's sample()
-                    // returns an empty sample there, so the path ends.
+                    Vec3 alb = closure_entry_albedo(e, wov0);
+                    if (k == 0)
+                        alb0 = alb;
+                    else
+                        alb1 = alb;
+                    ar += alb.x;
+                    ag += alb.y;
+                    ab += alb.z;
+                    if (e.id == WARD_ID_VK) {
+                        // shading.cpp:73 WardParams { Vec3 N; Vec3 T; float ax;
+                        // float ay; } -- 32 bytes right after the 16-byte
+                        // header: N at +16, T at +28, ax at +40, ay at +44.
+                        GlobalCPtr wp = (GlobalCPtr)sg + kOffPoolClosure
+                                        + e.off + 16;
+                        wardp.N  = load_vec((GlobalCVec3)wp);
+                        wardp.T  = load_vec((GlobalCVec3)(wp + 12));
+                        wardp.ax = *(GlobalFloatCPtr)(wp + 24);
+                        wardp.ay = *(GlobalFloatCPtr)(wp + 28);
+                        is_ward   = 1;
+                        all_delta = 0;
+                    } else if (e.id == DIFFUSE_ID_VK) {
+                        all_delta = 0;
+                    } else if (!closure_entry_is_delta(e)) {
+                        all_delta = 0;
+                    }
                 }
+                if (ncomp == 1
+                    && (ce0.id == REFLECTION_ID_VK
+                        || ce0.id == FRESNEL_REFLECTION_ID_VK))
+                    is_mirror = 1;
+                if (all_delta > 0)
+                    all_delta = 1;
             }
 
             // (Probe values were captured right after the intersection above.)
@@ -1658,7 +1834,7 @@ extern "C" void osl_vk_raytrace_frame(GlobalPtr base)
             // it a matte surface only sees the background through the (much
             // noisier) bsdf-sampling path, which is why the sphere came out an
             // order of magnitude dark.
-            if (p->bg_res > 0 && !is_mirror) {
+            if (p->bg_res > 0 && !all_delta) {
                 Vec3 bg_dir;
                 float bg_pdf = 0.0f;
                 Vec3 bgv
@@ -1704,7 +1880,7 @@ extern "C" void osl_vk_raytrace_frame(GlobalPtr base)
             // uniformly, sample a point on it, evaluate the (Lambert) BSDF
             // toward it, MIS-weight, shoot a shadow ray, and shade the light
             // primitive to get its emitted radiance.
-            if (scene.nlightprims > 0 && !is_mirror) {
+            if (scene.nlightprims > 0 && !all_delta) {
                 const float light_pick_pdf = 1.0f / (float)scene.nlightprims;
                 float xl                   = xsv * (float)scene.nlightprims;
                 int ls                     = (int)__builtin_floorf(xl);
@@ -1858,7 +2034,71 @@ extern "C" void osl_vk_raytrace_frame(GlobalPtr base)
             // closure weight, the sample weight and 1/pdfs[0] all multiply in.
             Vec3 wi;
             float sweight = 1.0f;
-            if (is_mirror) {
+            // Per-channel multiplier applied to the throughput after sampling.
+            // For the analytic closures it is albedo * sample weight; for the
+            // composite delta case below it is the component weight divided by
+            // the probability it was chosen with.
+            float wmulr = ar, wmulg = ag, wmulb = ab;
+            if (all_delta) {
+                // CompositeBSDF::sample (shading.h:390-421) over the flattened
+                // components.  prepare() sets
+                //     pdfs[i] = weights[i].dot(path_weight * albedo)
+                //               / (path_weight.x + path_weight.y + path_weight.z)
+                // and renormalises while the total is in range, so a glass
+                // surface carries two probabilities F and 1-F.  sample() then
+                // picks one with rx, and multiplies its weight by
+                // weights[i] * (1/pdfs[i]) -- the component's own weight
+                // divided by the probability it was chosen with.  Skipping that
+                // 1/pdfs[i] is what makes a glass sphere brighter or darker
+                // than the reference even once it is no longer black.
+                float msum = w.x + w.y + w.z;
+                float p0   = 0.0f, p1 = 0.0f;
+                if (msum > 0.0f) {
+                    p0 = (alb0.x * w.x + alb0.y * w.y + alb0.z * w.z) / msum;
+                    p1 = (alb1.x * w.x + alb1.y * w.y + alb1.z * w.z) / msum;
+                }
+                float ptot = p0 + p1;
+                if (!(ptot > 0.0f))
+                    break;  // nothing this BSDF can sample
+                int pick    = 0;
+                float share = p0 / ptot;
+                float prob  = share;
+                if (!(rx < share)) {
+                    pick = 1;
+                    prob = p1 / ptot;
+                    rx   = (rx - share) / prob;
+                } else {
+                    rx = rx / share;
+                }
+                if (!(prob > 0.0f))
+                    break;
+                const ClosureEntryVK& e = (pick == 0) ? ce0 : ce1;
+                float cw                = 0.0f;
+                if (e.id == REFLECTION_ID_VK
+                    || e.id == FRESNEL_REFLECTION_ID_VK) {
+                    // Reflection::sample (shading.cpp:1095-1105): the reflected
+                    // direction is the only one, weight = Fresnel.
+                    float cosNO = dot(e.N, wov);
+                    if (cosNO > 0.0f) {
+                        wi  = sub(mul(e.N, 2.0f * cosNO), wov);
+                        cw  = fresnel_dielectric_vk(cosNO, e.eta);
+                        bsdf_pdf = inf();
+                    }
+                } else if (e.id == REFRACTION_ID_VK) {
+                    // Refraction::sample (shading.cpp:1124-1131).
+                    float Ft
+                        = fresnel_refraction_vk(mul(wov, -1.0f), e.N, e.eta, wi);
+                    cw       = Ft;
+                    bsdf_pdf = inf();
+                } else if (e.id == TRANSPARENT_ID_VK) {
+                    wi       = mul(wov, -1.0f);
+                    cw       = 1.0f;
+                    bsdf_pdf = inf();
+                }
+                wmulr = e.w.x * cw / prob;
+                wmulg = e.w.y * cw / prob;
+                wmulb = e.w.z * cw / prob;
+            } else if (is_mirror) {
                 float cosNO = dot(n, wov);
                 wi          = sub(mul(n, 2.0f * cosNO), wov);
                 bsdf_pdf    = inf();
@@ -1886,7 +2126,11 @@ extern "C" void osl_vk_raytrace_frame(GlobalPtr base)
                 wi            = sample_cosine_hemisphere(n, rx, s3.y, pdf_cos);
                 bsdf_pdf      = pdf_cos;
             }
-            w           = mulv(w, mk(ar * sweight, ag * sweight, ab * sweight));
+            if (all_delta) {
+                w = mulv(w, mk(wmulr, wmulg, wmulb));
+            } else {
+                w = mulv(w, mk(ar * sweight, ag * sweight, ab * sweight));
+            }
             r.origin    = P;
             r.direction = wi;
             prev_id     = hit.id;
