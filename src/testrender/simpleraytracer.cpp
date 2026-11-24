@@ -1310,7 +1310,9 @@ SimpleRaytracer::init_vulkan_shading()
     m_vulkan_requested        = false;
     m_vulkan_hard_failure     = false;
     m_vulkan_failure_reported = false;
-    m_vk_frame                = -1;
+    m_vk_gen                  = -1;
+    m_vk_intersect            = -1;
+    m_vk_shade                = -1;
     m_vk.reset();
 
     const char* enable = getenv("OSL_USE_VULKAN");
@@ -1328,13 +1330,13 @@ SimpleRaytracer::init_vulkan_shading()
     }
     fprintf(stderr, "[vulkan] device: %s\n", m_vk->device_name().c_str());
 
-    // Assemble one module out of every group plus the device frame renderer,
-    // so the whole frame (ray generation, sampling, intersection,
-    // accumulation) runs in one dispatch.  A whole-frame kernel has to be able
-    // to call *any* material, and SPIR-V modules cannot call across modules,
-    // which is why this is the only device path: there is no per-material
-    // pipeline to dispatch a single shading point through.  See
-    // src/liboslexec/vulkan_module.cpp.
+    // Assemble one module out of every group plus the device wavefront
+    // renderer.  The module carries three kernels (generation, intersection,
+    // shading) and the host creates one compute pipeline per entry point; they
+    // share the module so every pass sees the same descriptor set and storage
+    // buffer.  A pass has to be able to call *any* material, and SPIR-V modules
+    // cannot call across modules, which is why everything is one module.
+    // See src/liboslexec/vulkan_module.cpp.
     std::vector<std::string> irs;
     std::vector<std::vector<std::string>> ents;
     m_vk_dispatch_id.assign(m_shaders.size(), -1);
@@ -1400,22 +1402,32 @@ SimpleRaytracer::init_vulkan_shading()
             fprintf(stderr, "[vulkan] wrote %s\n", spvpath);
         }
     }
-    // Entry `osl_kernel` sits at the top of the module and calls
-    // osl_vk_raytrace_frame, which reaches every material through the
-    // synthesised dispatch.
-    int frame_id
-        = m_vk->add_shader(spirv.data(), spirv.size(), "osl_kernel", err);
-    if (frame_id < 0) {
-        fprintf(stderr, "[vulkan] frame pipeline failed: %s\n", err.c_str());
-        vulkan_report_failure("frame pipeline failed", err.c_str());
-        return;
+    // Three entry points in the one module: the wavefront passes.  Entry names
+    // must match the kernels vulkan_module.cpp synthesises.
+    struct PassSpec {
+        const char* entry;
+        int* slot;
+    };
+    const PassSpec passes[] = {
+        { "osl_kernel_gen", &m_vk_gen },
+        { "osl_kernel_intersect", &m_vk_intersect },
+        { "osl_kernel_shade", &m_vk_shade },
+    };
+    for (auto& ps : passes) {
+        int id = m_vk->add_shader(spirv.data(), spirv.size(), ps.entry, err);
+        if (id < 0) {
+            fprintf(stderr, "[vulkan] pipeline '%s' failed: %s\n", ps.entry,
+                    err.c_str());
+            vulkan_report_failure("wavefront pipeline failed", ps.entry);
+            return;
+        }
+        *ps.slot = id;
     }
-    m_vk_frame = frame_id;
     upload_vulkan_textures();
     fprintf(stderr,
-            "[vulkan] whole-frame pipeline ready (pipeline %d): raytracing, "
-            "sampling and accumulation run on the device\n",
-            frame_id);
+            "[vulkan] wavefront pipeline ready (gen %d, intersect %d, shade %d): "
+            "ray generation, BVH traversal and shading run as separate passes\n",
+            m_vk_gen, m_vk_intersect, m_vk_shade);
 }
 
 
@@ -1733,7 +1745,8 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
 {
     using namespace osl_vk_abi;
     std::string err;
-    if (!m_vk || !m_vk->ready() || m_vk_frame < 0)
+    if (!m_vk || !m_vk->ready() || m_vk_gen < 0 || m_vk_intersect < 0
+        || m_vk_shade < 0)
         return false;
 
     size_t cursor = (m_vk->texture_end() + 15) & ~(size_t)15;
@@ -1802,6 +1815,33 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
                 tri_area.empty() ? -1.0f : tri_area[tri_area.size() - 1]);
     }
     size_t out_off  = take(npix * sizeof(float) * 4);
+    /// Wavefront buffers, one component per array (SoA), one entry per pixel:
+    /// the ray buffer carries a path's state across passes, the hit buffer the
+    /// traversal result of the current wave.
+    size_t wf_org_x = take(npix * sizeof(float));
+    size_t wf_org_y = take(npix * sizeof(float));
+    size_t wf_org_z = take(npix * sizeof(float));
+    size_t wf_dir_x = take(npix * sizeof(float));
+    size_t wf_dir_y = take(npix * sizeof(float));
+    size_t wf_dir_z = take(npix * sizeof(float));
+    size_t wf_radius = take(npix * sizeof(float));
+    size_t wf_spread = take(npix * sizeof(float));
+    size_t wf_thr_r  = take(npix * sizeof(float));
+    size_t wf_thr_g  = take(npix * sizeof(float));
+    size_t wf_thr_b  = take(npix * sizeof(float));
+    size_t wf_bpdf   = take(npix * sizeof(float));
+    size_t wf_seed   = take(npix * sizeof(int));
+    size_t wf_sindex = take(npix * sizeof(int));
+    size_t wf_depth  = take(npix * sizeof(int));
+    size_t wf_prev   = take(npix * sizeof(int));
+    size_t wf_active = take(npix * sizeof(int));
+    size_t wf_hit_t  = take(npix * sizeof(float));
+    size_t wf_hit_u  = take(npix * sizeof(float));
+    size_t wf_hit_v  = take(npix * sizeof(float));
+    size_t wf_hit_id = take(npix * sizeof(int));
+    size_t wf_hit_ok = take(npix * sizeof(int));
+    /// Traversal stack scratch, one block per pixel (see `wf_stack`).
+    size_t wf_stack = take(npix * (size_t)kTraversalStackStride);
     size_t arena_off = take(npix * (size_t)kShadeBlockStride);
     /// The background importance table (Background::prepare), uploaded so the
     /// device's *indirect* rays can evaluate the background the way the CPU
@@ -1991,7 +2031,7 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
     fp.bg_shader_id = -1;
     if (backgroundShaderID >= 0
         && backgroundShaderID < (int)m_vk_dispatch_id.size()
-        && m_vk_frame >= 0)
+        && m_vk_shade >= 0)
         fp.bg_shader_id = m_vk_dispatch_id[backgroundShaderID];
     fp.bg_color[0] = fp.bg_color[1] = fp.bg_color[2] = 0.0f;
     fp.tri_offset        = (long long)tri_off;
@@ -2004,6 +2044,29 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
     fp.out_offset        = (long long)out_off;
     fp.arena_offset      = (long long)arena_off;
     fp.arena_stride      = (long long)kShadeBlockStride;
+    fp.wf_org_x          = (long long)wf_org_x;
+    fp.wf_org_y          = (long long)wf_org_y;
+    fp.wf_org_z          = (long long)wf_org_z;
+    fp.wf_dir_x          = (long long)wf_dir_x;
+    fp.wf_dir_y          = (long long)wf_dir_y;
+    fp.wf_dir_z          = (long long)wf_dir_z;
+    fp.wf_radius         = (long long)wf_radius;
+    fp.wf_spread         = (long long)wf_spread;
+    fp.wf_thr_r          = (long long)wf_thr_r;
+    fp.wf_thr_g          = (long long)wf_thr_g;
+    fp.wf_thr_b          = (long long)wf_thr_b;
+    fp.wf_seed           = (long long)wf_seed;
+    fp.wf_sindex         = (long long)wf_sindex;
+    fp.wf_depth          = (long long)wf_depth;
+    fp.wf_prev           = (long long)wf_prev;
+    fp.wf_active         = (long long)wf_active;
+    fp.wf_bpdf           = (long long)wf_bpdf;
+    fp.wf_hit_t          = (long long)wf_hit_t;
+    fp.wf_hit_u          = (long long)wf_hit_u;
+    fp.wf_hit_v          = (long long)wf_hit_v;
+    fp.wf_hit_id         = (long long)wf_hit_id;
+    fp.wf_hit_ok         = (long long)wf_hit_ok;
+    fp.wf_stack          = (long long)wf_stack;
     fp.lightprim_offset  = (long long)lp_off;
     fp.num_lightprims    = (int)lp_count;
     fp.area_offset       = (long long)area_off;
@@ -2033,9 +2096,10 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
     fp.bg_values_offset = (long long)bg_vals_off;
     fp.bg_rows_offset   = (long long)bg_rows_off;
     fp.bg_cols_offset   = (long long)bg_cols_off;
-    fp.pad_light         = getenv("OSL_VULKAN_DEBUG_PIXEL") ? 1 : 0;
-    if (const char* dm = getenv("OSL_VULKAN_DEBUG_MODE"))
-        fp.pad_light = atoi(dm);
+    // The probe modes belonged to the megakernel (they counted per-sample
+    // statistics inside one thread).  The wavefront passes do not implement
+    // them, so the field stays 0 and the reporting block below is skipped.
+    fp.pad_light = 0;
     if (!m_vk->upload(kFrameParamsOffset, &fp, sizeof(fp), err)) {
         errhandler().errorfmt("[vulkan] FrameParams upload failed: {}", err);
         return false;
@@ -2118,65 +2182,55 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
     unsigned groups = (unsigned)((npix + kWorkgroupSize - 1) / kWorkgroupSize);
     OIIO::Timer t;
     std::vector<float> image(npix * 4);
-    if (fp.pad_light) {
-        // Probe runs keep the single-dispatch shape: their counters are
-        // per-sample statistics and only make sense with every sample in one
-        // thread.
-        if (!m_vk->dispatch(m_vk_frame, groups, err)) {
-            errhandler().errorfmt("[vulkan] frame dispatch failed: {}", err);
+    // Wavefront loop: per antialiasing sample, generate the primary rays and
+    // then alternate intersect / shade once per bounce.  Every pass is a full
+    // npix-wide dispatch; the shading pass accumulates that bounce's radiance
+    // into the sample's image and writes the next bounce's ray, which the next
+    // intersect pass picks up.
+    const int frame_samples = std::max(1, fp.aa * fp.aa);
+    fp.sample_count         = frame_samples;
+    fp.sample_batch         = 1;
+    std::fill(image.begin(), image.end(), 0.0f);
+    std::vector<float> one(npix * 4);
+    const int bounces = std::max(0, fp.max_bounces);
+    if (frame_samples > 1)
+        fprintf(stderr,
+                "[vulkan] wavefront: %d samples x %d intersect/shade pairs, "
+                "%u workgroups per pass\n",
+                frame_samples, bounces + 1, groups);
+    for (int s = 0; s < frame_samples; ++s) {
+        fp.sample_index = s;
+        if (!m_vk->upload(kFrameParamsOffset, &fp, sizeof(fp), err)) {
+            errhandler().errorfmt("[vulkan] FrameParams upload failed: {}",
+                                  err);
             return false;
         }
-        if (!m_vk->download(out_off, image.data(), image.size() * sizeof(float),
+        if (!m_vk->dispatch(m_vk_gen, groups, err)) {
+            errhandler().errorfmt(
+                "[vulkan] sample {}: ray generation failed: {}", s, err);
+            return false;
+        }
+        for (int b = 0; b <= bounces; ++b) {
+            if (!m_vk->dispatch(m_vk_intersect, groups, err)) {
+                errhandler().errorfmt(
+                    "[vulkan] sample {} bounce {}: intersect failed: {}", s, b,
+                    err);
+                return false;
+            }
+            if (!m_vk->dispatch(m_vk_shade, groups, err)) {
+                errhandler().errorfmt(
+                    "[vulkan] sample {} bounce {}: shade failed: {}", s, b, err);
+                return false;
+            }
+        }
+        if (!m_vk->download(out_off, one.data(), one.size() * sizeof(float),
                             err)) {
-            errhandler().errorfmt("[vulkan] image read-back failed: {}", err);
+            errhandler().errorfmt("[vulkan] sample {} read-back failed: {}", s,
+                                  err);
             return false;
         }
-    } else {
-        // One dispatch per sample, accumulated on the host.  Each dispatch runs
-        // the same kernel with a thread that shades exactly one sample, which is
-        // the structure the CUDA path has (one closure pool per subpixel thread)
-        // -- and the device-side radiance is already weighted by 1/nsamples, so
-        // the host only has to add them up.
-        const int frame_samples = std::max(1, fp.aa * fp.aa);
-        fp.sample_count         = frame_samples;
-        // One sample per thread is what the CUDA path does; batching a few more
-        // per dispatch only trims the host round trip, and it has to stay small
-        // because it is exactly the reuse that used to stripe the image.
-        int batch = 1;
-        if (const char* sb = getenv("OSL_VULKAN_SAMPLES_PER_DISPATCH"))
-            batch = std::max(1, atoi(sb));
-        batch = std::min(batch, frame_samples);
-        fp.sample_batch = batch;
-        if (frame_samples > 1)
-            fprintf(stderr,
-                    "[vulkan] aa split: %d sample(s) per dispatch, %d dispatch(es)\n",
-                    batch, frame_samples / batch);
-        std::fill(image.begin(), image.end(), 0.0f);
-        std::vector<float> one(npix * 4);
-        for (int s = 0; s < frame_samples; s += batch) {
-            fp.sample_index = s;
-            if (!m_vk->upload(kFrameParamsOffset, &fp, sizeof(fp), err)) {
-                errhandler().errorfmt("[vulkan] FrameParams upload failed: {}",
-                                      err);
-                return false;
-            }
-            if (!m_vk->dispatch(m_vk_frame, groups, err)) {
-                errhandler().errorfmt("[vulkan] sample {} dispatch failed: {}", s,
-                                      err);
-                return false;
-            }
-            if (!m_vk->download(out_off, one.data(), one.size() * sizeof(float),
-                                err)) {
-                errhandler().errorfmt("[vulkan] sample {} read-back failed: {}", s,
-                                      err);
-                return false;
-            }
-            for (size_t i = 0; i < image.size(); ++i)
-                image[i] += one[i];
-        }
-        fp.sample_count = 0;
-        fp.sample_index = 0;
-        fp.sample_batch = 0;
+        for (size_t i = 0; i < image.size(); ++i)
+            image[i] += one[i];
     }
     (void)t;
 
@@ -2630,7 +2684,7 @@ void
 SimpleRaytracer::render(int xres, int yres)
 {
     OIIO::Timer timer;
-    if (m_vk_frame >= 0) {
+    if (m_vk_shade >= 0) {
         if (render_vulkan_frame(xres, yres))
             return;
         // The whole-frame pipeline was requested and produced nothing.  Re-

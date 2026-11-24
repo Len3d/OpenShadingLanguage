@@ -15,7 +15,8 @@
 //   + osl_layer_<g>_layer0/1/...  for every group of the scene
 //   -> one module
 //   -> osl_vk_shade_dispatch(sg, id)   switch over the material ids
-//   -> osl_kernel(ptr addrspace(1))    calls osl_vk_raytrace_frame
+//   -> osl_kernel_gen / osl_kernel_intersect / osl_kernel_shade
+//      (ptr addrspace(1)), one wavefront pass each
 //
 // That module is then handed to clspv (`-x ir`) exactly like a single group
 // would have been.
@@ -385,42 +386,61 @@ bool vulkan_build_render_module (const std::vector<std::string>& group_ir,
             nb.CreateRetVoid();
         }
 
-        // ---- the compute kernel ----
+        // ---- the compute kernels ----
+        //
+        // The wavefront pipeline is three kernels in one module: clspv emits
+        // one OpEntryPoint per SPIR_KERNEL function (verified on the standalone
+        // clspv binary), and the host creates one compute pipeline per entry
+        // name via add_shader().  Sharing the module is what lets every pass use
+        // the same descriptor set and the same storage buffer.
+        struct KernelSpec {
+            const char* name;
+            const char* impl;
+        };
+        static const KernelSpec kernels[] = {
+            { "osl_kernel_gen", "osl_vk_wave_gen" },
+            { "osl_kernel_intersect", "osl_vk_wave_intersect" },
+            { "osl_kernel_shade", "osl_vk_wave_shade" },
+        };
         llvm::FunctionType* ktype
             = llvm::FunctionType::get(vd, { ptr1 }, false);
-        llvm::Function* kernel
-            = llvm::Function::Create(ktype, llvm::GlobalValue::ExternalLinkage,
-                                     "osl_kernel", *render);
-        kernel->setCallingConv(llvm::CallingConv::SPIR_KERNEL);
-        {
-            llvm::BasicBlock* bb = llvm::BasicBlock::Create(ctx, "entry", kernel);
-            llvm::IRBuilder<> b(bb);
-            llvm::Function* frame = render->getFunction("osl_vk_raytrace_frame");
-            if (!frame) {
-                out_log = "the device render module has no "
-                          "osl_vk_raytrace_frame";
+        for (auto& ks : kernels) {
+            llvm::Function* impl = render->getFunction(ks.impl);
+            if (!impl) {
+                out_log = std::string("the device render module has no ")
+                          + ks.impl;
                 return false;
             }
-            b.CreateCall(frame, { kernel->getArg(0) });
-            b.CreateRetVoid();
-        }
-        // clspv reads the workgroup size from *metadata* named
-        // "reqd_work_group_size" (that is what clang emits for the OpenCL
-        // attribute of the same name), not from a function attribute.  With the
-        // attribute form it silently falls back to 1x1x1, which is a silent
-        // wrong-answer bug: the dispatch then covers only `groups` pixels.
-        kernel->addFnAttr("reqd_work_group_size",
-                          fmtformat("{} 1 1", osl_vk_abi::kWorkgroupSize));
-        {
-            llvm::Type* i32ty = llvm::Type::getInt32Ty(ctx);
-            auto* md          = llvm::MDNode::get(
-                ctx, { llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
-                           i32ty, osl_vk_abi::kWorkgroupSize)),
-                       llvm::ConstantAsMetadata::get(
-                           llvm::ConstantInt::get(i32ty, 1)),
-                       llvm::ConstantAsMetadata::get(
-                           llvm::ConstantInt::get(i32ty, 1)) });
-            kernel->setMetadata("reqd_work_group_size", md);
+            llvm::Function* kernel = llvm::Function::Create(
+                ktype, llvm::GlobalValue::ExternalLinkage, ks.name, *render);
+            kernel->setCallingConv(llvm::CallingConv::SPIR_KERNEL);
+            {
+                llvm::BasicBlock* bb
+                    = llvm::BasicBlock::Create(ctx, "entry", kernel);
+                llvm::IRBuilder<> b(bb);
+                b.CreateCall(impl, { kernel->getArg(0) });
+                b.CreateRetVoid();
+            }
+            // clspv reads the workgroup size from *metadata* named
+            // "reqd_work_group_size" (that is what clang emits for the OpenCL
+            // attribute of the same name), not from a function attribute.  With
+            // the attribute form it silently falls back to 1x1x1, which is a
+            // silent wrong-answer bug: the dispatch then covers only `groups`
+            // pixels.
+            kernel->addFnAttr("reqd_work_group_size",
+                              fmtformat("{} 1 1", osl_vk_abi::kWorkgroupSize));
+            {
+                llvm::Type* i32ty = llvm::Type::getInt32Ty(ctx);
+                auto* md          = llvm::MDNode::get(
+                    ctx,
+                    { llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+                          i32ty, osl_vk_abi::kWorkgroupSize)),
+                      llvm::ConstantAsMetadata::get(
+                          llvm::ConstantInt::get(i32ty, 1)),
+                      llvm::ConstantAsMetadata::get(
+                          llvm::ConstantInt::get(i32ty, 1)) });
+                kernel->setMetadata("reqd_work_group_size", md);
+            }
         }
 
         // Everything else has to be inlined: clspv can only attribute a pointer
@@ -428,9 +448,8 @@ bool vulkan_build_render_module (const std::vector<std::string>& group_ir,
         // visible in the IR, and a pointer returned by a call breaks that chain
         // (it makes clspv drop the store, see vulkan_legalize.h).
         for (auto& F : *render) {
-            if (F.isDeclaration() || &F == kernel)
-                continue;
-            if (F.getCallingConv() == llvm::CallingConv::SPIR_KERNEL)
+            if (F.isDeclaration()
+                || F.getCallingConv() == llvm::CallingConv::SPIR_KERNEL)
                 continue;
             F.addFnAttr(llvm::Attribute::AlwaysInline);
         }

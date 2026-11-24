@@ -269,6 +269,35 @@ inline TriangleIndices load_tri(GlobalCTri p)
     return t;
 }
 
+/// Byte-addressed reads for the traversal.
+///
+/// `p[i]` on a *typed* pointer with a runtime index is lowered by clspv to
+/// `OpPtrAccessChain`, and the Intel compiler crashes on that instruction
+/// (measured: the whole module fails to build a pipeline as soon as the
+/// intersection pass contains five of them, while the old megakernel module --
+/// which had none -- built fine).  Doing the arithmetic in bytes keeps every
+/// access a plain `OpAccessChain` off the kernel argument, which is the form
+/// the rest of this file already uses.
+inline TriangleIndices tri_at(GlobalCPtr tris, int id)
+{
+    GlobalCPtr p = tris + (unsigned long long)id * sizeof(TriangleIndices);
+    TriangleIndices t;
+    t.a = *(VK_GLOBAL const int*)p;
+    t.b = *(VK_GLOBAL const int*)(p + 4);
+    t.c = *(VK_GLOBAL const int*)(p + 8);
+    return t;
+}
+
+inline Vec3 vec_at(GlobalCPtr verts, int id)
+{
+    GlobalCPtr p = verts + (unsigned long long)id * sizeof(Vec3);
+    Vec3 v;
+    v.x = *(VK_GLOBAL const float*)p;
+    v.y = *(VK_GLOBAL const float*)(p + 4);
+    v.z = *(VK_GLOBAL const float*)(p + 8);
+    return v;
+}
+
 /// Möller-Trumbore, matching the CPU's triangle test closely enough that a
 /// shadow ray arrives at the same primitive.
 inline bool intersect_tri(const Ray& r, const Vec3& va, const Vec3& vb,
@@ -306,6 +335,7 @@ struct SceneView {
     GlobalCTri tri_uv;
     VK_GLOBAL const BvhNodeVK* nodes;   ///< the CPU BVH, uploaded verbatim
     VK_GLOBAL const unsigned* bvh_idx;  ///< triangle ids the leaves point at
+    GlobalPtr stack;                    ///< traversal stack, 64 slots per pixel
     int ntris;
     int nlightprims;
     int num_bvh_nodes;
@@ -351,6 +381,34 @@ inline float xorf_vk(float a, unsigned b)
     return __builtin_bit_cast(float, __builtin_bit_cast(unsigned, a) ^ b);
 }
 
+// --- the BVH traversal stack ------------------------------------------------
+//
+// Slot layout is {int node, float dist}, 8 bytes, at most
+// `kTraversalStackDepth` deep.  Addressed by byte offset so the codegen stays
+// in the same shape as the rest of the file (an `OpAccessChain` off the buffer
+// argument) instead of a typed `p[i]`, which clspv turns into
+// `OpPtrAccessChain` -- fine on a storage buffer, fatal on a private alloca.
+
+inline int stack_node(GlobalPtr st, int i)
+{
+    return *(VK_GLOBAL const int*)(st + (unsigned long long)i * 8ULL);
+}
+
+inline float stack_dist(GlobalPtr st, int i)
+{
+    return *(VK_GLOBAL const float*)(st + (unsigned long long)i * 8ULL + 4ULL);
+}
+
+inline void stack_node_set(GlobalPtr st, int i, int node)
+{
+    *(VK_GLOBAL int*)(st + (unsigned long long)i * 8ULL) = node;
+}
+
+inline void stack_dist_set(GlobalPtr st, int i, float dist)
+{
+    *(VK_GLOBAL float*)(st + (unsigned long long)i * 8ULL + 4ULL) = dist;
+}
+
 // Two-speed intersect: `skip_b` is the light primitive a shadow ray is aimed
 // at, so the shadow test has to ignore it as well as the surface it left (this
 // is what Scene::intersect(r, tmax, skipID1, skipID2) does on the CPU).
@@ -374,11 +432,11 @@ inline Hit intersect_scene(const SceneView& s, const Ray& r, float tmax,
         for (int i = 0; i < s.ntris; ++i) {
             if (i == skip_id || i == skip_id_b)
                 continue;
-            TriangleIndices ti = load_tri(&s.tris[i]);
+            TriangleIndices ti = tri_at((GlobalCPtr)s.tris, i);
             float t, u, v;
-            if (!intersect_tri(r, load_vec(&s.verts[ti.a]),
-                               load_vec(&s.verts[ti.b]),
-                               load_vec(&s.verts[ti.c]), t, u, v))
+            if (!intersect_tri(r, vec_at((GlobalCPtr)s.verts, ti.a),
+                               vec_at((GlobalCPtr)s.verts, ti.b),
+                               vec_at((GlobalCPtr)s.verts, ti.c), t, u, v))
                 continue;
             if (t < tmax && t < h.t) {
                 h.t  = t;
@@ -392,11 +450,9 @@ inline Hit intersect_scene(const SceneView& s, const Ray& r, float tmax,
         return h;
     }
 
-    struct StackItemVK {
-        int node;
-        float dist;
-    };
-    StackItemVK stack[64];
+    // The traversal stack lives in the storage buffer, not in a local array --
+    // see the comment on the accessors above.
+    GlobalPtr stack = s.stack;
 
     const Vec3 org = r.origin;
     const Vec3 dir = r.direction;
@@ -414,25 +470,29 @@ inline Hit intersect_scene(const SceneView& s, const Ray& r, float tmax,
 
     float best             = tmax;
     int stackPtr           = 1;
-    stack[0].node          = 0;
-    stack[0].dist          = best;
+    stack_node_set(stack, 0, 0);
+    stack_dist_set(stack, 0, best);
     while (stackPtr != 0) {
         --stackPtr;
-        if (best < stack[stackPtr].dist)
+        if (best < stack_dist(stack, stackPtr))
             continue;
-        const int ni            = stack[stackPtr].node;
-        VK_GLOBAL const BvhNodeVK* node = &s.nodes[ni];
+        const int ni            = stack_node(stack, stackPtr);
+        VK_GLOBAL const BvhNodeVK* node
+            = (VK_GLOBAL const BvhNodeVK*)((GlobalCPtr)s.nodes
+                                           + (unsigned long long)ni
+                                                 * sizeof(BvhNodeVK));
         const unsigned nprims   = node->nprims;
         if (nprims) {
             const unsigned base = node->child;
             for (unsigned i = 0; i < nprims; ++i) {
-                const int id = (int)s.bvh_idx[base + i];
+                const int id = (int)*(VK_GLOBAL const unsigned*)((GlobalCPtr)s.bvh_idx
+                                    + (unsigned long long)(base + i) * 4ULL);
                 if (id == skip_id || id == skip_id_b)
                     continue;  // the surface we just left, or the lit triangle
-                TriangleIndices ti = load_tri(&s.tris[id]);
-                const Vec3 A = sub(load_vec(&s.verts[ti.a]), org);
-                const Vec3 B = sub(load_vec(&s.verts[ti.b]), org);
-                const Vec3 C = sub(load_vec(&s.verts[ti.c]), org);
+                TriangleIndices ti = tri_at((GlobalCPtr)s.tris, id);
+                const Vec3 A = sub(vec_at((GlobalCPtr)s.verts, ti.a), org);
+                const Vec3 B = sub(vec_at((GlobalCPtr)s.verts, ti.b), org);
+                const Vec3 C = sub(vec_at((GlobalCPtr)s.verts, ti.c), org);
                 const float Ax = compv(A, kx) - shearDir.x * compv(A, kz);
                 const float Ay = compv(A, ky) - shearDir.y * compv(A, kz);
                 const float Bx = compv(B, kx) - shearDir.x * compv(B, kz);
@@ -482,11 +542,11 @@ inline Hit intersect_scene(const SceneView& s, const Ray& r, float tmax,
                 c1             = c2;
                 c2             = tc;
             }
-            stack[stackPtr].node = c2;
-            stack[stackPtr].dist = d2;
+            stack_node_set(stack, stackPtr, c2);
+            stack_dist_set(stack, stackPtr, d2);
             stackPtr += hit2;
-            stack[stackPtr].node = c1;
-            stack[stackPtr].dist = d1;
+            stack_node_set(stack, stackPtr, c1);
+            stack_dist_set(stack, stackPtr, d1);
             stackPtr += hit1;
         }
     }
@@ -1358,14 +1418,34 @@ inline void fill_globals(VK_GLOBAL ShaderGlobals* sg, const SceneView& s,
     sg->thread_index = 0;
 }
 
+
 // ---------------------------------------------------------------------------
-// Kernel body
+// Wavefront kernels
 // ---------------------------------------------------------------------------
 //
-// Offsets inside a ShadeBlock, mirroring vulkan_shadeops.cpp.  The arena *is* the
-// ShadeBlock: `sg` sits at its start, the closure pool 320 bytes in, and
-// `sg.renderstate` doubles as the bump cursor (the legaliser lowered every
-// alloca and every closure allocation onto those two fields).
+// The frame is traced in passes over structure-of-arrays buffers, one entry per
+// pixel, dispatched in this order for every antialiasing sample:
+//
+//   osl_kernel_gen        jitter + camera ray            -> ray buffer
+//   osl_kernel_intersect  BVH traversal                  ray -> hit buffer
+//   osl_kernel_shade      shading, NEE, roulette, next ray
+//
+// and `intersect` / `shade` repeat once per bounce.  Separating the traversal
+// from the shading is what makes it coherent: a launch walks the same node set
+// for neighbouring rays instead of one invocation diving into its own path, and
+// the shading pass no longer carries the traversal live ranges.
+//
+// Explicit light sampling and background NEE stay inside the shading pass.
+// Their contributions are MIS-weighted against the bsdf pdf that same pass has
+// just produced, and the CPU order (emission, NEE, roulette, bsdf sample) is
+// reproduced exactly -- splitting them into their own wave would reorder the
+// float additions and drift away from the reference image.
+//
+// Ray buffer contents, one array per component (`width*height` entries each):
+// origin x/y/z, direction x/y/z, radius, spread, throughput r/g/b, the sampler
+// state (seed, index), depth, the primitive the ray left, a liveness flag and
+// the bsdf pdf that produced it.  Hit buffer: t, u, v, primitive id, hit flag.
+
 static const long long kOffRenderstate = 216;
 static const long long kOffCi          = 288;
 static const long long kOffPool        = 320;
@@ -1373,14 +1453,139 @@ static const long long kOffPool        = 320;
 // kTextureTableOffset in src/testrender/vulkan_shading.cpp.
 static const long long kTexTableOffsetVK = 64 * 1024;
 
-extern "C" void osl_vk_raytrace_frame(GlobalPtr base)
+/// One ray-buffer entry, gathered from / scattered back to the SoA arrays.
+struct WaveRay {
+    Vec3 org, dir;
+    float radius, spread;
+    float thr_r, thr_g, thr_b;
+    float bpdf;                 ///< bsdf pdf of the ray (inf for a delta)
+    unsigned int seed, sindex;  ///< sampler state, advanced across bounces
+    int depth;                  ///< bounce index
+    int prev;                   ///< primitive the ray left (skipped by traversal)
+    int active;                 ///< 0 once the path died
+};
+
+inline VK_GLOBAL float*
+wf_fp(GlobalPtr base, long long off)
+{
+    return (VK_GLOBAL float*)(base + off);
+}
+
+inline VK_GLOBAL const float*
+wf_fcp(GlobalPtr base, long long off)
+{
+    return (VK_GLOBAL const float*)(base + off);
+}
+
+inline VK_GLOBAL int*
+wf_ip(GlobalPtr base, long long off)
+{
+    return (VK_GLOBAL int*)(base + off);
+}
+
+inline VK_GLOBAL const int*
+wf_icp(GlobalPtr base, long long off)
+{
+    return (VK_GLOBAL const int*)(base + off);
+}
+
+inline void
+wave_ray_load(VK_GLOBAL const FrameParams* p, GlobalPtr base,
+              unsigned long long i, WaveRay& r)
+{
+    r.org.x  = wf_fcp(base, p->wf_org_x)[i];
+    r.org.y  = wf_fcp(base, p->wf_org_y)[i];
+    r.org.z  = wf_fcp(base, p->wf_org_z)[i];
+    r.dir.x  = wf_fcp(base, p->wf_dir_x)[i];
+    r.dir.y  = wf_fcp(base, p->wf_dir_y)[i];
+    r.dir.z  = wf_fcp(base, p->wf_dir_z)[i];
+    r.radius = wf_fcp(base, p->wf_radius)[i];
+    r.spread = wf_fcp(base, p->wf_spread)[i];
+    r.thr_r  = wf_fcp(base, p->wf_thr_r)[i];
+    r.thr_g  = wf_fcp(base, p->wf_thr_g)[i];
+    r.thr_b  = wf_fcp(base, p->wf_thr_b)[i];
+    r.bpdf   = wf_fcp(base, p->wf_bpdf)[i];
+    r.seed   = (unsigned int)wf_icp(base, p->wf_seed)[i];
+    r.sindex = (unsigned int)wf_icp(base, p->wf_sindex)[i];
+    r.depth  = wf_icp(base, p->wf_depth)[i];
+    r.prev   = wf_icp(base, p->wf_prev)[i];
+    r.active = wf_icp(base, p->wf_active)[i];
+}
+
+inline void
+wave_ray_store(VK_GLOBAL const FrameParams* p, GlobalPtr base,
+               unsigned long long i, const WaveRay& r)
+{
+    wf_fp(base, p->wf_org_x)[i]  = r.org.x;
+    wf_fp(base, p->wf_org_y)[i]  = r.org.y;
+    wf_fp(base, p->wf_org_z)[i]  = r.org.z;
+    wf_fp(base, p->wf_dir_x)[i]  = r.dir.x;
+    wf_fp(base, p->wf_dir_y)[i]  = r.dir.y;
+    wf_fp(base, p->wf_dir_z)[i]  = r.dir.z;
+    wf_fp(base, p->wf_radius)[i] = r.radius;
+    wf_fp(base, p->wf_spread)[i] = r.spread;
+    wf_fp(base, p->wf_thr_r)[i]  = r.thr_r;
+    wf_fp(base, p->wf_thr_g)[i]  = r.thr_g;
+    wf_fp(base, p->wf_thr_b)[i]  = r.thr_b;
+    wf_fp(base, p->wf_bpdf)[i]   = r.bpdf;
+    wf_ip(base, p->wf_seed)[i]   = (int)r.seed;
+    wf_ip(base, p->wf_sindex)[i] = (int)r.sindex;
+    wf_ip(base, p->wf_depth)[i]  = r.depth;
+    wf_ip(base, p->wf_prev)[i]   = r.prev;
+    wf_ip(base, p->wf_active)[i] = r.active;
+}
+
+inline void
+wave_hit_store(VK_GLOBAL const FrameParams* p, GlobalPtr base,
+               unsigned long long i, float t, float u, float v, int id, int ok)
+{
+    wf_fp(base, p->wf_hit_t)[i]  = t;
+    wf_fp(base, p->wf_hit_u)[i]  = u;
+    wf_fp(base, p->wf_hit_v)[i]  = v;
+    wf_ip(base, p->wf_hit_id)[i] = id;
+    wf_ip(base, p->wf_hit_ok)[i] = ok;
+}
+
+inline void
+wave_hit_load(VK_GLOBAL const FrameParams* p, GlobalPtr base,
+              unsigned long long i, float& t, float& u, float& v, int& id,
+              int& ok)
+{
+    t  = wf_fcp(base, p->wf_hit_t)[i];
+    u  = wf_fcp(base, p->wf_hit_u)[i];
+    v  = wf_fcp(base, p->wf_hit_v)[i];
+    id = wf_icp(base, p->wf_hit_id)[i];
+    ok = wf_icp(base, p->wf_hit_ok)[i];
+}
+
+/// The scene view every pass that touches geometry needs: eleven pointers into
+/// the storage buffer plus the three counts.  Same construction the megakernel
+/// used, so the same pointers clspv can attribute to the buffer argument.
+#define WAVE_SCENE_SETUP(scene)                                               \
+    scene.tris          = (GlobalTri)(base + p->tri_offset);                  \
+    scene.verts         = (GlobalVec3)(base + p->vert_offset);                \
+    scene.normals       = (GlobalVec3)(base + p->normal_offset);              \
+    scene.tri_n         = (GlobalCTri)(base + p->tri_n_offset);               \
+    scene.ntris         = p->num_triangles;                                   \
+    scene.lightprims    = (GlobalInt)(base + p->lightprim_offset);            \
+    scene.nlightprims   = p->num_lightprims;                                  \
+    scene.uvs           = (VK_GLOBAL const float*)(base + p->uv_offset);      \
+    scene.tri_uv        = (GlobalCTri)(base + p->tri_uv_offset);              \
+    scene.nodes         = (VK_GLOBAL const BvhNodeVK*)(base + p->bvh_offset); \
+    scene.bvh_idx       = (VK_GLOBAL const unsigned*)(base                        \
+                                + p->bvh_index_offset);                       \
+    scene.num_bvh_nodes = p->num_bvh_nodes;                                   \
+    scene.stack         = (base + p->wf_stack)                                \
+                  + (gid) * (unsigned long long)kTraversalStackStride;
+
+
+// ---- pass 1: ray generation ------------------------------------------------
+
+extern "C" void osl_vk_wave_gen(GlobalPtr base)
 {
     VK_GLOBAL const FrameParams* p
         = (VK_GLOBAL const FrameParams*)(base + kFrameParamsOffset);
 
-    // `gid` is the pointer-width builtin value (i64 here): keep the pixel index
-    // arithmetic in that width and only narrow for the per-pixel coordinates,
-    // so clspv never has to mix i32 and i64 operands.
     const unsigned long long gid = get_global_id(0);
     const unsigned long long npix
         = (unsigned long long)p->width * (unsigned long long)p->height;
@@ -1390,19 +1595,118 @@ extern "C" void osl_vk_raytrace_frame(GlobalPtr base)
     Camera cam;
     cam.setup(p);
 
+    const int x = (int)(gid % (unsigned long long)p->width);
+    const int y = (int)(gid / (unsigned long long)p->width);
+    const int si = p->sample_index >= 0 ? p->sample_index : 0;
+
+    Sampler sampler;
+    sampler.init(x, y, si);
+    Vec3 j = sampler.get();
+    // Tent filter warp, identical to antialias_pixel() on the CPU.
+    j.x *= 2.0f;
+    j.x = j.x < 1.0f ? __builtin_sqrtf(j.x) - 1.0f
+                     : 1.0f - __builtin_sqrtf(2.0f - j.x);
+    j.y *= 2.0f;
+    j.y = j.y < 1.0f ? __builtin_sqrtf(j.y) - 1.0f
+                     : 1.0f - __builtin_sqrtf(2.0f - j.y);
+
+    Vec3 dirv = normalize(add(add(mul(cam.cx, ((float)x + 0.5f + j.x) * cam.invw - 0.5f),
+                                 mul(cam.cy, 0.5f - ((float)y + 0.5f + j.y) * cam.invh)),
+                             cam.dir));
+    float cos_a = dot(cam.dir, dirv);
+    float spread
+        = __builtin_sqrtf(cam.invw * cam.invh * length(cam.cx) * length(cam.cy)
+                          * cos_a)
+          * cos_a;
+
+    WaveRay r;
+    r.org    = cam.eye;
+    r.dir    = dirv;
+    r.radius = 0.0f;
+    r.spread = spread;
+    r.thr_r  = 1.0f;
+    r.thr_g  = 1.0f;
+    r.thr_b  = 1.0f;
+    r.bpdf   = inf();  // a camera ray has only one possible direction
+    // The sampler state is parked *after* the jitter draw, so the shading pass's
+    // first draw is the same one the CPU takes for the first bounce.
+    r.seed   = sampler.seed;
+    r.sindex = sampler.index;
+    r.depth  = 0;
+    r.prev   = -1;
+    r.active = 1;
+    wave_ray_store(p, base, gid, r);
+
+    // Accumulation target for this sample: the host sums one image per sample,
+    // exactly as it did for the megakernel.
+    VK_GLOBAL float* out = wf_fp(base, p->out_offset);
+    out[gid * 4 + 0]     = 0.0f;
+    out[gid * 4 + 1]     = 0.0f;
+    out[gid * 4 + 2]     = 0.0f;
+    out[gid * 4 + 3]     = 1.0f;
+}
+
+
+// ---- pass 2: intersection --------------------------------------------------
+
+extern "C" void osl_vk_wave_intersect(GlobalPtr base)
+{
+    VK_GLOBAL const FrameParams* p
+        = (VK_GLOBAL const FrameParams*)(base + kFrameParamsOffset);
+
+    const unsigned long long gid = get_global_id(0);
+    const unsigned long long npix
+        = (unsigned long long)p->width * (unsigned long long)p->height;
+    if (gid >= npix)
+        return;
+
+    WaveRay r;
+    wave_ray_load(p, base, gid, r);
+    if (!r.active) {
+        // Dead path: keep the slot dead and record a miss, so the shading pass
+        // has nothing to do with it.
+        wave_hit_store(p, base, gid, inf(), 0.0f, 0.0f, -1, 0);
+        return;
+    }
+
     SceneView scene;
-    scene.tris    = (GlobalTri)(base + p->tri_offset);
-    scene.verts   = (GlobalVec3)(base + p->vert_offset);
-    scene.normals = (GlobalVec3)(base + p->normal_offset);
-    scene.tri_n   = (GlobalCTri)(base + p->tri_n_offset);
-    scene.ntris   = p->num_triangles;
-    scene.lightprims   = (GlobalInt)(base + p->lightprim_offset);
-    scene.nlightprims  = p->num_lightprims;
-    scene.uvs          = (VK_GLOBAL const float*)(base + p->uv_offset);
-    scene.tri_uv       = (GlobalCTri)(base + p->tri_uv_offset);
-    scene.nodes        = (VK_GLOBAL const BvhNodeVK*)(base + p->bvh_offset);
-    scene.bvh_idx      = (VK_GLOBAL const unsigned*)(base + p->bvh_index_offset);
-    scene.num_bvh_nodes = p->num_bvh_nodes;
+    WAVE_SCENE_SETUP(scene)
+
+    Ray ray;
+    ray.origin    = r.org;
+    ray.direction = r.dir;
+    ray.radius    = r.radius;
+    ray.spread    = r.spread;
+
+    Hit h = intersect_scene(scene, ray, inf(), r.prev);
+    wave_hit_store(p, base, gid, h.t, h.u, h.v, h.id, h.id >= 0 ? 1 : 0);
+}
+
+
+// ---- pass 3: shading -------------------------------------------------------
+
+extern "C" void osl_vk_wave_shade(GlobalPtr base)
+{
+    VK_GLOBAL const FrameParams* p
+        = (VK_GLOBAL const FrameParams*)(base + kFrameParamsOffset);
+
+    const unsigned long long gid = get_global_id(0);
+    const unsigned long long npix
+        = (unsigned long long)p->width * (unsigned long long)p->height;
+    if (gid >= npix)
+        return;
+
+    WaveRay r;
+    wave_ray_load(p, base, gid, r);
+    if (!r.active)
+        return;
+
+    float h_t, h_u, h_v;
+    int h_id, h_ok;
+    wave_hit_load(p, base, gid, h_t, h_u, h_v, h_id, h_ok);
+
+    SceneView scene;
+    WAVE_SCENE_SETUP(scene)
 
     GlobalInt tri_shader = (GlobalInt)(base + p->tri_shader_offset);
     GlobalPtr arena      = (GlobalPtr)(base + p->arena_offset)
@@ -1411,248 +1715,79 @@ extern "C" void osl_vk_raytrace_frame(GlobalPtr base)
 
     // Two facts the device runtime cannot derive from `sg` alone: where this
     // invocation's block sits in the storage buffer, and where the texture
-    // table lives.  Without the first one, `osl_texture()` can only work when
-    // the block happens to start at buffer offset 0 -- exactly the per-point
-    // path -- and reads garbage in the whole-frame path.  They ride in the
-    // first 16 bytes of the closure pool, which the allocator never hands out
-    // (it starts at offset 16).
+    // table lives.  They ride in the first 16 bytes of the closure pool, which
+    // the allocator never hands out (it starts at offset 16).
     const long long sg_abs = (long long)(p->arena_offset
                                          + gid * (unsigned long long)p->arena_stride);
     *(GlobalI64)((GlobalPtr)sg + kOffPool)     = sg_abs;
     *(GlobalI64)((GlobalPtr)sg + kOffPool + 8) = kTexTableOffsetVK;
 
-    const int x = (int)(gid % (unsigned long long)p->width);
-    const int y = (int)(gid / (unsigned long long)p->width);
+    // Resume the per-sample sampler where the generation pass left it.
+    Sampler sampler;
+    sampler.seed  = r.seed;
+    sampler.index = r.sindex;
 
-    float rad_r = 0.0f, rad_g = 0.0f, rad_b = 0.0f;
-    // Mode-4 probe: across all aa samples of this pixel, the highest arena
-    // cursor reached (kClosurePoolSize is 256, so anything past that means a
-    // sample ran out of pool and silently lost its closure) and how many
-    // samples ended up with a usable Ci.
-    float pmaxcur = 0.0f;
-    int pgood     = 0;
-    int pnan      = 0;
-    int pmiss     = 0;
-    int phit      = 0;
-    float pstartcur = 0.0f;
-    int pzero_ci   = 0;
-    int pbad_id    = 0;
-    float jx0      = 0.0f;
-    float jy0      = 0.0f;
-    float jmin     = 1.0e9f;
-    float jmax     = -1.0e9f;
-    float jymin    = 1.0e9f;
-    float jymax    = -1.0e9f;
-    float phit0    = -1.0f;
-    int pscans     = 0;
-    float diag_nx  = 0.0f, diag_ny = 0.0f, diag_nz = 0.0f, diag_uv = 0.0f;
-    float diag_mat = -1.0f;
-    float diag_mat_last = -1.0f;
-    float diag_id  = -99.0f;  // shaderID of the first hit (debug only)
-    float diag_ci  = -1.0f;   // Ci offset the shader left behind
-    float diag_cid = -1.0f;   // component id at that offset
-    float diag_cur = -1.0f;   // arena cursor after shading
-    // One dispatch covers `sample_count` samples of this pixel when the host
-    // splits the frame (sample_count >= 1, sample_index picks one), or all of
-    // them when it does not (sample_count == 0).  Splitting is how the device
-    // ends up with the CUDA structure: a thread shades exactly one sample, so
-    // its closure pool never has to survive a second sample in the same block.
-    const int nsamples = p->sample_count > 0 ? p->sample_count : p->aa * p->aa;
-    const int si_first = (p->sample_count > 0)
-                             ? (p->sample_index >= 0 ? p->sample_index : 0)
-                             : 0;
-    const int batch = p->sample_batch > 1 ? p->sample_batch : 1;
-    int si_last = (p->sample_count > 0) ? si_first + batch : nsamples;
-    if (si_last > nsamples)
-        si_last = nsamples;
+    Ray ray;
+    ray.origin    = r.org;
+    ray.direction = r.dir;
+    ray.radius    = r.radius;
+    ray.spread    = r.spread;
 
-    for (int si = si_first; si < si_last; ++si) {
-        Sampler sampler;
-        sampler.init(x, y, si);
-        Vec3 j = sampler.get();
-        // Tent filter warp, identical to antialias_pixel() on the CPU.
-        j.x *= 2.0f;
-        j.x = j.x < 1.0f ? __builtin_sqrtf(j.x) - 1.0f
-                         : 1.0f - __builtin_sqrtf(2.0f - j.x);
-        j.y *= 2.0f;
-        j.y = j.y < 1.0f ? __builtin_sqrtf(j.y) - 1.0f
-                         : 1.0f - __builtin_sqrtf(2.0f - j.y);
+    Vec3 w          = mk(r.thr_r, r.thr_g, r.thr_b);
+    float bsdf_pdf  = r.bpdf;
+    const int b     = r.depth;
 
-        // Mode 12 records the warped jitter so the host can see whether the
-        // device's sample positions really cover a pixel (reference values from
-        // sampling.h span [0,1) before the tent warp and [-1,1) after).
-        if (p->pad_light == 12) {
-            if (si == 0) {
-                jx0 = j.x;
-                jy0 = j.y;
-            }
-            if (j.x < jmin)
-                jmin = j.x;
-            if (j.x > jmax)
-                jmax = j.x;
-            if (j.y < jymin)
-                jymin = j.y;
-            if (j.y > jymax)
-                jymax = j.y;
+    Vec3 L = mk(0.0f, 0.0f, 0.0f);
+
+    Hit hit;
+    hit.t  = h_t;
+    hit.u  = h_u;
+    hit.v  = h_v;
+    hit.id = h_ok ? h_id : -1;
+
+    // The path is dead unless this pass produces a live next ray.
+    r.active = 0;
+
+    if (hit.id < 0) {
+        if (p->bg_shader_id < 0) {
+            // No background shader: the scene's flat colour, which is the
+            // value the CPU path falls back to as well.
+            L = add(L, mulv(w, mk(p->bg_color[0], p->bg_color[1],
+                                  p->bg_color[2])));
+        } else if (b > 0 && p->bg_res > 0) {
+            // Indirect ray: the CPU does NOT run the shader here.  It looks the
+            // direction up in the importance table and multiplies by the MIS
+            // weight against the bsdf pdf.
+            float bg_pdf = 0.0f;
+            Vec3 bg      = background_table_eval(p, base, ray.direction, bg_pdf);
+            const float k = power_heuristic_weight_weight(bsdf_pdf, bg_pdf);
+            L = add(L, mulv(w, mk(bg.x * k, bg.y * k, bg.z * k)));
+        } else {
+            // Primary ray: the shader itself, exactly like the CPU's
+            // eval_background().  The globals are zero except for I and
+            // raytype, and the arena cursor / root are reset first because this
+            // shares the invocation's ShadeBlock with any surface shading.
+            GlobalPtr raw = (GlobalPtr)sg;
+            for (unsigned int i = 0; i < sizeof(ShaderGlobals); ++i)
+                raw[i] = 0;
+            store_vec(&sg->I, ray.direction);
+            // Ray::CAMERA = 1, Ray::DIFFUSE = 16 (raytracer.h).
+            sg->raytype                                   = (b > 0) ? 16 : 1;
+            *(GlobalI64)((GlobalPtr)sg + kOffRenderstate) = 16;
+            *(GlobalI64)((GlobalPtr)sg + kOffCi)          = -1;
+            osl_vk_shade_dispatch((GlobalPtr)sg, p->bg_shader_id);
+            const Vec3 Le
+                = background_closure_color(sg, *(GlobalI64)((GlobalPtr)sg + kOffCi));
+            L = add(L, mulv(w, Le));
         }
+    } else {
+        fill_globals(sg, scene, p, ray, hit,
+                     (VK_GLOBAL const unsigned char*)base);
 
-        Vec3 dirv = normalize(add(add(mul(cam.cx, ((float)x + 0.5f + j.x) * cam.invw - 0.5f),
-                                     mul(cam.cy, 0.5f - ((float)y + 0.5f + j.y) * cam.invh)),
-                                 cam.dir));
-        float cos_a = dot(cam.dir, dirv);
-        float spread
-            = __builtin_sqrtf(cam.invw * cam.invh * length(cam.cx) * length(cam.cy) * cos_a)
-              * cos_a;
-        // Mode 8 pins every sample to the pixel centre.  Rendering is otherwise
-        // normal, so comparing it against the jittered aa render says whether
-        // the striping comes from the *positions* the samples take (edge /
-        // shadow behaviour) or from the sample loop's bookkeeping.
-        if (p->pad_light == 8 || p->pad_light == 9) {
-            j.x = 0.5f;
-            j.y = 0.5f;
-            const float jx = 0.0f, jy = 0.0f;
-            dirv = normalize(add(add(mul(cam.cx, ((float)x + 0.5f + jx) * cam.invw - 0.5f),
-                                     mul(cam.cy, 0.5f - ((float)y + 0.5f + jy) * cam.invh)),
-                                 cam.dir));
-            cos_a = dot(cam.dir, dirv);
-            spread
-                = __builtin_sqrtf(cam.invw * cam.invh * length(cam.cx) * length(cam.cy)
-                                  * cos_a)
-                  * cos_a;
-        }
-
-        Ray r;
-        r.origin    = cam.eye;
-        r.direction = dirv;
-        r.radius    = 0.0f;
-        r.spread    = spread;
-
-        Vec3 w = mk(1.0f, 1.0f, 1.0f);
-        // Mode 10 wants to know whether the closure cursor is really back at 0
-        // when a new sample starts.  fill_globals() zeroes sizeof(ShaderGlobals)
-        // bytes, and the cursor lives at sg+216, inside that range -- so this
-        // should always read back 0.  If it grows with si, the pool is leaking
-        // across samples and will eventually write into the next pixel's block
-        // (only 256 B of headroom past kOffPool).
-        if (p->pad_light >= 10 && si > 0) {
-            float c0 = (float)(*(GlobalI64)((GlobalPtr)sg + kOffRenderstate));
-            if (c0 > pstartcur)
-                pstartcur = c0;
-        }
-
-        Vec3 L = mk(0.0f, 0.0f, 0.0f);
-        int prev_id    = -1;
-        float bsdf_pdf = inf();  // camera ray has only one possible direction
-
-        // Mode 9 stops after the first hit's shading (no NEE, no indirect ray),
-        // still 16 times per pixel and still at the pixel centre.  If that
-        // renders clean while mode 8 bands, the repeated path -- not the
-        // repeated shading -- is what breaks.
-        const int bmax = (p->pad_light == 9) ? 0 : p->max_bounces;
-        for (int b = 0; b <= bmax; ++b) {
-            if (p->pad_light == 14)
-                ++pscans;  // the primary/as-continued ray of this bounce
-            Hit hit = intersect_scene(scene, r, inf(), prev_id);
-            if (b == 0 && p->pad_light >= 1) {
-                // Probe captured *here*, before anything touches `r` again:
-                // triangle id, hit distance, material, and ntris.
-                diag_id  = (float)hit.id;
-                diag_ci  = hit.t;
-                diag_cid = (float)(hit.id >= 0 ? tri_shader[hit.id] : -1);
-                diag_cur = (float)scene.ntris;
-                // The material of sample 0 is this pixel's material; letting
-                // later samples overwrite it made the census shuffle pixels
-                // between materials and made coverage look 3x too large.
-                if (si == 0)
-                    diag_mat = diag_cid;
-                if (si == nsamples - 1)
-                    diag_mat_last = diag_cid;
-                if (p->pad_light >= 6) {
-                    if (si == 0)
-                        phit0 = (hit.id >= 0) ? 1.0f : 0.0f;
-                    if (hit.id < 0)
-                        ++pmiss;
-                    else
-                        ++phit;
-                }
-            }
-            if (hit.id < 0) {
-                if (p->bg_shader_id < 0) {
-                    // No background shader: the scene's flat colour, which is the
-                    // value the CPU path falls back to as well.
-                    L = add(L, mulv(w, mk(p->bg_color[0], p->bg_color[1],
-                                         p->bg_color[2])));
-                } else if (b > 0 && p->bg_res > 0) {
-                    // Indirect ray: the CPU does NOT run the shader here.  It
-                    // looks the direction up in the importance table and
-                    // multiplies by the MIS weight against the bsdf pdf
-                    // (simpleraytracer.cpp:1017-1023).  Running the shader
-                    // instead would give the right mean but the wrong weight --
-                    // 1/mis too bright on every bounce -- and the table lookup is
-                    // also what keeps the CPU's background noise free at these
-                    // depths.
-                    float bg_pdf = 0.0f;
-                    Vec3 bg = background_table_eval(p, base, r.direction, bg_pdf);
-                    const float k
-                        = power_heuristic_weight_weight(bsdf_pdf, bg_pdf);
-                    L = add(L, mulv(w, mk(bg.x * k, bg.y * k, bg.z * k)));
-                } else {
-                    // Primary ray: the shader itself, exactly like the CPU's
-                    // eval_background() (simpleraytracer.cpp:971).  The globals
-                    // are zero except for I (the ray direction) and raytype, the
-                    // group runs, and its BACKGROUND closures are summed.  The
-                    // arena cursor and root are reset first because this shares
-                    // the sample's ShadeBlock with the surface shading that may
-                    // have run in an earlier bounce.  The two words the kernel
-                    // parked at the head of the pool (sg_abs and the
-                    // texture-table offset) live at offset 0, which the allocator
-                    // starts past, so they survive.
-                    GlobalPtr raw = (GlobalPtr)sg;
-                    for (unsigned int i = 0; i < sizeof(ShaderGlobals); ++i)
-                        raw[i] = 0;
-                    store_vec(&sg->I, r.direction);
-                    // Ray::CAMERA = 1, Ray::DIFFUSE = 16 (raytracer.h).
-                    sg->raytype = (b > 0) ? 16 : 1;
-                    *(GlobalI64)((GlobalPtr)sg + kOffRenderstate) = 16;
-                    *(GlobalI64)((GlobalPtr)sg + kOffCi)          = -1;
-                    osl_vk_shade_dispatch((GlobalPtr)sg, p->bg_shader_id);
-                    const Vec3 Le = background_closure_color(
-                        sg, *(GlobalI64)((GlobalPtr)sg + kOffCi));
-                    L = add(L, mulv(w, Le));
-                }
-                break;
-            }
-
-            fill_globals(sg, scene, p, r, hit, (VK_GLOBAL const unsigned char*)base);
-            if (p->pad_light == 22) {
-                // Mode 22: replace the shading normal of the matte sphere with
-                // the analytic radial one.  If the striping disappears, the
-                // normal the device hands the shader is at fault; if it stays,
-                // the normal is innocent.
-                Vec3 PP = load_vec(&sg->P);
-                if (hit.id >= 16384 && hit.id < 32768)
-                    store_vec(&sg->N, normalize(mk(PP.x - 0.0f, PP.y - 30.0f,
-                                                    PP.z - 60.0f)));
-            }
-            if (p->pad_light == 21 && b == 0 && si == 0) {
-                // Mode 21: are the barycentrics of the *recorded* hit inside the
-                // triangle?  ch0 = u+v (must be <= 1), ch1 = u<0 ? 1 : 0,
-                // ch2 = v<0 ? 1 : 0, ch3 = |N-Ng| * 1000.
-                Vec3 NN  = load_vec(&sg->N);
-                Vec3 NGG = load_vec(&sg->Ng);
-                diag_nx  = hit.u + hit.v;
-                diag_ny  = (hit.u < 0.0f) ? 1.0f : 0.0f;
-                diag_nz  = (hit.v < 0.0f) ? 1.0f : 0.0f;
-                diag_uv  = length(sub(NN, NGG)) * 1000.0f;
-            }
-
-
-            const int shaderID = tri_shader[hit.id];
-            if (shaderID < 0)
-                break;
-
-            // Reset the per-sample arena state: cursor at 0, root sentinel -1
-            // (offset 0 is a valid component offset, see the host comment).
+        const int shaderID = tri_shader[hit.id];
+        if (shaderID >= 0) {
+            // Reset the per-sample arena state: cursor at 16 (offset 0 is the
+            // two int64s parked at the head of the pool), root sentinel -1.
             *(GlobalI64)((GlobalPtr)sg + kOffRenderstate) = 16;
             *(GlobalI64)((GlobalPtr)sg + kOffCi)          = -1;
 
@@ -1662,29 +1797,26 @@ extern "C" void osl_vk_raytrace_frame(GlobalPtr base)
             float ar = 0.0f, ag = 0.0f, ab = 0.0f;  // albedo / closure weight
             int is_mirror = 0;
             int is_ward   = 0;
-            // All the closures this material produced are delta closures (mirror
-            // / refraction / transparent).  Then the BSDF has exactly one
-            // outgoing direction per component, the pdf is infinite, and NEE has
-            // nothing to evaluate toward -- the CPU suppresses its next-bounce
-            // NEE for exactly this case (shading.cpp:1102 returns pdf = inf).
+            // All the closures this material produced are delta closures
+            // (mirror / refraction / transparent).  Then the BSDF has exactly
+            // one outgoing direction per component, the pdf is infinite, and
+            // NEE has nothing to evaluate toward.
             int all_delta = 0;
             WardVK wardp;
             long long ci = *(GlobalI64)((GlobalPtr)sg + kOffCi);
             // Flatten ADD/MUL: glass is `Ks*reflection(N,eta) +
-            // Cs*refraction(N,eta)`, i.e. two components, and until now the
-            // device only ever looked at a single one (ci >= 0), so every
-            // glass sphere came out black.
+            // Cs*refraction(N,eta)`, i.e. two components.
             ClosureEntryVK ce0, ce1;
-            ce0.id   = -1;
-            ce1.id   = -1;
-            ce0.off  = 0;
-            ce1.off  = 0;
-            int ncomp = collect_closure_entries(sg, ci, ce0, ce1);
-            Vec3 alb0 = mk(0.0f, 0.0f, 0.0f);
-            Vec3 alb1 = mk(0.0f, 0.0f, 0.0f);
+            ce0.id  = -1;
+            ce1.id  = -1;
+            ce0.off = 0;
+            ce1.off = 0;
+            int ncomp   = collect_closure_entries(sg, ci, ce0, ce1);
+            Vec3 alb0   = mk(0.0f, 0.0f, 0.0f);
+            Vec3 alb1   = mk(0.0f, 0.0f, 0.0f);
             if (ncomp > 0) {
-                Vec3 wov0     = mul(r.direction, -1.0f);
-                all_delta     = ncomp;
+                Vec3 wov0 = mul(ray.direction, -1.0f);
+                all_delta = ncomp;
                 for (int k = 0; k < ncomp; ++k) {
                     const ClosureEntryVK& e = (k == 0) ? ce0 : ce1;
                     if (e.id == EMISSION_ID_VK || e.id == BACKGROUND_ID_VK) {
@@ -1728,62 +1860,12 @@ extern "C" void osl_vk_raytrace_frame(GlobalPtr base)
                     all_delta = 1;
             }
 
-            // (Probe values were captured right after the intersection above.)
-            if (b == 0 && p->pad_light == 40) {
-                // Probe 40: what the primary hit's closure actually looks like.
-                // ch0 = Ci offset, ch1 = component id, ch2 = closure weight R,
-                // ch3 = Ward ax (0 if the id is not Ward).
-                diag_id  = (float)ci;
-                diag_ci  = -1.0f;
-                diag_cid = -1.0f;
-                diag_cur = 0.0f;
-                if (ci >= 0) {
-                    const VK_GLOBAL ClosureComponentVK* pc
-                        = (VK_GLOBAL const ClosureComponentVK*)(arena + kOffPool
-                                                               + ci);
-                    const int pid = pc->id;
-                    diag_ci       = (float)pid;
-                    diag_cid      = pc->w.x;
-                    if (pid == WARD_ID_VK) {
-                        GlobalCPtr wp = (GlobalCPtr)pc + 16;
-                        diag_cur      = *(GlobalFloatCPtr)(wp + 24);
-                    }
-                }
-            }
-            if (b == 0 && (p->pad_light == 4 || p->pad_light >= 10)) {
-                float cur = (float)(*(GlobalI64)((GlobalPtr)sg + kOffRenderstate));
-                if (cur > pmaxcur)
-                    pmaxcur = cur;
-                if (ci >= 0)
-                    ++pgood;
-            }
-            if (b == 0 && p->pad_light == 11) {
-                // Ci == 0 is *not* "no closure" in the offset model: offset 0
-                // lands on the two int64s the kernel parks at the head of the
-                // pool (sg_abs and the texture-table offset), so reading it as a
-                // ClosureComponent yields a garbage id and a garbage weight.
-                // Count that, and count ids that are not one of the three the
-                // device actually has.
-                if (ci == 0)
-                    ++pzero_ci;
-                else if (ci > 0) {
-                    const VK_GLOBAL ClosureComponentVK* cc
-                        = (VK_GLOBAL const ClosureComponentVK*)(arena + kOffPool + ci);
-                    const int idv = cc->id;
-                    if (!(idv == EMISSION_ID_VK || idv == BACKGROUND_ID_VK
-                          || idv == DIFFUSE_ID_VK))
-                        ++pbad_id;
-                }
-            }
-
             // One random triple per bounce, exactly where the CPU takes it
             // (simpleraytracer.cpp:1103): NEE and the BSDF sample both use it.
             Vec3 s3 = sampler.get();
             float xsv = s3.x, ysv = s3.y;
 
-            // Is the surface we hit one of the light primitives?  The CPU asks
-            // m_shader_is_light; on the device the same information is the
-            // lightprim list.
+            // Is the surface we hit one of the light primitives?
             int lid_of_hit = -1;
             for (int i = 0; i < scene.nlightprims; ++i) {
                 if (scene.lightprims[i] == hit.id) {
@@ -1793,480 +1875,278 @@ extern "C" void osl_vk_raytrace_frame(GlobalPtr base)
             }
             if (lid_of_hit >= 0) {
                 // Self-emission, MIS-weighted against the light sampling that
-                // could also have found this point (1069-1088 on the CPU).
+                // could also have found this point.
                 float light_pdf = (1.0f / (float)scene.nlightprims)
-                                  * shape_pdf(scene, hit.id, r.origin,
+                                  * shape_pdf(scene, hit.id, ray.origin,
                                               load_vec(&sg->P));
                 float k = power_heuristic_weight_eval(bsdf_pdf, light_pdf);
                 L = add(L, mulv(w, mk(er * k, eg * k, eb * k)));
-                if (p->pad_light == 23 && b == 0 && si == 0) {
-                    // Le the emitter material produced, its MIS factor and the
-                    // per-primitive surface area it was handed.
-                    diag_nx = er;
-                    diag_ny = k;
-                    diag_nz = (float)(gid >= 0 ? 0.0f : 0.0f);
-                    diag_nz = load_vec(&sg->P).y;
-                    diag_uv = (float)hit.id;
-                }
             } else {
                 L = add(L, mulv(w, mk(er, eg, eb)));
             }
 
-            if (b == p->max_bounces)
-                break;
-            if (!(ar > 0.0f) && !(ag > 0.0f) && !(ab > 0.0f))
-                break;
-
             Vec3 P = load_vec(&sg->P);
             Vec3 n = load_vec(&sg->N);
-            if (dot(n, r.direction) > 0.0f)
+            if (dot(n, ray.direction) > 0.0f)
                 n = mul(n, -1.0f);
-            // The CPU hands the closure -sg.I as the outgoing direction; every
-            // closure here (diffuse, Ward, mirror) is evaluated the same way.
-            Vec3 wov = mul(r.direction, -1.0f);
+            Vec3 wov = mul(ray.direction, -1.0f);
 
-            // ---- explicit background sampling (NEE) -------------------------
-            // Mirrors simpleraytracer.cpp:1137-1155: sample a direction from the
-            // background importance table, evaluate the closure toward it,
-            // MIS-weight it against the closure's own pdf, and shoot a shadow
-            // ray.  The CPU does this before the light NEE and reuses the same
-            // random pair (xi, yi), so the sample assignment matches.  Without
-            // it a matte surface only sees the background through the (much
-            // noisier) bsdf-sampling path, which is why the sphere came out an
-            // order of magnitude dark.
-            if (p->bg_res > 0 && !all_delta) {
-                Vec3 bg_dir;
-                float bg_pdf = 0.0f;
-                Vec3 bgv
-                    = background_sample(p, base, xsv, ysv, bg_dir, bg_pdf);
-                float bpdf = 0.0f;
-                float bwt  = 0.0f;
-                if (is_ward) {
-                    // Same anisotropic lobe eval the light NEE uses.
-                    Vec3 wv;
-                    ward_eval_vk(wardp, wov, bg_dir, wv, bpdf);
-                    bwt = wv.x;
-                } else {
-                    // Diffuse: Diffuse<trans>::eval (shading.cpp:305) returns
-                    // weight = Color3(1) and pdf = max(N.wi,0)/pi, so the two
-                    // halves are different numbers.  The albedo is the closure
-                    // weight the caller already folded into ar/ag/ab, so the
-                    // weight side is exactly 1 and the pdf side is cos/pi.
-                    // (Using the pdf as the weight as well made the background
-                    // NEE contribute only cos/pi of what it should.)
-                    const float NLd = dot(n, bg_dir);
-                    bpdf = (NLd > 0.0f ? NLd : 0.0f) * 0.31830988618f;
-                    bwt  = 1.0f;
-                }
-                // The CPU weights with WEIGHT_WEIGHT against the *bsdf pdf*,
-                // which folds that pdf into the weight -- hence bpdf here.
-                const float mis = power_heuristic_weight_weight(bg_pdf, bpdf);
-                Vec3 contrib = mulv(mulv(w, mk(ar * bwt, ag * bwt, ab * bwt)),
-                                    mk(bgv.x * mis, bgv.y * mis, bgv.z * mis));
-                if (contrib.x + contrib.y + contrib.z > 0.0f) {
-                    Ray sray;
-                    sray.origin    = P;
-                    sray.direction = bg_dir;
-                    sray.radius    = r.radius;
-                    sray.spread    = r.spread;
-                    Hit sh         = intersect_scene(scene, sray, inf(), hit.id);
-                    if (sh.id < 0)  // nothing between the point and the sky
-                        L = add(L, contrib);
-                }
-            }
+            do {
+                if (b == p->max_bounces)
+                    break;
+                if (!(ar > 0.0f) && !(ag > 0.0f) && !(ab > 0.0f))
+                    break;
 
-            // ---- explicit light sampling (NEE) -----------------------------
-            // Mirrors simpleraytracer.cpp:1129-1187: pick a light primitive
-            // uniformly, sample a point on it, evaluate the (Lambert) BSDF
-            // toward it, MIS-weight, shoot a shadow ray, and shade the light
-            // primitive to get its emitted radiance.
-            if (scene.nlightprims > 0 && !all_delta) {
-                const float light_pick_pdf = 1.0f / (float)scene.nlightprims;
-                float xl                   = xsv * (float)scene.nlightprims;
-                int ls                     = (int)__builtin_floorf(xl);
-                xl -= (float)ls;
-                int lid = scene.lightprims[ls];
-                if (lid != hit.id) {
-                    LightSampleVK lsmp = light_sample(scene, lid, P, xl, ysv);
-                    // CPU: b = result.bsdf.eval(-sg.I, sample.dir), so both the
-                    // weight and the pdf come from the closure itself.  For
-                    // diffuse that collapses to weight 1 and pdf =
-                    // max(N*wi,0)/pi; for Ward the BRDF is anisotropic and the
-                    // lobe has to be evaluated for real.
-                    Vec3 wov_nee  = wov;
-                    float bpdf  = 0.0f;
-                    float bwt   = 0.0f;
+                // ---- explicit background sampling (NEE) ---------------------
+                // Mirrors simpleraytracer.cpp:1137-1155: sample a direction
+                // from the background importance table, evaluate the closure
+                // toward it, MIS-weight it against the closure's own pdf, and
+                // shoot a shadow ray.
+                if (p->bg_res > 0 && !all_delta) {
+                    Vec3 bg_dir;
+                    float bg_pdf = 0.0f;
+                    Vec3 bgv
+                        = background_sample(p, base, xsv, ysv, bg_dir, bg_pdf);
+                    float bpdf = 0.0f;
+                    float bwt  = 0.0f;
                     if (is_ward) {
                         Vec3 wv;
-                        ward_eval_vk(wardp, wov_nee, lsmp.dir, wv, bpdf);
+                        ward_eval_vk(wardp, wov, bg_dir, wv, bpdf);
                         bwt = wv.x;
                     } else {
-                        float NLd = dot(n, lsmp.dir);
-                        bpdf      = (NLd > 0.0f ? NLd : 0.0f) * 0.31830988618f;
-                        bwt       = 1.0f;
+                        // Diffuse: Diffuse<trans>::eval (shading.cpp:305)
+                        // returns weight = Color3(1) and pdf = max(N.wi,0)/pi.
+                        const float NLd = dot(n, bg_dir);
+                        bpdf = (NLd > 0.0f ? NLd : 0.0f) * 0.31830988618f;
+                        bwt  = 1.0f;
                     }
-                    float mis = power_heuristic_eval_weight(
-                        light_pick_pdf * lsmp.pdf, bpdf);
-                    Vec3 contrib
-                        = mulv(mulv(w, mk(ar * bwt, ag * bwt, ab * bwt)),
-                               mk(mis, mis, mis));
+                    const float mis = power_heuristic_weight_weight(bg_pdf, bpdf);
+                    Vec3 contrib = mulv(mulv(w, mk(ar * bwt, ag * bwt, ab * bwt)),
+                                        mk(bgv.x * mis, bgv.y * mis, bgv.z * mis));
                     if (contrib.x + contrib.y + contrib.z > 0.0f) {
-                        if (p->pad_light == 14)
-                        ++pscans;
-                    Ray sray;
-                        if (p->pad_light == 14)
-                            ++pscans;
+                        Ray sray;
                         sray.origin    = P;
-                        if (p->pad_light == 20) {
-                            // Diagnosis only: lift the shadow ray off the
-                            // surface.  If the striping is self-intersection
-                            // acne, this makes it disappear.
-                            sray.origin = add(P, mul(n, 1e-3f));
-                            sray.direction = normalize(sub(lsmp.dir, mul(n, 0.0f)));
+                        sray.direction = bg_dir;
+                        sray.radius    = ray.radius;
+                        sray.spread    = ray.spread;
+                        Hit sh = intersect_scene(scene, sray, inf(), hit.id);
+                        if (sh.id < 0)  // nothing between the point and the sky
+                            L = add(L, contrib);
+                    }
+                }
+
+                // ---- explicit light sampling (NEE) -------------------------
+                // Mirrors simpleraytracer.cpp:1129-1187: pick a light
+                // primitive uniformly, sample a point on it, evaluate the
+                // (Lambert) BSDF toward it, MIS-weight, shoot a shadow ray, and
+                // shade the light primitive to get its emitted radiance.
+                if (scene.nlightprims > 0 && !all_delta) {
+                    const float light_pick_pdf = 1.0f / (float)scene.nlightprims;
+                    float xl                   = xsv * (float)scene.nlightprims;
+                    int ls                     = (int)__builtin_floorf(xl);
+                    xl -= (float)ls;
+                    int lid = scene.lightprims[ls];
+                    if (lid != hit.id) {
+                        LightSampleVK lsmp = light_sample(scene, lid, P, xl, ysv);
+                        // CPU: b = result.bsdf.eval(-sg.I, sample.dir), so both
+                        // the weight and the pdf come from the closure itself.
+                        float bpdf = 0.0f;
+                        float bwt  = 0.0f;
+                        if (is_ward) {
+                            Vec3 wv;
+                            ward_eval_vk(wardp, wov, lsmp.dir, wv, bpdf);
+                            bwt = wv.x;
+                        } else {
+                            float NLd = dot(n, lsmp.dir);
+                            bpdf = (NLd > 0.0f ? NLd : 0.0f) * 0.31830988618f;
+                            bwt  = 1.0f;
                         }
-                        sray.direction = lsmp.dir;
-                        sray.radius    = r.radius;
-                        sray.spread    = r.spread;
-                        Hit sh = intersect_scene(scene, sray, lsmp.dist,
-                                                hit.id, lid);
-                        // Visible when nothing is hit closer than the light.
-                        // The CPU expresses this as `shadow_hit.t == sample.dist`
-                        // because its BVH intersect leaves t at tmax when there
-                        // is no occluder (bvh.cpp:273); our version reports
-                        // id = -1 instead, so the test is sh.id < 0.  (Asking
-                        // for a hit *on* the light would be inverted: the light
-                        // triangle is skipped, so there can never be one.)
-                        if (sh.id < 0) {
-                            const int lightShaderID = tri_shader[lid];
-                            if (lightShaderID >= 0) {
-                                // Shade the point on the light.  We already
-                                // copied out P/N/albedo, so the single per-pixel
-                                // ShadeBlock can be reused for it.
-                                Hit lhit;
-                                lhit.id = lid;
-                                lhit.u  = lsmp.u;
-                                lhit.v  = lsmp.v;
-                                lhit.t  = lsmp.dist;
-                                fill_globals(sg, scene, p, sray, lhit, (VK_GLOBAL const unsigned char*)base);
-                                *(GlobalI64)((GlobalPtr)sg + kOffRenderstate) = 16;
-                                *(GlobalI64)((GlobalPtr)sg + kOffCi)          = -1;
-                                osl_vk_shade_dispatch((GlobalPtr)sg,
-                                                      lightShaderID);
-                                long long lci = *(GlobalI64)((GlobalPtr)sg
-                                                             + kOffCi);
-                                if (p->pad_light == 3) {
-                                    // Probe: what did the light material
-                                    // actually hand back?  lci in slot 0,
-                                    // component id in 1, Le.r in 2, MIS in 3.
-                                    diag_id  = (float)sh.id;
-                                    diag_ci  = (float)lci;
-                                    diag_cid = -1.0f;
-                                    diag_cur = mis;
+                        float mis = power_heuristic_eval_weight(
+                            light_pick_pdf * lsmp.pdf, bpdf);
+                        Vec3 contrib
+                            = mulv(mulv(w, mk(ar * bwt, ag * bwt, ab * bwt)),
+                                   mk(mis, mis, mis));
+                        if (contrib.x + contrib.y + contrib.z > 0.0f) {
+                            Ray sray;
+                            sray.origin    = P;
+                            sray.direction = lsmp.dir;
+                            sray.radius    = ray.radius;
+                            sray.spread    = ray.spread;
+                            Hit sh = intersect_scene(scene, sray, lsmp.dist,
+                                                     hit.id, lid);
+                            // Visible when nothing is hit closer than the light.
+                            if (sh.id < 0) {
+                                const int lightShaderID = tri_shader[lid];
+                                if (lightShaderID >= 0) {
+                                    // Shade the point on the light.  P/N/albedo
+                                    // are already copied out, so the single
+                                    // ShadeBlock can be reused for it.
+                                    Hit lhit;
+                                    lhit.id = lid;
+                                    lhit.u  = lsmp.u;
+                                    lhit.v  = lsmp.v;
+                                    lhit.t  = lsmp.dist;
+                                    fill_globals(sg, scene, p, sray, lhit,
+                                                 (VK_GLOBAL const unsigned char*)base);
+                                    *(GlobalI64)((GlobalPtr)sg + kOffRenderstate)
+                                        = 16;
+                                    *(GlobalI64)((GlobalPtr)sg + kOffCi) = -1;
+                                    osl_vk_shade_dispatch((GlobalPtr)sg,
+                                                          lightShaderID);
+                                    long long lci
+                                        = *(GlobalI64)((GlobalPtr)sg + kOffCi);
                                     if (lci >= 0) {
-                                        const VK_GLOBAL ClosureComponentVK* c3
+                                        const VK_GLOBAL ClosureComponentVK* lcomp
                                             = (VK_GLOBAL const ClosureComponentVK*)(
                                                 arena + kOffPool + lci);
-                                        diag_cid = (float)c3->id;
-                                        diag_cur = c3->w.x;
+                                        if (lcomp->id == EMISSION_ID_VK
+                                            || lcomp->id == BACKGROUND_ID_VK) {
+                                            // Scalar loads: a Vec3 lvalue living
+                                            // in AS1 cannot bind to a reference.
+                                            Vec3 lw = mk(lcomp->w.x,
+                                                         lcomp->w.y,
+                                                         lcomp->w.z);
+                                            L = add(L, mulv(contrib, lw));
+                                        }
                                     }
-                                }
-                                if (lci >= 0) {
-                                    const VK_GLOBAL ClosureComponentVK* lcomp
-                                        = (VK_GLOBAL const ClosureComponentVK*)(
-                                            arena + kOffPool + lci);
-                                    if (lcomp->id == EMISSION_ID_VK
-                                        || lcomp->id == BACKGROUND_ID_VK) {
-                                        // Scalar loads: a Vec3 lvalue living in
-                                        // AS1 cannot be bound to a reference.
-                                        Vec3 lw = mk(lcomp->w.x, lcomp->w.y,
-                                                     lcomp->w.z);
-                                        L = add(L, mulv(contrib, lw));
-                                    }
+                                    // The light shading overwrote the block the
+                                    // surface's own closure tree lived in.  P,
+                                    // n and the albedo are copied out already,
+                                    // and nothing after this pass reads sg.
                                 }
                             }
                         }
                     }
                 }
-            }
 
-            // ---- Russian roulette (shading.h:356-386, shading.h:411-438) ---
-            // With a single closure the probability the CPU samples it with is
-            //   pdfs[0] = (albedo . path_weight) / sum(path_weight),
-            // and past rr_depth CompositeBSDF::prepare does NOT renormalise it,
-            // so the leftover 1 - pdfs[0] is absorption: sample() falls through
-            // its loop and returns an empty sample.  Before that depth (or when
-            // the total exceeds 1) the probabilities are renormalised, so
-            // pdfs[0] is 1 and this block leaves everything alone -- which is
-            // what the sampler below assumes.
-            float rx = s3.x;
-            // pdfs[0] after CompositeBSDF::prepare (shading.h:358-389): 1 when
-            // it renormalised (the usual case before rr_depth), sel when it did
-            // not.  The BSDF sample multiplies its pdf by pdfs[0] and its
-            // weight by 1/pdfs[0].
-            float pdf0 = 1.0f;
-            if (b >= p->rr_depth) {
-                float msum = w.x + w.y + w.z;
-                float sel  = (msum > 0.0f)
-                                 ? (ar * w.x + ag * w.y + ab * w.z) / msum
-                                 : 0.0f;
-                if (sel > 1.0f)
-                    sel = 1.0f;  // total > 1 gets renormalised, see above
-                if (!(rx < sel))
-                    break;  // absorbed
-                pdf0 = sel;
-                rx /= sel;
-                if (rx > 0.99999994f)
-                    rx = 0.99999994f;
-                // weight *= albedo * (1/pdfs[0]); the 1/sel is the roulette's
-                // unbiased compensation for the paths it just killed.
-                ar /= sel;
-                ag /= sel;
-                ab /= sel;
-            }
+                // ---- Russian roulette (shading.h:356-386, :411-438) ---------
+                float rx = s3.x;
+                float pdf0 = 1.0f;
+                if (b >= p->rr_depth) {
+                    float msum = w.x + w.y + w.z;
+                    float sel  = (msum > 0.0f)
+                                     ? (ar * w.x + ag * w.y + ab * w.z) / msum
+                                     : 0.0f;
+                    if (sel > 1.0f)
+                        sel = 1.0f;  // total > 1 gets renormalised
+                    if (!(rx < sel))
+                        break;  // absorbed
+                    pdf0 = sel;
+                    rx /= sel;
+                    if (rx > 0.99999994f)
+                        rx = 0.99999994f;
+                    ar /= sel;
+                    ag /= sel;
+                    ab /= sel;
+                }
 
-            // ---- BSDF sampling --------------------------------------------
-            // Diffuse: cosine weighted, and the cosine pdf cancels the cosine
-            // factor, so throughput *= albedo.  Mirror: the reflected direction
-            // is the only one with weight, and its pdf is infinite
-            // (shading.cpp:1151-1159), which is what keeps a later NEE from
-            // double counting light that this mirror bounce will reach anyway.
-            // Ward: the lobe itself is sampled (shading.cpp:441-493) and the
-            // closure weight, the sample weight and 1/pdfs[0] all multiply in.
-            Vec3 wi;
-            float sweight = 1.0f;
-            // Per-channel multiplier applied to the throughput after sampling.
-            // For the analytic closures it is albedo * sample weight; for the
-            // composite delta case below it is the component weight divided by
-            // the probability it was chosen with.
-            float wmulr = ar, wmulg = ag, wmulb = ab;
-            if (all_delta) {
-                // CompositeBSDF::sample (shading.h:390-421) over the flattened
-                // components.  prepare() sets
-                //     pdfs[i] = weights[i].dot(path_weight * albedo)
-                //               / (path_weight.x + path_weight.y + path_weight.z)
-                // and renormalises while the total is in range, so a glass
-                // surface carries two probabilities F and 1-F.  sample() then
-                // picks one with rx, and multiplies its weight by
-                // weights[i] * (1/pdfs[i]) -- the component's own weight
-                // divided by the probability it was chosen with.  Skipping that
-                // 1/pdfs[i] is what makes a glass sphere brighter or darker
-                // than the reference even once it is no longer black.
-                float msum = w.x + w.y + w.z;
-                float p0   = 0.0f, p1 = 0.0f;
-                if (msum > 0.0f) {
-                    p0 = (alb0.x * w.x + alb0.y * w.y + alb0.z * w.z) / msum;
-                    p1 = (alb1.x * w.x + alb1.y * w.y + alb1.z * w.z) / msum;
-                }
-                float ptot = p0 + p1;
-                if (!(ptot > 0.0f))
-                    break;  // nothing this BSDF can sample
-                int pick    = 0;
-                float share = p0 / ptot;
-                float prob  = share;
-                if (!(rx < share)) {
-                    pick = 1;
-                    prob = p1 / ptot;
-                    rx   = (rx - share) / prob;
-                } else {
-                    rx = rx / share;
-                }
-                if (!(prob > 0.0f))
-                    break;
-                const ClosureEntryVK& e = (pick == 0) ? ce0 : ce1;
-                float cw                = 0.0f;
-                if (e.id == REFLECTION_ID_VK
-                    || e.id == FRESNEL_REFLECTION_ID_VK) {
-                    // Reflection::sample (shading.cpp:1095-1105): the reflected
-                    // direction is the only one, weight = Fresnel.
-                    float cosNO = dot(e.N, wov);
-                    if (cosNO > 0.0f) {
-                        wi  = sub(mul(e.N, 2.0f * cosNO), wov);
-                        cw  = fresnel_dielectric_vk(cosNO, e.eta);
+                // ---- BSDF sampling -----------------------------------------
+                Vec3 wi;
+                float sweight = 1.0f;
+                float wmulr = ar, wmulg = ag, wmulb = ab;
+                if (all_delta) {
+                    // CompositeBSDF::sample over the flattened components:
+                    // pick one with rx, multiply its weight by
+                    // weights[i] * (1/pdfs[i]).
+                    float msum = w.x + w.y + w.z;
+                    float p0 = 0.0f, p1 = 0.0f;
+                    if (msum > 0.0f) {
+                        p0 = (alb0.x * w.x + alb0.y * w.y + alb0.z * w.z) / msum;
+                        p1 = (alb1.x * w.x + alb1.y * w.y + alb1.z * w.z) / msum;
+                    }
+                    float ptot = p0 + p1;
+                    if (!(ptot > 0.0f))
+                        break;  // nothing this BSDF can sample
+                    int pick    = 0;
+                    float share = p0 / ptot;
+                    float prob  = share;
+                    if (!(rx < share)) {
+                        pick = 1;
+                        prob = p1 / ptot;
+                        rx   = (rx - share) / prob;
+                    } else {
+                        rx = rx / share;
+                    }
+                    if (!(prob > 0.0f))
+                        break;
+                    const ClosureEntryVK& e = (pick == 0) ? ce0 : ce1;
+                    float cw                = 0.0f;
+                    if (e.id == REFLECTION_ID_VK
+                        || e.id == FRESNEL_REFLECTION_ID_VK) {
+                        // Reflection::sample: the reflected direction is the
+                        // only one, weight = Fresnel.
+                        float cosNO = dot(e.N, wov);
+                        if (cosNO > 0.0f) {
+                            wi      = sub(mul(e.N, 2.0f * cosNO), wov);
+                            cw      = fresnel_dielectric_vk(cosNO, e.eta);
+                            bsdf_pdf = inf();
+                        }
+                    } else if (e.id == REFRACTION_ID_VK) {
+                        float Ft = fresnel_refraction_vk(mul(wov, -1.0f), e.N,
+                                                         e.eta, wi);
+                        cw       = Ft;
+                        bsdf_pdf = inf();
+                    } else if (e.id == TRANSPARENT_ID_VK) {
+                        wi       = mul(wov, -1.0f);
+                        cw       = 1.0f;
                         bsdf_pdf = inf();
                     }
-                } else if (e.id == REFRACTION_ID_VK) {
-                    // Refraction::sample (shading.cpp:1124-1131).
-                    float Ft
-                        = fresnel_refraction_vk(mul(wov, -1.0f), e.N, e.eta, wi);
-                    cw       = Ft;
-                    bsdf_pdf = inf();
-                } else if (e.id == TRANSPARENT_ID_VK) {
-                    wi       = mul(wov, -1.0f);
-                    cw       = 1.0f;
-                    bsdf_pdf = inf();
+                    wmulr = e.w.x * cw / prob;
+                    wmulg = e.w.y * cw / prob;
+                    wmulb = e.w.z * cw / prob;
+                } else if (is_mirror) {
+                    float cosNO = dot(n, wov);
+                    wi          = sub(mul(n, 2.0f * cosNO), wov);
+                    bsdf_pdf    = inf();
+                } else if (is_ward) {
+                    Vec3 wv;
+                    float wp = 0.0f;
+                    ward_sample_vk(wardp, wov, rx, s3.y, wi, wv, wp);
+                    bsdf_pdf = wp * pdf0;
+                    sweight  = wv.x;
+                    if (!(wp > 0.0f)) {
+                        w.x = 0.0f;
+                        w.y = 0.0f;
+                        w.z = 0.0f;
+                    }
+                } else {
+                    // Sampling::sample_cosine_hemisphere (sampling.h:92).
+                    float pdf_cos = 0.0f;
+                    wi            = sample_cosine_hemisphere(n, rx, s3.y, pdf_cos);
+                    bsdf_pdf      = pdf_cos;
                 }
-                wmulr = e.w.x * cw / prob;
-                wmulg = e.w.y * cw / prob;
-                wmulb = e.w.z * cw / prob;
-            } else if (is_mirror) {
-                float cosNO = dot(n, wov);
-                wi          = sub(mul(n, 2.0f * cosNO), wov);
-                bsdf_pdf    = inf();
-            } else if (is_ward) {
-                Vec3 wv;
-                float wp = 0.0f;
-                ward_sample_vk(wardp, wov, rx, s3.y, wi, wv, wp);
-                bsdf_pdf = wp * pdf0;
-                sweight  = wv.x;
-                // sample() returns {} when its pdf comes out zero, which the
-                // CPU turns into an empty sample; a zero throughput here ends
-                // the path the same way.
-                if (!(wp > 0.0f)) {
-                    w.x = 0.0f;
-                    w.y = 0.0f;
-                    w.z = 0.0f;
+                if (all_delta) {
+                    w = mulv(w, mk(wmulr, wmulg, wmulb));
+                } else {
+                    w = mulv(w, mk(ar * sweight, ag * sweight, ab * sweight));
                 }
-            } else {
-                // Sampling::sample_cosine_hemisphere (sampling.h:92): concentric
-                // disk map -> Pixar tangent frame.  This is *not* the polar
-                // (phi = 2*pi*rx, r = sqrt(ry)) construction: the two are both
-                // unbiased, but they send the same random numbers to different
-                // directions, so paths stop matching the CPU sample by sample.
-                float pdf_cos = 0.0f;
-                wi            = sample_cosine_hemisphere(n, rx, s3.y, pdf_cos);
-                bsdf_pdf      = pdf_cos;
-            }
-            if (all_delta) {
-                w = mulv(w, mk(wmulr, wmulg, wmulb));
-            } else {
-                w = mulv(w, mk(ar * sweight, ag * sweight, ab * sweight));
-            }
-            r.origin    = P;
-            r.direction = wi;
-            prev_id     = hit.id;
-            if (!(w.x > 0.0f) && !(w.y > 0.0f) && !(w.z > 0.0f))
-                break;
+                r.org    = P;
+                r.dir    = wi;
+                r.radius = ray.radius;
+                r.spread = ray.spread;
+                r.prev   = hit.id;
+                r.depth  = b + 1;
+                r.bpdf   = bsdf_pdf;
+                r.thr_r  = w.x;
+                r.thr_g  = w.y;
+                r.thr_b  = w.z;
+                r.seed   = sampler.seed;
+                r.sindex = sampler.index;
+                r.active = (w.x > 0.0f || w.y > 0.0f || w.z > 0.0f) ? 1 : 0;
+            } while (0);
         }
-
-        rad_r += L.x / (float)nsamples;
-        rad_g += L.y / (float)nsamples;
-        rad_b += L.z / (float)nsamples;
-        // Mode 5: is the blackness a NaN that came from one sample and poisoned
-        // the whole aa average?  (NaN > 0 is false, so a poisoned pixel reads
-        // back as black in every dump we have looked at so far.)
-        if (p->pad_light == 5 && !(L.x == L.x))
-            ++pnan;
     }
 
-    GlobalFloat out  = (GlobalFloat)(base + p->out_offset);
-    out[gid * 4 + 0] = rad_r;
-    out[gid * 4 + 1] = rad_g;
-    out[gid * 4 + 2] = rad_b;
-    out[gid * 4 + 3] = 1.0f;
-    if (p->pad_light == 1) {
-        out[gid * 4 + 0] = diag_id;
-        out[gid * 4 + 1] = diag_ci;
-        out[gid * 4 + 2] = diag_cid;
-        out[gid * 4 + 3] = diag_cur;
-    }
-    if (p->pad_light == 2) {
-        // Mode 2: the actual radiance, with the primary-hit material moved into
-        // alpha so the host can report radiance *per material*.
-        out[gid * 4 + 0] = rad_r;
-        out[gid * 4 + 1] = rad_g;
-        out[gid * 4 + 2] = rad_b;
-        out[gid * 4 + 3] = diag_cid;
-    }
-    if (p->pad_light == 3) {
-        // Mode 3: what the light-material dispatch handed back (see the NEE
-        // block): shadow triangle, Ci offset, component id, Le.r.
-        out[gid * 4 + 0] = diag_id;
-        out[gid * 4 + 1] = diag_ci;
-        out[gid * 4 + 2] = diag_cid;
-        out[gid * 4 + 3] = diag_cur;
-    }
-    if (p->pad_light == 4) {
-        // Mode 4: radiance R (so the host can see black) + arena cursor peak,
-        // closure success count and material in the other channels.
-        out[gid * 4 + 0] = rad_r;
-        out[gid * 4 + 1] = pmaxcur;
-        out[gid * 4 + 2] = (float)pgood;
-        out[gid * 4 + 3] = diag_cid;
-    }
-    if (p->pad_light == 5) {
-        // Mode 5: radiance R, how many aa samples came out NaN, cursor peak,
-        // material.
-        out[gid * 4 + 0] = rad_r;
-        out[gid * 4 + 1] = (float)pnan;
-        out[gid * 4 + 2] = pmaxcur;
-        out[gid * 4 + 3] = diag_cid;
-    }
-    if (p->pad_light == 7) {
-        // Mode 7: material seen by sample 0, material seen by the last sample,
-        // radiance, and how many samples missed.  If sample 0 reports a
-        // different material here than it does at aa=1 for the same pixel, the
-        // loop itself is suspect; if it agrees, the damage is after the loop.
-        out[gid * 4 + 0] = diag_mat;
-        out[gid * 4 + 1] = diag_mat_last;
-        out[gid * 4 + 2] = rad_r;
-        out[gid * 4 + 3] = (float)pmiss;
-    }
-    if (p->pad_light == 40) {
-        // Probe 40: Ci offset, component id, closure weight R, Ward ax.
-        out[gid * 4 + 0] = diag_id;
-        out[gid * 4 + 1] = diag_ci;
-        out[gid * 4 + 2] = diag_cid;
-        out[gid * 4 + 3] = diag_cur;
-    }
-    if (p->pad_light == 21 || p->pad_light == 23) {
-        // Mode 15/17/18 share this dump; see the collection sites for the
-        // meaning of each channel.
-        // of sample 0.  A wrong barycentric assignment shows up on ch0, a wrong
-        // normal table on ch1.
-        out[gid * 4 + 0] = diag_nx;
-        out[gid * 4 + 1] = diag_ny;
-        out[gid * 4 + 2] = diag_nz;
-        out[gid * 4 + 3] = diag_uv;
-    }
-    if (p->pad_light == 14) {
-        // Mode 14: how many full-scene intersection scans one sample performs.
-        // This is the number that decides the cost of the linear triangle scan:
-        // every bounce is one scan plus one more for the NEE shadow ray.
-        out[gid * 4 + 0] = (float)pscans;
-        out[gid * 4 + 1] = (float)phit0;
-        out[gid * 4 + 2] = rad_r;
-        out[gid * 4 + 3] = (float)phit;
-    }
-    if (p->pad_light == 13) {
-        // Mode 13: did sample 0 hit (x), how many of samples 1..n-1 hit, the
-        // radiance, and the total hit count.
-        out[gid * 4 + 0] = phit0;
-        out[gid * 4 + 1] = (float)(phit - (int)phit0);
-        out[gid * 4 + 2] = rad_r;
-        out[gid * 4 + 3] = (float)phit;
-    }
-    if (p->pad_light == 12) {
-        // Mode 12: sample 0's jitter, the jitter range over all samples, and the
-        // hit count.
-        out[gid * 4 + 0] = jx0;
-        out[gid * 4 + 1] = jmax - jmin;
-        out[gid * 4 + 2] = jy0;
-        out[gid * 4 + 3] = (float)phit;
-    }
-    if (p->pad_light == 11) {
-        // Mode 11: Ci == 0 occurrences, unrecognised component ids, radiance,
-        // and how many samples hit.
-        out[gid * 4 + 0] = (float)pzero_ci;
-        out[gid * 4 + 1] = (float)pbad_id;
-        out[gid * 4 + 2] = rad_r;
-        out[gid * 4 + 3] = (float)phit;
-    }
-    if (p->pad_light == 10) {
-        // Mode 10: cursor seen at the start of samples 1..n-1 (peak), cursor
-        // peak after shading, radiance, and miss count.
-        out[gid * 4 + 0] = pstartcur;
-        out[gid * 4 + 1] = pmaxcur;
-        out[gid * 4 + 2] = rad_r;
-        out[gid * 4 + 3] = (float)pmiss;
-    }
-    if (p->pad_light == 6) {
-        // Mode 6: samples that missed / samples that got a closure / radiance /
-        // material of sample 0.  A pixel whose pixels mostly miss is a jitter
-        // or direction problem; one that mostly hits and still has no closure is
-        // a shader problem.
-        out[gid * 4 + 0] = (float)pmiss;
-        out[gid * 4 + 1] = (float)pgood;
-        out[gid * 4 + 2] = rad_r;
-        out[gid * 4 + 3] = diag_mat;
-    }
+    // Accumulate this bounce's radiance into the sample's image.  The vendor
+    // path divides by the sample count here, and the host sums one image per
+    // sample, so the mean comes out identical to the megakernel's.
+    const int nsamp = p->sample_count > 0 ? p->sample_count : p->aa * p->aa;
+    const float inv = 1.0f / (float)(nsamp > 0 ? nsamp : 1);
+    VK_GLOBAL float* out = wf_fp(base, p->out_offset);
+    out[gid * 4 + 0] += L.x * inv;
+    out[gid * 4 + 1] += L.y * inv;
+    out[gid * 4 + 2] += L.z * inv;
+
+    // Publish the next wave's ray (or the dead flag) for the intersect pass.
+    wave_ray_store(p, base, gid, r);
 }

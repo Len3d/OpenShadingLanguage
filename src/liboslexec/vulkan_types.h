@@ -171,6 +171,11 @@ static const int kGroupDataOffset =
 /// contains Vec3 arrays -- naturally aligned).
 static const int kShadeBlockStride = ((int)sizeof(ShadeBlock) + 15) & ~15;
 
+/// Per-pixel block for the BVH traversal stack: 64 entries of {int node, float
+/// dist}.  Kept in this buffer rather than in a local array, see `wf_stack`.
+static const int kTraversalStackDepth  = 64;
+static const int kTraversalStackStride = kTraversalStackDepth * 8;
+
 // -----------------------------------------------------------------------------
 // Whole-frame render layout (the Vulkan equivalent of cuda/optix_raytracer.cu)
 // -----------------------------------------------------------------------------
@@ -193,6 +198,7 @@ static const int kShadeBlockStride = ((int)sizeof(ShadeBlock) + 15) & ~15;
 //   params.tri_shader_off  : int per primitive -> material id
 //   params.out_offset      : float4 per pixel, row major
 //   params.arena_offset    : ShadeBlock per invocation (stride arena_stride)
+//   params.wf_*_offset     : the wavefront ray and hit buffers (SoA)
 //
 // Offsets are byte offsets into the buffer; the kernel derives every pointer
 // from `gep(base, offset)`, which is the only form clspv can attribute to the
@@ -301,6 +307,37 @@ struct FrameParams {
     long long bg_values_offset;
     long long bg_rows_offset;
     long long bg_cols_offset;
+    // ---------------------------------------------------------------------
+    // Wavefront (SoA) buffers.  One array per component, each holding
+    // width*height entries, so a pass walks every array linearly instead of
+    // striding a per-ray struct:
+    //
+    //   ray buffer : origin (x,y,z), direction (x,y,z), radius, spread,
+    //                throughput (r,g,b), sampler seed/index, depth,
+    //                previous primitive, liveness, bsdf pdf
+    //   hit buffer : t, u, v, primitive id, "did it hit" flag
+    //
+    // The shading pass reads the ray buffer, the intersect pass reads it and
+    // writes the hit buffer, and the shading pass writes the *next* wave's ray
+    // entry -- so the buffers ping-pong by being overwritten in place once the
+    // intersect pass of that wave has already consumed them.
+    long long wf_org_x, wf_org_y, wf_org_z;
+    long long wf_dir_x, wf_dir_y, wf_dir_z;
+    long long wf_radius, wf_spread;
+    long long wf_thr_r, wf_thr_g, wf_thr_b;
+    long long wf_seed, wf_sindex;  ///< sampler state (int arrays)
+    long long wf_depth, wf_prev;   ///< int arrays
+    long long wf_active;           ///< int array, 0 when the path died
+    long long wf_bpdf;             ///< float array, bsdf pdf of the ray
+    long long wf_hit_t, wf_hit_u, wf_hit_v;
+    long long wf_hit_id, wf_hit_ok;  ///< int arrays
+    /// Scratch for the BVH traversal stack, one `kTraversalStackStride` block
+    /// per pixel.  It has to live in this buffer and not in a local array:
+    /// clspv lowers a runtime index into a private alloca to an
+    /// `OpPtrAccessChain` on a *Function* pointer, and the Intel compiler
+    /// segfaults inside vkCreateComputePipelines on that instruction (its
+    /// storage-buffer flavour is fine, the old megakernel module had 251).
+    long long wf_stack;
 };
 
 /// Where FrameParams sits: the first bytes of the buffer, so the kernel can

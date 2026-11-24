@@ -178,8 +178,12 @@ private:
     // material index -- and the kernel needs this number, not the index, for
     // the background shader.
     std::vector<int> m_vk_dispatch_id;
-    // The whole-frame pipeline: one dispatch per image.
-    int m_vk_frame = -1;
+    // The wavefront pipelines, one per pass, all built from the same module:
+    // generation, intersection and shading.  The host runs
+    // gen -> (intersect, shade) per bounce, per antialiasing sample.
+    int m_vk_gen       = -1;
+    int m_vk_intersect = -1;
+    int m_vk_shade     = -1;
     // Textures the shaders referenced while compiling; recorded by the
     // get_texture_handle() override and uploaded to the device.
     std::vector<ustring> m_vk_texture_names;
