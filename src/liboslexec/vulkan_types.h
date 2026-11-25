@@ -338,6 +338,21 @@ struct FrameParams {
     /// segfaults inside vkCreateComputePipelines on that instruction (its
     /// storage-buffer flavour is fine, the old megakernel module had 251).
     long long wf_stack;
+    /// NEE shadow rays.  The shading pass cannot traverse the BVH itself: it
+    /// would inline a second and a third copy of the walk (about 10.7k SPIR-V
+    /// words each).  It publishes the rays it wants to shoot here instead, and
+    /// the next intersection wave traces them -- that pass already carries the
+    /// traversal, so the module keeps a single copy of it.
+    long long wf_nee_pending;      ///< int array, bit 0 = bg, bit 1 = light
+    long long wf_p_x, wf_p_y, wf_p_z;  ///< float, shadow ray origin
+    long long wf_bgdir_x, wf_bgdir_y, wf_bgdir_z;
+    long long wf_bgc_r, wf_bgc_g, wf_bgc_b;  ///< float, bg NEE contribution
+    long long wf_ldir_x, wf_ldir_y, wf_ldir_z;
+    long long wf_lc_r, wf_lc_g, wf_lc_b;  ///< float, light NEE contribution
+    long long wf_l_tmax, wf_l_u, wf_l_v;   ///< float, light distance and uv
+    long long wf_l_lid;                   ///< int, light primitive
+    long long wf_s_skip1;                 ///< int, the surface both rays left
+    long long wf_vis_bg, wf_vis_l;        ///< int, 1 when the ray got through
 };
 
 /// Where FrameParams sits: the first bytes of the buffer, so the kernel can

@@ -1561,7 +1561,11 @@ wave_hit_load(VK_GLOBAL const FrameParams* p, GlobalPtr base,
 /// The scene view every pass that touches geometry needs: eleven pointers into
 /// the storage buffer plus the three counts.  Same construction the megakernel
 /// used, so the same pointers clspv can attribute to the buffer argument.
-#define WAVE_SCENE_SETUP(scene)                                               \
+/// The scene view every pass that touches geometry needs.  `idx` is the pixel
+/// the invocation works on: it is plain `gid` in the generation and shading
+/// passes, but the intersection pass dispatches three slots per pixel (the path
+/// ray plus the two shadow rays), so there it is `gid % npix`.
+#define WAVE_SCENE_SETUP(scene, idx)                                          \
     scene.tris          = (GlobalTri)(base + p->tri_offset);                  \
     scene.verts         = (GlobalVec3)(base + p->vert_offset);                \
     scene.normals       = (GlobalVec3)(base + p->normal_offset);              \
@@ -1576,7 +1580,7 @@ wave_hit_load(VK_GLOBAL const FrameParams* p, GlobalPtr base,
                                 + p->bvh_index_offset);                       \
     scene.num_bvh_nodes = p->num_bvh_nodes;                                   \
     scene.stack         = (base + p->wf_stack)                                \
-                  + (gid) * (unsigned long long)kTraversalStackStride;
+                  + (idx) * (unsigned long long)kTraversalStackStride;
 
 
 // ---- pass 1: ray generation ------------------------------------------------
@@ -1637,6 +1641,9 @@ extern "C" void osl_vk_wave_gen(GlobalPtr base)
     r.active = 1;
     wave_ray_store(p, base, gid, r);
 
+    // No NEE shadow ray is outstanding when a sample starts.
+    wf_ip(base, p->wf_nee_pending)[gid] = 0;
+
     // Accumulation target for this sample: the host sums one image per sample,
     // exactly as it did for the megakernel.
     VK_GLOBAL float* out = wf_fp(base, p->out_offset);
@@ -1648,38 +1655,91 @@ extern "C" void osl_vk_wave_gen(GlobalPtr base)
 
 
 // ---- pass 2: intersection --------------------------------------------------
+//
+// Three slots per pixel, one dispatch: slot 0 is the path ray of this wave,
+// slots 1 and 2 are the background and light NEE shadow rays the previous
+// shading wave asked for.  Keeping them in one kernel is what makes the split
+// pay: the BVH walk is inlined exactly once, instead of once here plus twice
+// inside the shading pass.
 
 extern "C" void osl_vk_wave_intersect(GlobalPtr base)
 {
     VK_GLOBAL const FrameParams* p
         = (VK_GLOBAL const FrameParams*)(base + kFrameParamsOffset);
 
-    const unsigned long long gid = get_global_id(0);
-    const unsigned long long npix
-        = (unsigned long long)p->width * (unsigned long long)p->height;
-    if (gid >= npix)
+    // 32-bit indices on purpose: an i64 division makes clspv expand a software
+    // divide into the middle of an already large kernel, which costs minutes of
+    // compile time.  Three slots of a 1k x 1k image fit in 32 bits easily.
+    const unsigned gid = (unsigned)get_global_id(0);
+    const unsigned npix
+        = (unsigned)p->width * (unsigned)p->height;
+    if (npix == 0)
         return;
-
-    WaveRay r;
-    wave_ray_load(p, base, gid, r);
-    if (!r.active) {
-        // Dead path: keep the slot dead and record a miss, so the shading pass
-        // has nothing to do with it.
-        wave_hit_store(p, base, gid, inf(), 0.0f, 0.0f, -1, 0);
+    const unsigned slot = gid / npix;
+    if (slot > 2)
         return;
-    }
+    const unsigned pix = gid - slot * npix;
 
-    SceneView scene;
-    WAVE_SCENE_SETUP(scene)
+    const bool is_path = (slot == 0);
+
+    // Gather the ray for whichever slot this invocation belongs to.  The two
+    // kinds differ only in where the ray comes from and in the distance cutoff;
+    // the walk itself is shared below, so it exists once in the module.
+    WaveRay wr;
+    wave_ray_load(p, base, pix, wr);
 
     Ray ray;
-    ray.origin    = r.org;
-    ray.direction = r.dir;
-    ray.radius    = r.radius;
-    ray.spread    = r.spread;
+    ray.origin = wr.org;
+    ray.direction = wr.dir;
+    ray.radius = wr.radius;
+    ray.spread = wr.spread;
+    // A dead path has nothing to hit, so a negative cutoff makes the walk
+    // return a miss.  The shadow slots must not inherit that: the path they
+    // belong to can die after publishing its NEE request, and a sky shadow ray
+    // has no distance cutoff at all.
+    float tmax = is_path && !wr.active ? -1.0f : inf();
+    int skip_a = wr.prev;
+    int skip_b = -1;
 
-    Hit h = intersect_scene(scene, ray, inf(), r.prev);
-    wave_hit_store(p, base, gid, h.t, h.u, h.v, h.id, h.id >= 0 ? 1 : 0);
+    VK_GLOBAL int* vis = wf_ip(base, (slot == 1) ? p->wf_vis_bg : p->wf_vis_l);
+    if (!is_path) {
+        const int bit     = (slot == 1) ? 1 : 2;
+        const bool wanted = (wf_icp(base, p->wf_nee_pending)[pix] & bit) != 0;
+        vis[pix]          = 0;
+        ray.origin = mk(wf_fcp(base, p->wf_p_x)[pix],
+                        wf_fcp(base, p->wf_p_y)[pix],
+                        wf_fcp(base, p->wf_p_z)[pix]);
+        ray.radius = 0.0f;
+        ray.spread = 0.0f;
+        skip_a     = wf_icp(base, p->wf_s_skip1)[pix];
+        if (slot == 1) {
+            ray.direction = mk(wf_fcp(base, p->wf_bgdir_x)[pix],
+                               wf_fcp(base, p->wf_bgdir_y)[pix],
+                               wf_fcp(base, p->wf_bgdir_z)[pix]);
+            // `tmax` is already inf(), the sky is at infinity.
+        } else {
+            ray.direction = mk(wf_fcp(base, p->wf_ldir_x)[pix],
+                               wf_fcp(base, p->wf_ldir_y)[pix],
+                               wf_fcp(base, p->wf_ldir_z)[pix]);
+            tmax          = wanted ? wf_fcp(base, p->wf_l_tmax)[pix] : -1.0f;
+            skip_b        = wf_icp(base, p->wf_l_lid)[pix];
+        }
+        if (!wanted)
+            tmax = -1.0f;  // nothing was requested, so do not walk at all
+    }
+
+    // One traversal stack per pixel *and per slot*: the three slots of a pixel
+    // are separate work items that the device may run concurrently, so sharing
+    // the walk stack between them would corrupt both.
+    SceneView scene;
+    WAVE_SCENE_SETUP(scene, pix * 3 + slot)
+
+    Hit h = intersect_scene(scene, ray, tmax, skip_a, skip_b);
+    if (is_path) {
+        wave_hit_store(p, base, pix, h.t, h.u, h.v, h.id, h.id >= 0 ? 1 : 0);
+    } else {
+        vis[pix] = (h.id < 0) ? 1 : 0;
+    }
 }
 
 
@@ -1698,15 +1758,13 @@ extern "C" void osl_vk_wave_shade(GlobalPtr base)
 
     WaveRay r;
     wave_ray_load(p, base, gid, r);
-    if (!r.active)
-        return;
 
     float h_t, h_u, h_v;
     int h_id, h_ok;
     wave_hit_load(p, base, gid, h_t, h_u, h_v, h_id, h_ok);
 
     SceneView scene;
-    WAVE_SCENE_SETUP(scene)
+    WAVE_SCENE_SETUP(scene, gid)
 
     GlobalInt tri_shader = (GlobalInt)(base + p->tri_shader_offset);
     GlobalPtr arena      = (GlobalPtr)(base + p->arena_offset)
@@ -1721,6 +1779,78 @@ extern "C" void osl_vk_wave_shade(GlobalPtr base)
                                          + gid * (unsigned long long)p->arena_stride);
     *(GlobalI64)((GlobalPtr)sg + kOffPool)     = sg_abs;
     *(GlobalI64)((GlobalPtr)sg + kOffPool + 8) = kTexTableOffsetVK;
+
+    const int nsamp = p->sample_count > 0 ? p->sample_count : p->aa * p->aa;
+    const float inv = 1.0f / (float)(nsamp > 0 ? nsamp : 1);
+    VK_GLOBAL float* out = wf_fp(base, p->out_offset);
+
+    // ---- settle the NEE shadow rays of the previous wave -------------------
+    // The shading pass does not traverse the BVH: it published these rays into
+    // the buffer and the intersection pass traced them.  Adding them here, at
+    // the top of the next wave, is the same arithmetic the megakernel did in
+    // place -- only the point in the wave at which it lands has moved.
+    const int pending = wf_icp(base, p->wf_nee_pending)[gid];
+    if (pending) {
+        if ((pending & 1) && wf_icp(base, p->wf_vis_bg)[gid]) {
+            out[gid * 4 + 0] += wf_fcp(base, p->wf_bgc_r)[gid] * inv;
+            out[gid * 4 + 1] += wf_fcp(base, p->wf_bgc_g)[gid] * inv;
+            out[gid * 4 + 2] += wf_fcp(base, p->wf_bgc_b)[gid] * inv;
+        }
+        if ((pending & 2) && wf_icp(base, p->wf_vis_l)[gid]) {
+            // Nothing between the surface and the light: shade the point on the
+            // light and multiply in its emission, as the megakernel did inline.
+            const int lid           = wf_icp(base, p->wf_l_lid)[gid];
+            const int lightShaderID = tri_shader[lid];
+            if (lightShaderID >= 0) {
+                Ray sray;
+                sray.origin
+                    = mk(wf_fcp(base, p->wf_p_x)[gid],
+                         wf_fcp(base, p->wf_p_y)[gid],
+                         wf_fcp(base, p->wf_p_z)[gid]);
+                sray.direction = mk(wf_fcp(base, p->wf_ldir_x)[gid],
+                                    wf_fcp(base, p->wf_ldir_y)[gid],
+                                    wf_fcp(base, p->wf_ldir_z)[gid]);
+                sray.radius    = 0.0f;
+                sray.spread    = 0.0f;
+                Hit lhit;
+                lhit.id = lid;
+                lhit.u  = wf_fcp(base, p->wf_l_u)[gid];
+                lhit.v  = wf_fcp(base, p->wf_l_v)[gid];
+                lhit.t  = wf_fcp(base, p->wf_l_tmax)[gid];
+                fill_globals(sg, scene, p, sray, lhit,
+                             (VK_GLOBAL const unsigned char*)base);
+                *(GlobalI64)((GlobalPtr)sg + kOffRenderstate) = 16;
+                *(GlobalI64)((GlobalPtr)sg + kOffCi)          = -1;
+                osl_vk_shade_dispatch((GlobalPtr)sg, lightShaderID);
+                long long lci = *(GlobalI64)((GlobalPtr)sg + kOffCi);
+                if (lci >= 0) {
+                    const VK_GLOBAL ClosureComponentVK* lcomp
+                        = (VK_GLOBAL const ClosureComponentVK*)(arena + kOffPool
+                                                                + lci);
+                    if (lcomp->id == EMISSION_ID_VK
+                        || lcomp->id == BACKGROUND_ID_VK) {
+                        // Scalar loads: a Vec3 lvalue living in AS1 cannot bind
+                        // to a reference.
+                        Vec3 lw = mk(lcomp->w.x, lcomp->w.y, lcomp->w.z);
+                        out[gid * 4 + 0]
+                            += wf_fcp(base, p->wf_lc_r)[gid] * lw.x * inv;
+                        out[gid * 4 + 1]
+                            += wf_fcp(base, p->wf_lc_g)[gid] * lw.y * inv;
+                        out[gid * 4 + 2]
+                            += wf_fcp(base, p->wf_lc_b)[gid] * lw.z * inv;
+                    }
+                }
+                // The light shading overwrote the block the surface's closure
+                // tree lived in, but that tree is finished with: everything
+                // after this pass works off the ray buffer, not `sg`.
+            }
+        }
+        // Consumed.  The next wave publishes a fresh pair.
+        wf_ip(base, p->wf_nee_pending)[gid] = 0;
+    }
+
+    if (!r.active)
+        return;
 
     // Resume the per-sample sampler where the generation pass left it.
     Sampler sampler;
@@ -1924,14 +2054,20 @@ extern "C" void osl_vk_wave_shade(GlobalPtr base)
                     Vec3 contrib = mulv(mulv(w, mk(ar * bwt, ag * bwt, ab * bwt)),
                                         mk(bgv.x * mis, bgv.y * mis, bgv.z * mis));
                     if (contrib.x + contrib.y + contrib.z > 0.0f) {
-                        Ray sray;
-                        sray.origin    = P;
-                        sray.direction = bg_dir;
-                        sray.radius    = ray.radius;
-                        sray.spread    = ray.spread;
-                        Hit sh = intersect_scene(scene, sray, inf(), hit.id);
-                        if (sh.id < 0)  // nothing between the point and the sky
-                            L = add(L, contrib);
+                        // Publish the shadow ray instead of tracing it: the
+                        // next intersection wave walks it, the next shading
+                        // wave adds `contrib` if it got through.
+                        wf_fp(base, p->wf_p_x)[gid]      = P.x;
+                        wf_fp(base, p->wf_p_y)[gid]      = P.y;
+                        wf_fp(base, p->wf_p_z)[gid]      = P.z;
+                        wf_ip(base, p->wf_s_skip1)[gid] = hit.id;
+                        wf_fp(base, p->wf_bgdir_x)[gid]  = bg_dir.x;
+                        wf_fp(base, p->wf_bgdir_y)[gid]  = bg_dir.y;
+                        wf_fp(base, p->wf_bgdir_z)[gid]  = bg_dir.z;
+                        wf_fp(base, p->wf_bgc_r)[gid]    = contrib.x;
+                        wf_fp(base, p->wf_bgc_g)[gid]    = contrib.y;
+                        wf_fp(base, p->wf_bgc_b)[gid]    = contrib.z;
+                        wf_ip(base, p->wf_nee_pending)[gid] |= 1;
                     }
                 }
 
@@ -1967,54 +2103,24 @@ extern "C" void osl_vk_wave_shade(GlobalPtr base)
                             = mulv(mulv(w, mk(ar * bwt, ag * bwt, ab * bwt)),
                                    mk(mis, mis, mis));
                         if (contrib.x + contrib.y + contrib.z > 0.0f) {
-                            Ray sray;
-                            sray.origin    = P;
-                            sray.direction = lsmp.dir;
-                            sray.radius    = ray.radius;
-                            sray.spread    = ray.spread;
-                            Hit sh = intersect_scene(scene, sray, lsmp.dist,
-                                                     hit.id, lid);
-                            // Visible when nothing is hit closer than the light.
-                            if (sh.id < 0) {
-                                const int lightShaderID = tri_shader[lid];
-                                if (lightShaderID >= 0) {
-                                    // Shade the point on the light.  P/N/albedo
-                                    // are already copied out, so the single
-                                    // ShadeBlock can be reused for it.
-                                    Hit lhit;
-                                    lhit.id = lid;
-                                    lhit.u  = lsmp.u;
-                                    lhit.v  = lsmp.v;
-                                    lhit.t  = lsmp.dist;
-                                    fill_globals(sg, scene, p, sray, lhit,
-                                                 (VK_GLOBAL const unsigned char*)base);
-                                    *(GlobalI64)((GlobalPtr)sg + kOffRenderstate)
-                                        = 16;
-                                    *(GlobalI64)((GlobalPtr)sg + kOffCi) = -1;
-                                    osl_vk_shade_dispatch((GlobalPtr)sg,
-                                                          lightShaderID);
-                                    long long lci
-                                        = *(GlobalI64)((GlobalPtr)sg + kOffCi);
-                                    if (lci >= 0) {
-                                        const VK_GLOBAL ClosureComponentVK* lcomp
-                                            = (VK_GLOBAL const ClosureComponentVK*)(
-                                                arena + kOffPool + lci);
-                                        if (lcomp->id == EMISSION_ID_VK
-                                            || lcomp->id == BACKGROUND_ID_VK) {
-                                            // Scalar loads: a Vec3 lvalue living
-                                            // in AS1 cannot bind to a reference.
-                                            Vec3 lw = mk(lcomp->w.x,
-                                                         lcomp->w.y,
-                                                         lcomp->w.z);
-                                            L = add(L, mulv(contrib, lw));
-                                        }
-                                    }
-                                    // The light shading overwrote the block the
-                                    // surface's own closure tree lived in.  P,
-                                    // n and the albedo are copied out already,
-                                    // and nothing after this pass reads sg.
-                                }
-                            }
+                            // Same hand-off as the background ray above; the
+                            // light point is shaded when the result comes back,
+                            // because that needs `sg` and the shader dispatch.
+                            wf_fp(base, p->wf_p_x)[gid]      = P.x;
+                            wf_fp(base, p->wf_p_y)[gid]      = P.y;
+                            wf_fp(base, p->wf_p_z)[gid]      = P.z;
+                            wf_ip(base, p->wf_s_skip1)[gid] = hit.id;
+                            wf_fp(base, p->wf_ldir_x)[gid]   = lsmp.dir.x;
+                            wf_fp(base, p->wf_ldir_y)[gid]   = lsmp.dir.y;
+                            wf_fp(base, p->wf_ldir_z)[gid]   = lsmp.dir.z;
+                            wf_fp(base, p->wf_l_tmax)[gid]   = lsmp.dist;
+                            wf_fp(base, p->wf_l_u)[gid]      = lsmp.u;
+                            wf_fp(base, p->wf_l_v)[gid]      = lsmp.v;
+                            wf_ip(base, p->wf_l_lid)[gid]    = lid;
+                            wf_fp(base, p->wf_lc_r)[gid]     = contrib.x;
+                            wf_fp(base, p->wf_lc_g)[gid]     = contrib.y;
+                            wf_fp(base, p->wf_lc_b)[gid]     = contrib.z;
+                            wf_ip(base, p->wf_nee_pending)[gid] |= 2;
                         }
                     }
                 }
@@ -2140,9 +2246,6 @@ extern "C" void osl_vk_wave_shade(GlobalPtr base)
     // Accumulate this bounce's radiance into the sample's image.  The vendor
     // path divides by the sample count here, and the host sums one image per
     // sample, so the mean comes out identical to the megakernel's.
-    const int nsamp = p->sample_count > 0 ? p->sample_count : p->aa * p->aa;
-    const float inv = 1.0f / (float)(nsamp > 0 ? nsamp : 1);
-    VK_GLOBAL float* out = wf_fp(base, p->out_offset);
     out[gid * 4 + 0] += L.x * inv;
     out[gid * 4 + 1] += L.y * inv;
     out[gid * 4 + 2] += L.z * inv;

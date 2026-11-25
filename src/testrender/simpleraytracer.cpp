@@ -1841,7 +1841,34 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
     size_t wf_hit_id = take(npix * sizeof(int));
     size_t wf_hit_ok = take(npix * sizeof(int));
     /// Traversal stack scratch, one block per pixel (see `wf_stack`).
-    size_t wf_stack = take(npix * (size_t)kTraversalStackStride);
+    // One traversal stack per pixel and per intersection slot: the three slots
+    // of a pixel run as independent work items, so each needs its own stack.
+    size_t wf_stack = take(3 * npix * (size_t)kTraversalStackStride);
+    // NEE hand-off: the shading pass publishes the shadow rays it wants here
+    // and the next intersection wave traces them (see `wf_nee_pending`).
+    size_t wf_nee_pending = take(npix * sizeof(int));
+    size_t wf_p_x      = take(npix * sizeof(float));
+    size_t wf_p_y      = take(npix * sizeof(float));
+    size_t wf_p_z      = take(npix * sizeof(float));
+    size_t wf_bgdir_x  = take(npix * sizeof(float));
+    size_t wf_bgdir_y  = take(npix * sizeof(float));
+    size_t wf_bgdir_z  = take(npix * sizeof(float));
+    size_t wf_bgc_r    = take(npix * sizeof(float));
+    size_t wf_bgc_g    = take(npix * sizeof(float));
+    size_t wf_bgc_b    = take(npix * sizeof(float));
+    size_t wf_ldir_x   = take(npix * sizeof(float));
+    size_t wf_ldir_y   = take(npix * sizeof(float));
+    size_t wf_ldir_z   = take(npix * sizeof(float));
+    size_t wf_lc_r     = take(npix * sizeof(float));
+    size_t wf_lc_g     = take(npix * sizeof(float));
+    size_t wf_lc_b     = take(npix * sizeof(float));
+    size_t wf_l_tmax   = take(npix * sizeof(float));
+    size_t wf_l_u      = take(npix * sizeof(float));
+    size_t wf_l_v      = take(npix * sizeof(float));
+    size_t wf_l_lid    = take(npix * sizeof(int));
+    size_t wf_s_skip1  = take(npix * sizeof(int));
+    size_t wf_vis_bg   = take(npix * sizeof(int));
+    size_t wf_vis_l    = take(npix * sizeof(int));
     size_t arena_off = take(npix * (size_t)kShadeBlockStride);
     /// The background importance table (Background::prepare), uploaded so the
     /// device's *indirect* rays can evaluate the background the way the CPU
@@ -2067,6 +2094,29 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
     fp.wf_hit_id         = (long long)wf_hit_id;
     fp.wf_hit_ok         = (long long)wf_hit_ok;
     fp.wf_stack          = (long long)wf_stack;
+    fp.wf_nee_pending    = (long long)wf_nee_pending;
+    fp.wf_p_x            = (long long)wf_p_x;
+    fp.wf_p_y            = (long long)wf_p_y;
+    fp.wf_p_z            = (long long)wf_p_z;
+    fp.wf_bgdir_x        = (long long)wf_bgdir_x;
+    fp.wf_bgdir_y        = (long long)wf_bgdir_y;
+    fp.wf_bgdir_z        = (long long)wf_bgdir_z;
+    fp.wf_bgc_r          = (long long)wf_bgc_r;
+    fp.wf_bgc_g          = (long long)wf_bgc_g;
+    fp.wf_bgc_b          = (long long)wf_bgc_b;
+    fp.wf_ldir_x         = (long long)wf_ldir_x;
+    fp.wf_ldir_y         = (long long)wf_ldir_y;
+    fp.wf_ldir_z         = (long long)wf_ldir_z;
+    fp.wf_lc_r           = (long long)wf_lc_r;
+    fp.wf_lc_g           = (long long)wf_lc_g;
+    fp.wf_lc_b           = (long long)wf_lc_b;
+    fp.wf_l_tmax         = (long long)wf_l_tmax;
+    fp.wf_l_u            = (long long)wf_l_u;
+    fp.wf_l_v            = (long long)wf_l_v;
+    fp.wf_l_lid          = (long long)wf_l_lid;
+    fp.wf_s_skip1        = (long long)wf_s_skip1;
+    fp.wf_vis_bg         = (long long)wf_vis_bg;
+    fp.wf_vis_l          = (long long)wf_vis_l;
     fp.lightprim_offset  = (long long)lp_off;
     fp.num_lightprims    = (int)lp_count;
     fp.area_offset       = (long long)area_off;
@@ -2180,6 +2230,12 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
             "[vulkan] frame: %zu tris, %zu verts, %zu lightprims, %zu px, %u groups\n",
             ntris, nverts, lp_count, npix, (unsigned)((npix + kWorkgroupSize - 1) / kWorkgroupSize));
     unsigned groups = (unsigned)((npix + kWorkgroupSize - 1) / kWorkgroupSize);
+    // The intersection pass runs three slots per pixel -- the path ray and the
+    // two NEE shadow rays the previous shading wave published -- so it needs
+    // three times as many invocations.  One kernel keeps a single copy of the
+    // BVH walk in the module.
+    unsigned groups_ray = (unsigned)((3 * npix + kWorkgroupSize - 1)
+                                     / kWorkgroupSize);
     OIIO::Timer t;
     std::vector<float> image(npix * 4);
     // Wavefront loop: per antialiasing sample, generate the primary rays and
@@ -2196,8 +2252,8 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
     if (frame_samples > 1)
         fprintf(stderr,
                 "[vulkan] wavefront: %d samples x %d intersect/shade pairs, "
-                "%u workgroups per pass\n",
-                frame_samples, bounces + 1, groups);
+                "%u + %u workgroups per pass\n",
+                frame_samples, bounces + 1, groups, groups_ray);
     for (int s = 0; s < frame_samples; ++s) {
         fp.sample_index = s;
         if (!m_vk->upload(kFrameParamsOffset, &fp, sizeof(fp), err)) {
@@ -2211,7 +2267,7 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
             return false;
         }
         for (int b = 0; b <= bounces; ++b) {
-            if (!m_vk->dispatch(m_vk_intersect, groups, err)) {
+            if (!m_vk->dispatch(m_vk_intersect, groups_ray, err)) {
                 errhandler().errorfmt(
                     "[vulkan] sample {} bounce {}: intersect failed: {}", s, b,
                     err);
