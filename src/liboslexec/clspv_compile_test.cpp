@@ -20,13 +20,14 @@ main(int argc, char* argv[])
 {
     printf("clspv available: %d\n", (int)OSL::pvt::clspv_available());
 
-    // `clspv_compile_test -ir <in.ll> <out.spv>` lowers a textual LLVM IR
-    // module through clspv's IR entry point, which is what the backend feeds
-    // it in-process.  Keeping this mode separate from the OpenCL C kernel
-    // below means a failure here cannot be blamed on the source path.
+    // `clspv_compile_test -ir <in.ll> <out.spv> [clspv options]` lowers a
+    // textual LLVM IR module through clspv's IR entry point, which is what the
+    // backend feeds it in-process.  Keeping this mode separate from the OpenCL
+    // C kernel below means a failure here cannot be blamed on the source path.
     if (argc > 1 && std::string(argv[1]) == "-ir") {
         if (argc < 4) {
-            printf("usage: %s -ir <in.ll> <out.spv>\n", argv[0]);
+            printf("usage: %s -ir <in.ll> <out.spv> [clspv options]\n",
+                   argv[0]);
             return 2;
         }
         FILE* in = fopen(argv[2], "rb");
@@ -43,8 +44,10 @@ main(int argc, char* argv[])
 
         std::vector<uint32_t> ir_spirv;
         std::string ir_log;
-        bool ir_ok = OSL::pvt::clspv_compile(ir, "-x ir --arch=spirv64", ir_spirv,
-                                             ir_log);
+        std::string ir_opts = (argc > 4 && argv[4][0])
+                                  ? argv[4]
+                                  : "-x ir --arch=spirv64";
+        bool ir_ok = OSL::pvt::clspv_compile(ir, ir_opts, ir_spirv, ir_log);
         if (!ir_log.empty())
             printf("clspv log:\n%s\n", ir_log.c_str());
         if (!ir_ok || ir_spirv.empty()) {

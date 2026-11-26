@@ -44,6 +44,71 @@ unsigned long long get_global_id(unsigned int dim);
 // Synthesised by the module builder: runs material `shader_id` on `sg`.
 extern "C" void osl_vk_shade_dispatch(GlobalPtr sg, int shader_id);
 
+// One restricted dispatcher per material: each can only reach its own group
+// (plus the light group), which is what keeps a per-material shading kernel
+// from carrying every shader.  The module builder fills these in.
+extern "C" void osl_vk_shade_dispatch_0(GlobalPtr sg, int shader_id);
+extern "C" void osl_vk_shade_dispatch_1(GlobalPtr sg, int shader_id);
+extern "C" void osl_vk_shade_dispatch_2(GlobalPtr sg, int shader_id);
+extern "C" void osl_vk_shade_dispatch_3(GlobalPtr sg, int shader_id);
+extern "C" void osl_vk_shade_dispatch_4(GlobalPtr sg, int shader_id);
+extern "C" void osl_vk_shade_dispatch_5(GlobalPtr sg, int shader_id);
+extern "C" void osl_vk_shade_dispatch_6(GlobalPtr sg, int shader_id);
+extern "C" void osl_vk_shade_dispatch_7(GlobalPtr sg, int shader_id);
+extern "C" void osl_vk_shade_dispatch_8(GlobalPtr sg, int shader_id);
+extern "C" void osl_vk_shade_dispatch_9(GlobalPtr sg, int shader_id);
+extern "C" void osl_vk_shade_dispatch_10(GlobalPtr sg, int shader_id);
+extern "C" void osl_vk_shade_dispatch_11(GlobalPtr sg, int shader_id);
+extern "C" void osl_vk_shade_dispatch_12(GlobalPtr sg, int shader_id);
+extern "C" void osl_vk_shade_dispatch_13(GlobalPtr sg, int shader_id);
+extern "C" void osl_vk_shade_dispatch_14(GlobalPtr sg, int shader_id);
+extern "C" void osl_vk_shade_dispatch_15(GlobalPtr sg, int shader_id);
+
+/// Material slots the device runtime can specialize a shading kernel for (0..15,
+/// see the instantiations at the end of this file).  Scenes with more shading
+/// groups than that need a fix in the host dispatch, not here.  The testsuite's
+/// widest scene (render-mx-furnace-*, one group per sphere) needs 12.
+
+/// Route a shader id through the dispatcher that belongs to kernel MAT.  With
+/// `if constexpr` each instantiation references exactly one of them, so the
+/// other groups become unreachable in that kernel and clspv drops their code.
+template <int MAT>
+inline void wave_shade_dispatch(GlobalPtr sg, int shader_id)
+{
+    if constexpr (MAT == 0)
+        osl_vk_shade_dispatch_0(sg, shader_id);
+    else if constexpr (MAT == 1)
+        osl_vk_shade_dispatch_1(sg, shader_id);
+    else if constexpr (MAT == 2)
+        osl_vk_shade_dispatch_2(sg, shader_id);
+    else if constexpr (MAT == 3)
+        osl_vk_shade_dispatch_3(sg, shader_id);
+    else if constexpr (MAT == 4)
+        osl_vk_shade_dispatch_4(sg, shader_id);
+    else if constexpr (MAT == 5)
+        osl_vk_shade_dispatch_5(sg, shader_id);
+    else if constexpr (MAT == 6)
+        osl_vk_shade_dispatch_6(sg, shader_id);
+    else if constexpr (MAT == 7)
+        osl_vk_shade_dispatch_7(sg, shader_id);
+    else if constexpr (MAT == 8)
+        osl_vk_shade_dispatch_8(sg, shader_id);
+    else if constexpr (MAT == 9)
+        osl_vk_shade_dispatch_9(sg, shader_id);
+    else if constexpr (MAT == 10)
+        osl_vk_shade_dispatch_10(sg, shader_id);
+    else if constexpr (MAT == 11)
+        osl_vk_shade_dispatch_11(sg, shader_id);
+    else if constexpr (MAT == 12)
+        osl_vk_shade_dispatch_12(sg, shader_id);
+    else if constexpr (MAT == 13)
+        osl_vk_shade_dispatch_13(sg, shader_id);
+    else if constexpr (MAT == 14)
+        osl_vk_shade_dispatch_14(sg, shader_id);
+    else
+        osl_vk_shade_dispatch_15(sg, shader_id);
+}
+
 using namespace osl_vk_abi;
 
 // ---------------------------------------------------------------------------
@@ -136,6 +201,26 @@ inline unsigned int vk_owen_scramble(unsigned int p, unsigned int s)
     return reversebits(p);
 }
 
+// sampling.h's zmatrix (the third Sobol dimension), at namespace scope and in
+// the `constant` address space.
+//
+// It used to live inside Sampler::get() as a function-local `static const`.
+// clang then emits it as a *local* array with a constant initializer, and clspv
+// hoists that into a module-scope variable of Function storage class carrying
+// the initializer -- which SPIR-V forbids ("Variables cannot have function
+// storage class outside of a function"), so the module fails validation and
+// Intel's compiler aborts on it.  At namespace scope in address space 0 the
+// same thing happens (this translation unit is not compiled as OpenCL C, so a
+// plain global lands in the private space); `address_space(2)` makes it a
+// constant global, which clspv emits as an OpVariable of Constant storage
+// class -- legal at module scope.
+static const unsigned int kSobolZMatrix[24]
+    __attribute__((address_space(2)))
+    = { 0x000001u, 0x000003u, 0x000006u, 0x000009u, 0x000017u, 0x00003au,
+        0x000071u, 0x0000a3u, 0x000116u, 0x000339u, 0x000677u, 0x0009aau,
+        0x001601u, 0x003903u, 0x007706u, 0x00aa09u, 0x010117u, 0x03033au,
+        0x060671u, 0x0909a3u, 0x171616u, 0x3a3939u, 0x717777u, 0xa3aaaau };
+
 struct Sampler {
     unsigned int seed, index;
 
@@ -157,18 +242,12 @@ struct Sampler {
         seed += 4;  // advance depth for the next call
         // The Sobol matrix product is the same construction as sampling.h's
         // zmatrix/ymatrix loop; see there for the reference.
-        static const unsigned int zmatrix[24] = {
-            0x000001u, 0x000003u, 0x000006u, 0x000009u, 0x000017u, 0x00003au,
-            0x000071u, 0x0000a3u, 0x000116u, 0x000339u, 0x000677u, 0x0009aau,
-            0x001601u, 0x003903u, 0x007706u, 0x00aa09u, 0x010117u, 0x03033au,
-            0x060671u, 0x0909a3u, 0x171616u, 0x3a3939u, 0x717777u, 0xa3aaaau
-        };
         unsigned int si = vk_owen_scramble(index, vk_hash(seed - 4)) & 0xFFFFFFu;
         unsigned int rx = si, ry = 0, rz = 0, ymatrix = 1;
         for (int c = 0; c < 24; ++c) {
             unsigned int bit = (si >> c) & 1u;
             ry ^= bit * ymatrix;
-            rz ^= bit * zmatrix[c];
+            rz ^= bit * kSobolZMatrix[c];
             ymatrix ^= ymatrix << 1;
         }
         // Scramble the results and scale by 2^-24 to guarantee equally spaced
@@ -717,6 +796,12 @@ inline void frame_from_nt(const Vec3& n, const Vec3& t, Vec3& u, Vec3& v,
     }
 }
 
+// Fresnel helpers live further down next to the delta closures, but the
+// microfacet lobes need them too.
+inline float fresnel_dielectric_vk(float cosi, float eta);
+inline float fresnel_refraction_vk(const Vec3& I, const Vec3& N, float eta,
+                                   Vec3& T);
+
 /// The Ward anisotropic specular BRDF, device side.  Two functions that mirror
 /// shading.cpp:412-494 field by field: WardParams is { Vec3 N; Vec3 T;
 /// float ax; float ay; }, and both eval and sample hand back the same
@@ -791,6 +876,468 @@ inline void ward_sample_vk(const WardVK& p, const Vec3& wo, float rx, float ry,
             float val = k * s;
             weight  = mk(val, val, val);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Microfacet (Beckmann), device side
+// ---------------------------------------------------------------------------
+//
+// shading.cpp:469-796 ported statement for statement: the visible-normal
+// sampling of d'Eon & Heitz, the Beckmann slope distribution, the anisotropic
+// masking-shadowing terms, and the two lobes `refract` selects between.  The
+// only substitution is erf/erfinv, which have no SPIR-V builtin: OIIO's
+// fmath.h fast_erf / fast_ierf polynomials are copied below, with the exact
+// logf where fmath.h uses fast_log.  Those agree to ~1e-7, i.e. below the
+// precision the float arithmetic around them keeps.
+
+// The CPU's microfacet sampling is not libm: shading.cpp:533-561 calls
+// OIIO::fast_erf / fast_ierf / fast_exp, whose fast_log2 / fast_exp2 are
+// polynomial approximations (fmath.h:1830 and :1680, "2.7 ulp average, 232 ulp
+// max").  An exact __builtin_logf here differs from the CPU's fast_log by up
+// to ~1e-5 relative, which is enough to send the reflected ray of a near
+// specular lobe through a different environment texel -- the pixels where the
+// two renderers disagree are exactly those.  These three helpers are the same
+// polynomials as fmath.h, so the sampled micronormal matches the CPU bit for
+// bit; `#pragma clang fp contract(off)` keeps clang from fusing the madd pair
+// into an fma, which the CPU build's mul+add does not do.
+inline unsigned int mf_bitcast_u32(float f)
+{
+    return __builtin_bit_cast(unsigned int, f);
+}
+
+inline float mf_bitcast_f32(unsigned int u)
+{
+    return __builtin_bit_cast(float, u);
+}
+
+inline float mf_fast_log2(float xval)
+{
+#pragma clang fp contract(off)
+    // clamp to avoid special cases, like fmath.h:1830
+    const float FLT_MIN_ = 1.17549435e-38f;
+    const float FLT_MAX_ = 3.40282347e+38f;
+    float x              = xval < FLT_MAX_ ? xval : FLT_MAX_;
+    x                    = x > FLT_MIN_ ? x : FLT_MIN_;
+    const unsigned int bits = mf_bitcast_u32(x);
+    const int exponent      = (int)(bits >> 23) - 127;
+    const float f
+        = mf_bitcast_f32((bits & 0x007FFFFFu) | 0x3f800000u) - 1.0f;
+    const float f2 = f * f;
+    const float f4 = f2 * f2;
+    float hi       = f * -0.00931049621349f + 0.05206469089414f;
+    float lo       = f * 0.47868480909345f + -0.72116591947498f;
+    hi             = f * hi + -0.13753123777116f;
+    hi             = f * hi + 0.24187369696082f;
+    hi             = f * hi + -0.34730547155299f;
+    lo             = f * lo + 1.442689881667200f;
+    return ((f4 * hi) + (f * lo)) + (float)exponent;
+}
+
+inline float mf_fast_log(float x)
+{
+#pragma clang fp contract(off)
+    return mf_fast_log2(x) * 0.6931471805599453f;  // M_LN2
+}
+
+/// fmath.h:1680 -- fast_exp2(float): range reduction, a 5th degree polynomial,
+/// then the exponent is added back through the bit pattern.
+inline float mf_fast_exp2(float xval)
+{
+#pragma clang fp contract(off)
+    float x = xval < 126.0f ? xval : 126.0f;
+    x       = x > -126.0f ? x : -126.0f;
+    const int m = (int)x;
+    x -= (float)m;
+    x = 1.0f - (1.0f - x);  // crush denormals
+    float r = 1.33336498402e-3f;
+    r       = x * r + 9.810352697968e-3f;
+    r       = x * r + 5.551834031939e-2f;
+    r       = x * r + 0.2401793301105f;
+    r       = x * r + 0.693144857883f;
+    r       = x * r + 1.0f;
+    return mf_bitcast_f32(mf_bitcast_u32(r) + ((unsigned int)m << 23));
+}
+
+inline float mf_fast_exp(float x)
+{
+#pragma clang fp contract(off)
+    return mf_fast_exp2(x * 1.4426950408889634f);  // 1 / M_LN2
+}
+
+inline float mf_fast_erf(float x)
+{
+    // OIIO/fmath.h:2153 -- Abramowitz & Stegun 7.1.28.
+    const float a1 = 0.0705230784f;
+    const float a2 = 0.0422820123f;
+    const float a3 = 0.0092705272f;
+    const float a4 = 0.0001520143f;
+    const float a5 = 0.0002765672f;
+    const float a6 = 0.0000430638f;
+    const float a  = __builtin_fabsf(x);
+    const float b  = 1.0f - (1.0f - a);  // crush denormals
+    const float r  = ((((((a6 * b + a5) * b + a4) * b + a3) * b + a2) * b + a1)
+                      * b)
+                     + 1.0f;
+    const float s  = r * r;
+    const float t  = s * s;
+    const float u  = t * t;
+    const float v  = u * u;
+    return __builtin_copysignf(1.0f - 1.0f / v, x);
+}
+
+inline float mf_fast_ierf(float x)
+{
+    // OIIO/fmath.h:2189 -- Mike Giles' erfinv approximation.
+    float a = __builtin_fabsf(x);
+    if (a > 0.99999994f)
+        a = 0.99999994f;
+    float w = -mf_fast_log((1.0f - a) * (1.0f + a)), p;
+    if (w < 5.0f) {
+        w = w - 2.5f;
+        p = 2.81022636e-08f;
+        p = p * w + 3.43273939e-07f;
+        p = p * w + -3.5233877e-06f;
+        p = p * w + -4.39150654e-06f;
+        p = p * w + 0.00021858087f;
+        p = p * w + -0.00125372503f;
+        p = p * w + -0.00417768164f;
+        p = p * w + 0.246640727f;
+        p = p * w + 1.50140941f;
+    } else {
+        w = __builtin_sqrtf(w) - 3.0f;
+        p = -0.000200214257f;
+        p = p * w + 0.000100950558f;
+        p = p * w + 0.00134934322f;
+        p = p * w + -0.00367342844f;
+        p = p * w + 0.00573950773f;
+        p = p * w + -0.0076224613f;
+        p = p * w + 0.00943887047f;
+        p = p * w + 1.00167406f;
+        p = p * w + 2.83297682f;
+    }
+    return p * x;
+}
+
+/// shading.cpp:507-565 -- the Beckmann distribution's three entry points.
+inline float beckmann_F(float tan_m2)
+{
+    return 0.31830988618f * mf_fast_exp(-tan_m2);
+}
+
+inline float beckmann_Lambda(float a2)
+{
+    const float a = __builtin_sqrtf(a2);
+    return a < 1.6f ? (1.0f - 1.259f * a + 0.396f * a2)
+                          / (3.535f * a + 2.181f * a2)
+                    : 0.0f;
+}
+
+/// Wenzel Jakob's improved visible-normal Beckmann slope sample; the single
+/// Newton step is what the CPU does too (shading.cpp:538-558).
+inline void beckmann_sample_slope(float cos_theta, float randu, float randv,
+                                  float& sx, float& sy)
+{
+#pragma clang fp contract(off)
+    const float SQRT_PI_INV = 0.5641895835f;  // 1/sqrt(pi)
+    float ct                = cos_theta < 1e-6f ? 1e-6f : cos_theta;
+    float tanThetaI         = __builtin_sqrtf(1.0f - ct * ct) / ct;
+    float cotThetaI         = 1.0f / tanThetaI;
+
+    float c       = mf_fast_erf(cotThetaI);
+    float K       = tanThetaI * SQRT_PI_INV;
+    float yApprox = randu * (1.0f + c + K * (1.0f - c * c));
+    float yExact  = randu * (1.0f + c + K * mf_fast_exp(-cotThetaI * cotThetaI));
+    float b = K > 0 ? (0.5f - __builtin_sqrtf(K * (K - yApprox + 1.0f) + 0.25f))
+                              / K
+                    : yApprox - 1.0f;
+
+    float invErf = mf_fast_ierf(b);
+    float value  = 1.0f + b + K * mf_fast_exp(-invErf * invErf) - yExact;
+
+    if (__builtin_fabsf(value) > 1e-6f) {
+        b -= value / (1.0f - invErf * tanThetaI);  // newton step 1
+        invErf = mf_fast_ierf(b);
+        value  = 1.0f + b + K * mf_fast_exp(-invErf * invErf) - yExact;
+        b -= value / (1.0f - invErf * tanThetaI);  // newton step 2
+        sx = mf_fast_ierf(b);
+    } else {
+        sx = invErf;
+    }
+    sy = mf_fast_ierf(2.0f * randv - 1.0f);
+}
+
+/// fmath.h:1610 -- fast_sincos(float).  The CPU's Background::map goes through
+/// it, and with it the *direction* of every importance-sampled background ray.
+/// A near-specular lobe's NEE weight is extremely sensitive to that direction
+/// (even a ~1e-6 rad shift moves it across the Beckmann peak), so an exact
+/// sinf/cosf here leaves a visible difference on glossy highlights.  Same
+/// polynomials and the same SLEEF argument reduction as fmath.h.
+inline void mf_fast_sincos(float x, float& sine, float& cosine)
+{
+#pragma clang fp contract(off)
+    // fast_rint: SSE4.1 rint, i.e. round to nearest even
+    const int q = (int)__builtin_rintf(x * 0.31830988618379067154f);  // M_1_PI
+    const float qf = (float)q;
+    x              = qf * (-0.78515625f * 4.0f) + x;
+    x              = qf * (-0.00024187564849853515625f * 4.0f) + x;
+    x              = qf * (-3.7747668102383613586e-08f * 4.0f) + x;
+    x              = qf * (-1.2816720341285448015e-12f * 4.0f) + x;
+    const float MP = 1.57079632679489661923f;  // M_PI_2
+    x              = MP - (MP - x);            // crush denormals
+    const float s  = x * x;
+    if ((q & 1) != 0)
+        x = -x;
+    float su = 2.6083159809786593541503e-06f;
+    su       = su * s + -0.0001981069071916863322258f;
+    su       = su * s + 0.00833307858556509017944336f;
+    su       = su * s + -0.166666597127914428710938f;
+    su       = s * (su * x) + x;
+    float cu = -2.71811842367242206819355e-07f;
+    cu       = cu * s + 2.47990446951007470488548e-05f;
+    cu       = cu * s + -0.00138888787478208541870117f;
+    cu       = cu * s + 0.0416666641831398010253906f;
+    cu       = cu * s + -0.5f;
+    cu       = cu * s + 1.0f;
+    if ((q & 1) != 0)
+        cu = -cu;
+    sine   = su < -1.0f ? -1.0f : (su > 1.0f ? 1.0f : su);
+    cosine = cu < -1.0f ? -1.0f : (cu > 1.0f ? 1.0f : cu);
+}
+
+/// fmath.h:1775 -- fast_atan2(float, float), scalar variant (the build does not
+/// define OIIO_FMATH_SIMD_FRIENDLY, which is what selects the argument-swap
+/// branch of the reduction; the two differ in the last bit of the ratio).
+///
+/// The CPU's Background::eval maps every escaped ray to the importance table
+/// through this function.  A libm atan2f differs from it in the last bits, and
+/// `u * res` then moves the texel index across a table boundary for a small
+/// fraction of lookups, which swaps one environment radiance for a different
+/// one -- the "fireflies relocate" effect the reference scene's header warns
+/// about.  Same polynomial, same operations, same order.
+inline float mf_fast_atan2(float y, float x)
+{
+#pragma clang fp contract(off)
+    const float a               = __builtin_fabsf(x);
+    const float b               = __builtin_fabsf(y);
+    const bool b_is_gt_a        = b > a;
+    const float k  = (b == 0.0f) ? 0.0f
+                     : ((a == b) ? 1.0f : (b_is_gt_a ? a / b : b / a));
+    const float s  = 1.0f - (1.0f - k);  // crush denormals
+    const float t  = s * s;
+    const float t1 = 0.430165678f * t + 1.0f;
+    const float t2 = (0.0579354987f * t + 0.763007998f) * t + 1.0f;
+    float r        = s * t1 / t2;
+    if (b_is_gt_a)
+        r = 1.570796326794896557998982f - r;  // account for arg reduction
+    if (mf_bitcast_u32(x) & 0x80000000u)      // test the sign bit of x
+        r = 3.14159265358979323846f - r;
+    return __builtin_copysignf(r, y);
+}
+
+/// A flattened closure component: the branch weight already folded in (MUL
+/// multiplies it, ADD splits it, a component is a leaf -- the same walk
+/// testrender's process_bsdf_closure does at shading.cpp:1480-1690).
+///
+/// `N`/`U`/`eta`/`xalpha`/`yalpha`/`refract` are the `MicrofacetParams` fields
+/// (`{ ustringhash dist; Vec3 N; Vec3 U; float xalpha; float yalpha;
+/// float eta; int refract; }`, read on demand out of the closure pool), so the
+/// microfacet lobes below take a component directly instead of a converted
+/// copy: the conversion was pure overhead when inlined at every call site.
+struct ClosureEntryVK {
+    int id;
+    Vec3 w;      ///< component weight, MUL folds included
+    Vec3 N;      ///< reflection / refraction plane normal
+    float eta;   ///< reflection / refraction index of refraction
+    Vec3 U;      ///< microfacet tangent
+    float xalpha, yalpha;  ///< microfacet roughness
+    int refract;           ///< microfacet lobe: 0 reflection, 1 transmission
+    long long off;  ///< arena offset of the node, for parameters read on demand
+};
+
+inline float mf_Lambda(const ClosureEntryVK& p, const Vec3& w)
+{
+    float cosTheta2 = w.z * w.z;
+    float cp2       = (w.x * p.xalpha) * (w.x * p.xalpha);
+    float sp2       = (w.y * p.yalpha) * (w.y * p.yalpha);
+    return beckmann_Lambda(cosTheta2 / (cp2 + sp2));
+}
+
+inline float mf_G1(float lv) { return 1.0f / (lv + 1.0f); }
+inline float mf_G2(float li, float lo) { return 1.0f / (li + lo + 1.0f); }
+
+inline float mf_D(const ClosureEntryVK& p, const Vec3& h)
+{
+    float cosThetaM = h.z;
+    if (cosThetaM > 0.0f) {
+        float cp2        = (h.x / p.xalpha) * (h.x / p.xalpha);
+        float sp2        = (h.y / p.yalpha) * (h.y / p.yalpha);
+        float cosThetaM2 = cosThetaM * cosThetaM;
+        float cosThetaM4 = cosThetaM2 * cosThetaM2;
+        float tanThetaM2 = (cp2 + sp2) / cosThetaM2;
+        return beckmann_F(tanThetaM2) / (p.xalpha * p.yalpha * cosThetaM4);
+    }
+    return 0.0f;
+}
+
+inline Vec3 mf_sample_micronormal(const ClosureEntryVK& p, const Vec3& wo,
+                                  float randu, float randv)
+{
+    Vec3 swo = mk(wo.x * p.xalpha, wo.y * p.yalpha, wo.z);
+    swo      = normalize(swo);
+
+    float cos_theta = swo.z > 0.0f ? swo.z : 0.0f;
+    float cos_phi   = 1.0f;
+    float sin_phi   = 0.0f;
+    if (cos_theta < 0.99999f) {
+        float invnorm = 1.0f
+                        / __builtin_sqrtf(swo.x * swo.x + swo.y * swo.y);
+        cos_phi = swo.x * invnorm;
+        sin_phi = swo.y * invnorm;
+    }
+
+    float slope_x, slope_y;
+    beckmann_sample_slope(cos_theta, randu, randv, slope_x, slope_y);
+
+    float rx = cos_phi * slope_x - sin_phi * slope_y;
+    float ry = sin_phi * slope_x + cos_phi * slope_y;
+    rx *= p.xalpha;
+    ry *= p.yalpha;
+
+    float mlen = __builtin_sqrtf(rx * rx + ry * ry + 1.0f);
+    return mk(-rx / mlen, -ry / mlen, 1.0f / mlen);
+}
+
+/// Microfacet::get_albedo (shading.cpp:576).  `refract==2` carries both lobes,
+/// so its albedo is the whole unit; otherwise it is the Fresnel term of the
+/// lobe: reflection gets fr, transmission 1-fr.
+inline float mf_albedo(const ClosureEntryVK& p, const Vec3& wo)
+{
+    if (p.refract == 2)
+        return 1.0f;
+    float fr = fresnel_dielectric_vk(dot(p.N, wo), p.eta);
+    return p.refract ? 1.0f - fr : fr;
+}
+
+/// Microfacet::eval (shading.cpp:585) -- the (weight, pdf) the NEE rays want.
+///
+/// The two lobes share everything except the half-vector and the Fresnel
+/// orientation, and they are mutually exclusive (reflection wants `wil.z > 0`,
+/// transmission `wil.z < 0`), so they are evaluated as one lobe body with the
+/// half-vector and the Fresnel term selected, not as two branches that each
+/// carry their own Beckmann evaluation.  clspv copies a branch body once per
+/// call site, so the duplicated lobes were the bulk of the microfacet kernel.
+inline void mf_eval_vk(const ClosureEntryVK& p, const Vec3& wo, const Vec3& wi,
+                       float& w, float& pdf)
+{
+    w   = 0.0f;
+    pdf = 0.0f;
+    Vec3 u, v, nn;
+    frame_from_nt(p.N, p.U, u, v, nn);
+    Vec3 wol = mk(dot(u, wo), dot(v, wo), dot(nn, wo));
+    Vec3 wil = mk(dot(u, wi), dot(v, wi), dot(nn, wi));
+
+    // Reflection is possible for the mirror lobe and inside the combined one,
+    // transmission for the transmitting lobe and inside the combined one.
+    bool rf = (p.refract != 1) && (wol.z > 0.0f) && (wil.z > 0.0f);
+    bool tr = (p.refract != 0) && (wol.z > 0.0f) && (wil.z < 0.0f);
+    if (!rf && !tr)
+        return;
+
+    // Reflection half-vector, and the refraction one (eq. 16).  `eta < 1`
+    // flips ht so its z stays positive, exactly like the CPU.
+    Vec3 hrefl = normalize(add(wil, wol));
+    Vec3 htraw = sub(mk(0.0f, 0.0f, 0.0f), add(mul(wil, p.eta), wol));
+    if (p.eta < 1.0f)
+        htraw = mul(htraw, -1.0f);
+    Vec3 h = tr ? normalize(htraw) : hrefl;
+
+    float cosHO = dot(h, wol);
+    float cosHI = dot(h, wil);
+    float Fr    = fresnel_dielectric_vk(cosHO, p.eta);
+    float D     = mf_D(p, h);
+    float Lo    = mf_Lambda(p, wol);
+    float Li    = mf_Lambda(p, wil);
+    float G2    = mf_G2(Li, Lo);
+    float G1    = mf_G1(Lo);
+    float out   = G2 / G1;
+    float use   = tr ? (1.0f - Fr) : Fr;
+
+    float invHt2 = 1.0f / dot(htraw, htraw);
+    float pdfr   = (G1 * D * 0.25f) / wol.z;
+    float pdft   = __builtin_fabsf(cosHI * cosHO) * (p.eta * p.eta) * (G1 * D)
+          * invHt2 / wol.z;
+    pdf = tr ? pdft : pdfr;
+    // `refract == 2` carries both lobes and puts the Fresnel split in the pdf,
+    // so the weight is the bare G2/G1; a single lobe keeps it in the weight.
+    w = (p.refract == 2) ? out : out * use;
+    if (p.refract == 2)
+        pdf = pdf * use;
+
+    // Transmission is only a lobe when the refraction half-vector faces out and
+    // there is transmitted energy left (total internal reflection otherwise).
+    if (tr && !(use > 0.0f && h.z > 0.0f)) {
+        w   = 0.0f;
+        pdf = 0.0f;
+    }
+}
+
+/// Microfacet::sample (shading.cpp:652).  `refract==2` picks the lobe with the
+/// third random number, weighted by the Fresnel term, exactly like the CPU.
+/// Both lobes are produced unconditionally and one is selected: a branch here
+/// means two complete Beckmann bodies per call site once clspv inlines.
+inline void mf_sample_vk(const ClosureEntryVK& p, const Vec3& wo, float rx,
+                         float ry, float rz, Vec3& wi, float& w, float& pdf)
+{
+    wi  = mk(0.0f, 0.0f, 0.0f);
+    w   = 0.0f;
+    pdf = 0.0f;
+    Vec3 u, v, nn;
+    frame_from_nt(p.N, p.U, u, v, nn);
+    Vec3 wol    = mk(dot(u, wo), dot(v, wo), dot(nn, wo));
+    float cosNO = wol.z;
+    if (!(cosNO > 0.0f))
+        return;
+
+    Vec3 m      = mf_sample_micronormal(p, wol, rx, ry);
+    float cosMO = dot(m, wol);
+    float F     = fresnel_dielectric_vk(cosMO, p.eta);
+
+    bool rf = (p.refract == 0) || (p.refract == 2 && rz < F);
+
+    // Reflection direction and refraction direction, both from the same
+    // micronormal; the CPU picks one and only the weight/pdf differ afterwards.
+    Vec3 wilr     = sub(mul(m, 2.0f * cosMO), wol);
+    Vec3 M        = add(add(mul(u, m.x), mul(v, m.y)), mul(nn, m.z));
+    Vec3 wdir;
+    float Ft      = fresnel_refraction_vk(mul(wo, -1.0f), M, p.eta, wdir);
+    Vec3 wilt     = mk(dot(u, wdir), dot(v, wdir), dot(nn, wdir));
+
+    Vec3 wil  = rf ? wilr : wilt;
+    wi        = rf ? add(add(mul(u, wil.x), mul(v, wil.y)), mul(nn, wil.z))
+                   : wdir;
+    float cosHO = cosMO;
+    float cosHI = dot(m, wil);
+
+    float D   = mf_D(p, m);
+    float Lo  = mf_Lambda(p, wol);
+    float Li  = mf_Lambda(p, wil);
+    float G2  = mf_G2(Li, Lo);
+    float G1  = mf_G1(Lo);
+    float out = G2 / G1;
+
+    Vec3 ht      = sub(mk(0.0f, 0.0f, 0.0f), add(mul(wil, p.eta), wol));
+    float invHt2 = 1.0f / dot(ht, ht);
+    float pdfr   = (G1 * D * 0.25f) / cosNO;
+    float pdft   = __builtin_fabsf(cosHI * cosHO) * (p.eta * p.eta) * (G1 * D)
+          * invHt2 / __builtin_fabsf(wol.z);
+    pdf = rf ? pdfr : pdft;
+    float fru = rf ? F : Ft;
+    if (p.refract == 2) {
+        pdf = pdf * fru;
+        w   = out;
+    } else {
+        w = fru * out;
     }
 }
 
@@ -869,6 +1416,11 @@ inline float shape_pdf(const SceneView& s, int primID, const Vec3& x,
 static const int EMISSION_ID_VK   = 1;
 static const int BACKGROUND_ID_VK = 2;
 static const int DIFFUSE_ID_VK    = 3;
+/// `microfacet(dist, N, U, xalpha, yalpha, eta, refract)` is testrender's
+/// Masking-Shadowing-Microfacet closure.  `refract` selects the lobe: 0 is the
+/// reflection lobe, 1 the transmission lobe, 2 both.  glass is the pair
+/// (refract=1, refract=0), which is why two components have to be kept.
+static const int MICROFACET_ID_VK = 8;
 /// `ward(N, T, ax, ay)` is an anisotropic *glossy* closure: unlike diffuse its
 /// weight is angle dependent, so it cannot be folded into a constant albedo --
 /// NEE has to evaluate the real BRDF toward the light and the BSDF sample has to
@@ -884,6 +1436,29 @@ static const int FRESNEL_REFLECTION_ID_VK = 10;
 /// the mirrors these are delta closures -- one outgoing direction, infinite pdf.
 static const int REFRACTION_ID_VK  = 11;
 static const int TRANSPARENT_ID_VK = 12;
+
+// ---- compile-time closure sets ---------------------------------------------
+//
+// Which closure *families* a group's shader can produce.  This is the one
+// dimension that lets a lane shed code: `e.id` is a runtime load out of the
+// closure pool, so a plain `if (e.id == WARD_ID_VK)` keeps the Ward lobe, the
+// cosine sampler and the Fresnel path in every kernel.  The device runtime is
+// also force-inlined before clspv (`vulkan_module.cpp` marks every non-kernel
+// function `alwaysinline`, because clspv can only attribute a storage-buffer
+// pointer while the chain from the kernel argument is still visible), so each
+// of those paths is copied once per material kernel and once per call site --
+// which is what pushed the microfacet scene past what the driver will build.
+//
+// A group's set is read off the `closure_component(sg, id, ...)` calls in its
+// IR, so a kernel carries only the families its shader can actually emit.
+// `CS_ALL` is the fallback: a set that is not one of the instantiations below
+// gets the full body, correct but not slimmed.
+static const unsigned CS_BG    = osl_vk_abi::kClosureSetBG;
+static const unsigned CS_DIFF  = osl_vk_abi::kClosureSetDiff;
+static const unsigned CS_WARD  = osl_vk_abi::kClosureSetWard;
+static const unsigned CS_MF    = osl_vk_abi::kClosureSetMF;
+static const unsigned CS_DELTA = osl_vk_abi::kClosureSetDelta;
+static const unsigned CS_ALL   = osl_vk_abi::kClosureSetAll;
 
 /// testrender/optics.h:13, verbatim.  TIR returns 1, eta == 0 means "no Fresnel".
 inline float fresnel_dielectric_vk(float cosi, float eta)
@@ -908,11 +1483,12 @@ struct ClosureComponentVK {
     Vec3 w;
 };
 
-/// Root component of a closure, or null when the shader produced none.
+/// Root component of a closure.  The device module never produces a null
+/// closure pointer (vulkan_shadeops.cpp: a black weight allocates a zero-weight
+/// component), which is what lets the null tests be folded away -- a pointer
+/// comparison would need `CapabilityVariablePointers`.
 inline const ClosureComponentVK* closure_root(const void* ci)
 {
-    if (!ci)
-        return (const ClosureComponentVK*)0;
     return (const ClosureComponentVK*)ci;
 }
 
@@ -932,16 +1508,45 @@ struct ClosureAddVK {
 static const long long kOffPoolClosure = 320;
 
 
-/// A flattened closure component: the branch weight already folded in (MUL
-/// multiplies it, ADD splits it, a component is a leaf -- the same walk
-/// testrender's process_bsdf_closure does at shading.cpp:1480-1690).
-struct ClosureEntryVK {
-    int id;
-    Vec3 w;      ///< component weight, MUL folds included
-    Vec3 N;      ///< reflection / refraction plane normal
-    float eta;   ///< reflection / refraction index of refraction
-    long long off;  ///< arena offset of the node, for parameters read on demand
-};
+/// Fill one flattened component from its pool node.
+///
+/// Split out of `collect_closure_entries` so the two slots can be written by
+/// straight-line calls: `(n == 0) ? first : second` is a `select` between two
+/// distinct objects, and clspv turns that into an `OpSelect` on a Function
+/// pointer -- the same `CapabilityVariablePointers` leak the two-slot stack
+/// below avoids, and the Intel driver aborts on it when the module is handed
+/// to `vkCreateComputePipelines`.
+inline __attribute__((always_inline)) void
+fill_closure_entry (ClosureEntryVK& e, int id, long long off, const Vec3& w,
+                    VK_GLOBAL const unsigned char* node)
+{
+    e.id  = id;
+    e.off = off;
+    e.w   = w;
+    e.N   = mk (0.0f, 0.0f, 0.0f);
+    e.U   = mk (0.0f, 0.0f, 0.0f);
+    e.eta = 0.0f;
+    e.xalpha = 1.0f;
+    e.yalpha = 1.0f;
+    e.refract = 0;
+    if (id == FRESNEL_REFLECTION_ID_VK || id == REFRACTION_ID_VK) {
+        // ReflectionParams / RefractionParams { Vec3 N; float eta }
+        e.N   = load_vec ((GlobalCVec3)(node + 16));
+        e.eta = *(VK_GLOBAL const float*)(node + 28);
+    } else if (id == MICROFACET_ID_VK) {
+        // MicrofacetParams { ustringhash dist; Vec3 N; Vec3 U; float xalpha;
+        // float yalpha; float eta; int refract; }: dist is a 64-bit hash, so N
+        // starts at +24.
+        e.N       = load_vec ((GlobalCVec3)(node + 24));
+        e.U       = load_vec ((GlobalCVec3)(node + 36));
+        e.xalpha  = *(VK_GLOBAL const float*)(node + 48);
+        e.yalpha  = *(VK_GLOBAL const float*)(node + 52);
+        e.eta     = *(VK_GLOBAL const float*)(node + 56);
+        e.refract = *(VK_GLOBAL const int*)(node + 60);
+    } else if (id == REFLECTION_ID_VK) {
+        e.N = load_vec ((GlobalCVec3)(node + 16));
+    }
+}
 
 
 /// Flatten `Ci` into at most two components.
@@ -949,11 +1554,18 @@ struct ClosureEntryVK {
 /// Two is enough for the closures a render-* material produces: matte and Ward
 /// are a single component, and glass is exactly
 /// `reflection(N, eta) + refraction(N, eta)`.  A larger tree is truncated to
-/// the first two, which dims a path rather than corrupting it.  Deliberately
-/// not an array: a local array is an `alloca`, and the legalizer rewrites every
-/// alloca in the device runtime into `osl_vk_arena_alloc(<enclosing function's
-/// first argument>, ...)` -- inside the frame kernel that pointer is the
-/// ShadeBlock itself, so the allocation would land in the closure pool.
+/// the first two, which dims a path rather than corrupting it.
+///
+/// The pending work is two scalars, *not* a local array.  An indexed array of
+/// `Vec3` leaves the device runtime with a `getelementptr` whose index is
+/// dynamic, and clspv lowers that to `OpPtrAccessChain` on a Function pointer:
+/// plain float-pointer arithmetic in private memory, which is only legal with
+/// `CapabilityVariablePointers`.  That capability in turn makes Intel's
+/// compiler abort inside `vkCreateComputePipelines` (0xC0000005) for any
+/// module that carries it, however small -- verified with a probe that creates
+/// a pipeline for a single 140k-word kernel.  Two slots are enough because the
+/// walk stops the moment it has both components, so it can never need a third
+/// pending node.
 inline __attribute__((always_inline)) int
 collect_closure_entries (VK_GLOBAL ShaderGlobals* sg, long long root,
                          ClosureEntryVK& first, ClosureEntryVK& second)
@@ -961,8 +1573,8 @@ collect_closure_entries (VK_GLOBAL ShaderGlobals* sg, long long root,
     if (root < 0)
         return 0;
 
-    long long stack_off[8];
-    Vec3 stack_w[8];
+    long long off0 = 0, off1 = 0;
+    Vec3 w0, w1;
     int sp        = 0;
     long long cur = root;
     Vec3 branch   = mk (1.0f, 1.0f, 1.0f);
@@ -973,11 +1585,15 @@ collect_closure_entries (VK_GLOBAL ShaderGlobals* sg, long long root,
             GlobalCPtr node = (GlobalCPtr)sg + kOffPoolClosure + cur;
             const int id    = *(VK_GLOBAL const int*)node;
             if (id == -2) {  // ADD
-                if (sp < 8) {
-                    stack_off[sp] = *(VK_GLOBAL const long long*)(node + 16);
-                    stack_w[sp]   = branch;
-                    ++sp;
+                if (sp == 0) {
+                    off0 = *(VK_GLOBAL const long long*)(node + 16);
+                    w0   = branch;
+                } else if (sp == 1) {
+                    off1 = *(VK_GLOBAL const long long*)(node + 16);
+                    w1   = branch;
                 }
+                if (sp < 2)
+                    ++sp;
                 cur = *(VK_GLOBAL const long long*)(node + 8);
                 continue;
             }
@@ -986,30 +1602,30 @@ collect_closure_entries (VK_GLOBAL ShaderGlobals* sg, long long root,
                 cur    = *(VK_GLOBAL const long long*)(node + 16);
                 continue;
             }
-            if (n < 2) {
-                ClosureEntryVK& e = (n == 0) ? first : second;
-                e.id              = id;
-                e.off             = cur;
-                e.w = mulv (branch, load_vec ((GlobalCVec3)(node + 4)));
-                e.N   = mk (0.0f, 0.0f, 0.0f);
-                e.eta = 0.0f;
-                if (id == FRESNEL_REFLECTION_ID_VK
-                    || id == REFRACTION_ID_VK) {
-                    // ReflectionParams / RefractionParams { Vec3 N; float eta }
-                    e.N   = load_vec ((GlobalCVec3)(node + 16));
-                    e.eta = *(VK_GLOBAL const float*)(node + 28);
-                } else if (id == REFLECTION_ID_VK) {
-                    e.N = load_vec ((GlobalCVec3)(node + 16));
-                }
-                ++n;
+            const Vec3 bw = mulv (branch, load_vec ((GlobalCVec3)(node + 4)));
+            if (n == 0) {
+                fill_closure_entry (first, id, cur, bw, node);
+            } else {
+                fill_closure_entry (second, id, cur, bw, node);
             }
+            ++n;
+            // Both slots are filled: nothing the rest of the tree holds can
+            // change the answer, and not walking it keeps the pending depth at
+            // two.
+            if (n == 2)
+                break;
             cur = -1;
         }
         if (sp == 0)
             break;
         --sp;
-        cur    = stack_off[sp];
-        branch = stack_w[sp];
+        if (sp == 0) {
+            cur    = off0;
+            branch = w0;
+        } else {
+            cur    = off1;
+            branch = w1;
+        }
     }
     return n;
 }
@@ -1027,23 +1643,178 @@ inline bool closure_entry_is_delta (const ClosureEntryVK& e)
 
 /// `get_albedo(wo)` for one component (shading.cpp:1083-1118 and :1114-1118):
 /// mirror carries the Fresnel term, refraction the complement, a matte
-/// component its own weight.
+/// component its own weight, a microfacet lobe its Fresnel-weighted albedo.
+/// `CS` is the kernel's compile-time closure set: a family the material cannot
+/// produce is not emitted at all.
+template <unsigned CS>
 inline Vec3 closure_entry_albedo (const ClosureEntryVK& e, const Vec3& wo)
 {
-    if (e.id == REFLECTION_ID_VK || e.id == FRESNEL_REFLECTION_ID_VK) {
-        float cosNO = dot (e.N, wo);
-        if (cosNO > 0.0f) {
-            float F = fresnel_dielectric_vk (cosNO, e.eta);
+    if constexpr (CS & CS_DELTA) {
+        if (e.id == REFLECTION_ID_VK || e.id == FRESNEL_REFLECTION_ID_VK) {
+            float cosNO = dot (e.N, wo);
+            if (cosNO > 0.0f) {
+                float F = fresnel_dielectric_vk (cosNO, e.eta);
+                return mk (e.w.x * F, e.w.y * F, e.w.z * F);
+            }
+            return e.w;  // shading.cpp:1088 returns Color3(1) times the weight
+        }
+        if (e.id == REFRACTION_ID_VK) {
+            float cosNO = dot (e.N, wo);
+            float F     = 1.0f - fresnel_dielectric_vk (cosNO, e.eta);
             return mk (e.w.x * F, e.w.y * F, e.w.z * F);
         }
-        return e.w;  // shading.cpp:1088 returns Color3(1) times the weight
     }
-    if (e.id == REFRACTION_ID_VK) {
-        float cosNO = dot (e.N, wo);
-        float F     = 1.0f - fresnel_dielectric_vk (cosNO, e.eta);
-        return mk (e.w.x * F, e.w.y * F, e.w.z * F);
+    if constexpr (CS & CS_MF) {
+        if (e.id == MICROFACET_ID_VK) {
+            float a = mf_albedo (e, wo);
+            return mk (e.w.x * a, e.w.y * a, e.w.z * a);
+        }
     }
     return e.w;
+}
+
+
+/// `MIS::update_eval` (sampling.h:173) over device types: folds a component's
+/// (weight, pdf) into the running sum of a BSDF mixture with the balance
+/// heuristic.  Used to mix a sampled lobe with the others' evaluation.
+inline void mis_update_eval_vk (Vec3& w, float& pdf, Vec3 ow, float opdf,
+                                float b)
+{
+    if (b > 1.17549435e-38f) {  // FLT_MIN; 1/b must stay finite
+        opdf *= b;
+        ow = mul (ow, 1.0f / b);
+        float mis;
+        if (pdf < opdf)
+            mis = 1.0f / (1.0f + pdf / opdf);
+        else if (opdf < pdf)
+            mis = 1.0f - 1.0f / (1.0f + opdf / pdf);
+        else
+            mis = 0.5f;  // avoid inf/inf
+        w = add (mul (w, 1.0f - mis), mul (ow, mis));
+        pdf += opdf;
+    }
+}
+
+
+/// One component's `eval(wo, wi)` -- weight already multiplied by the
+/// component's branch weight, plus its solid-angle pdf.  `n` is the shading
+/// normal the diffuse lobe is defined on (testrender's DiffuseParams.N stores
+/// the same vector the shader wrote).  `CS` gates the families at compile time.
+template <unsigned CS>
+inline Vec3 component_eval (const ClosureEntryVK& e, const WardVK& wardp,
+                            const Vec3& wov, const Vec3& wi, const Vec3& n,
+                            float& pdf)
+{
+    pdf = 0.0f;
+    if constexpr (CS & CS_DIFF) {
+        if (e.id == DIFFUSE_ID_VK) {
+            float NL = dot (n, wi);
+            pdf      = (NL > 0.0f ? NL : 0.0f) * 0.31830988618f;  // 1/pi
+            return e.w;
+        }
+    }
+    if constexpr (CS & CS_WARD) {
+        if (e.id == WARD_ID_VK) {
+            Vec3 wv;
+            float p = 0.0f;
+            ward_eval_vk (wardp, wov, wi, wv, p);
+            pdf = p;
+            return mulv (e.w, wv);
+        }
+    }
+    if constexpr (CS & CS_MF) {
+        if (e.id == MICROFACET_ID_VK) {
+            float lw = 0.0f;
+            mf_eval_vk (e, wov, wi, lw, pdf);
+            return mul (e.w, lw);
+        }
+    }
+    return mk (0.0f, 0.0f, 0.0f);
+}
+
+
+/// `CompositeBSDF::eval`: the sum over a BSDF's components of their (weight,
+/// pdf) toward `wi`, skipping emitters.
+///
+/// The two slots are two straight-line evaluations rather than a loop over a
+/// local array.  Both are needed by clspv: a loop whose body indexes a local
+/// array makes clspv diverge on the microfacet kernel (it never returns, at any
+/// -O level), and `(k == 0) ? e0 : e1` on the entries is a `select` between two
+/// distinct objects, which clspv lowers to an OpSelect on a Function pointer --
+/// pointer arithmetic, i.e. CapabilityVariablePointers, which Intel's compiler
+/// aborts on at pipeline creation.  Two call sites with constant slot indices
+/// have neither shape; the cost is a second copy of `component_eval` in the
+/// kernel, which the size measurements have room for.
+///
+/// Skipping emitters is implicit: `component_eval` only answers for a
+/// DIFFUSE/WARD/MICROFACET component and reports pdf 0 otherwise, which is what
+/// the old `continue` did.
+template <unsigned CS>
+inline void components_eval_sum (const ClosureEntryVK& e0,
+                                 const ClosureEntryVK& e1, int ncomp,
+                                 const WardVK& wardp, const Vec3& wov,
+                                 const Vec3& wi, const Vec3& n, float b0,
+                                 float b1, Vec3& w, float& pdf)
+{
+    float p0 = 0.0f, p1 = 0.0f;
+    Vec3 w0 = mk (0.0f, 0.0f, 0.0f), w1 = mk (0.0f, 0.0f, 0.0f);
+    if (ncomp > 0)
+        w0 = component_eval<CS> (e0, wardp, wov, wi, n, p0);
+    if (ncomp > 1)
+        w1 = component_eval<CS> (e1, wardp, wov, wi, n, p1);
+    // Not a plain sum: CompositeBSDF::eval (shading.h:364-374) folds each
+    // lobe in with MIS::update_eval, using the lobe's own pick probability
+    // `b` = pdfs[i] from prepare().  With more than one lobe that is what
+    // turns `weight` into the mixture's f/pdf-normalised quantity and what
+    // scales the pdf by the pick probability, so the MIS weight the caller
+    // computes from it only lines up with the CPU when this matches.
+    w   = mk (0.0f, 0.0f, 0.0f);
+    pdf = 0.0f;
+    if (ncomp > 0)
+        mis_update_eval_vk (w, pdf, w0, p0, b0);
+    if (ncomp > 1)
+        mis_update_eval_vk (w, pdf, w1, p1, b1);
+}
+
+
+/// The NEE evaluation of the whole BSDF toward `wi`: the compile-time set
+/// decides which family is consulted, and the runtime flags only pick between
+/// the families the set actually contains.  `ar/ag/ab` is the accumulated
+/// albedo, which is what the Lambert lobe evaluates to.
+template <unsigned CS>
+inline void nee_eval_vk (const ClosureEntryVK& ce0, const ClosureEntryVK& ce1,
+                         int ncomp, int has_microfacet, int is_ward,
+                         const WardVK& wardp, const Vec3& wov, const Vec3& wi,
+                         const Vec3& n, float ar, float ag, float ab, float b0,
+                         float b1, Vec3& w, float& pdf)
+{
+    if constexpr (CS & CS_MF) {
+        if (has_microfacet) {
+            components_eval_sum<CS> (ce0, ce1, ncomp, wardp, wov, wi, n, b0,
+                                     b1, w, pdf);
+            return;
+        }
+    }
+    if constexpr (CS & CS_WARD) {
+        if (is_ward) {
+            Vec3 wv;
+            float p = 0.0f;
+            ward_eval_vk (wardp, wov, wi, wv, p);
+            pdf = p;
+            w   = mulv (mk (ar, ag, ab), wv);
+            return;
+        }
+    }
+    if constexpr (CS & CS_DIFF) {
+        // Diffuse: Diffuse<trans>::eval (shading.cpp:305) returns
+        // weight = Color3(1) and pdf = max(N.wi, 0)/pi.
+        const float NLd = dot (n, wi);
+        pdf = (NLd > 0.0f ? NLd : 0.0f) * 0.31830988618f;
+        w   = mk (ar, ag, ab);
+        return;
+    }
+    w   = mk (0.0f, 0.0f, 0.0f);
+    pdf = 0.0f;
 }
 
 
@@ -1166,10 +1937,9 @@ inline Vec3 background_table_eval(VK_GLOBAL const FrameParams* p,
     VK_GLOBAL const float* cols
         = (VK_GLOBAL const float*)(base + p->bg_cols_offset);
 
-    // 1/(2*pi); the CPU goes through OIIO::fast_atan2, the device through the
-    // libm entry point -- they differ in the last bits, which matters only for
-    // a direction that lands exactly on a texel boundary.
-    float u = __builtin_atan2f(dir.y, dir.x) * 0.15915494309189535f;
+    // 1/(2*pi); through OIIO::fast_atan2 (fmath.h:1775) so the texel index
+    // matches the CPU's for bit-identical directions.
+    float u = mf_fast_atan2(dir.y, dir.x) * 0.15915494309189535f;
     if (u < 0.0f)
         u += 1.0f;
     float v = (1.0f - dir.z) * 0.5f;
@@ -1276,8 +2046,9 @@ inline Vec3 background_sample(VK_GLOBAL const FrameParams* p,
     const float cos_phi  = 1.0f - 2.0f * v;
     const float sin_phi2 = 1.0f - cos_phi * cos_phi;
     const float sin_phi  = sin_phi2 > 0.0f ? __builtin_sqrtf(sin_phi2) : 0.0f;
-    dir = mk(sin_phi * __builtin_cosf(theta), sin_phi * __builtin_sinf(theta),
-             cos_phi);
+    float st = 0.0f, ct = 1.0f;
+    mf_fast_sincos(theta, st, ct);
+    dir = mk(sin_phi * ct, sin_phi * st, cos_phi);
 
     const float pd = row_pdf * col_pdf * p->bg_invjacobian;
     pdf            = pd > 0.0f ? pd : 0.0f;
@@ -1307,7 +2078,13 @@ inline void fill_globals(VK_GLOBAL ShaderGlobals* sg, const SceneView& s,
     const Vec3 vc      = load_vec(&s.verts[ti.c]);
 
     const float w0 = 1.0f - hit.u - hit.v;
-    Vec3 P         = add(add(mul(va, w0), mul(vb, hit.u)), mul(vc, hit.v));
+    // `origin + direction*t`, the CPU's form (raytracer.h:75, `Ray::point`,
+    // used by globals_from_hit in simpleraytracer.cpp).  Not the barycentric
+    // recurrence: the CPU hands this point to the shader and starts every NEE
+    // shadow ray from it, and a shadow ray that grazes the sphere it left is
+    // decided by exactly these last bits, so the two tracers have to build the
+    // point the same way or the glass silhouettes disagree at ulp level.
+    Vec3 P         = add(r.origin, mul(r.direction, hit.t));
     // Same cross product as the CPU, in the same operand order
     // (raytracer.h:270: (va-vb) x (va-vc)).  The equivalent form,
     // (vb-va) x (vc-va), is not bit-identical: its z component comes out as
@@ -1745,30 +2522,34 @@ extern "C" void osl_vk_wave_intersect(GlobalPtr base)
 
 // ---- pass 3: shading -------------------------------------------------------
 
-extern "C" void osl_vk_wave_shade(GlobalPtr base)
+/// `MAT` selects the material's shader code, `CS` the closure families it can
+/// produce.  Everything below that is gated on a closure id is either
+/// `if constexpr (CS & ...)` or a runtime flag that is only ever set inside
+/// such a block, so a family the material cannot emit costs no code.
+template <int MAT, unsigned CS>
+void wave_shade_body(GlobalPtr base, unsigned pix)
 {
+    constexpr bool HAS_MF   = (CS & CS_MF) != 0;
+    constexpr bool HAS_WARD = (CS & CS_WARD) != 0;
+    constexpr bool HAS_DIFF = (CS & CS_DIFF) != 0;
+    constexpr bool HAS_DLTA = (CS & CS_DELTA) != 0;
+
     VK_GLOBAL const FrameParams* p
         = (VK_GLOBAL const FrameParams*)(base + kFrameParamsOffset);
 
-    const unsigned long long gid = get_global_id(0);
-    const unsigned long long npix
-        = (unsigned long long)p->width * (unsigned long long)p->height;
-    if (gid >= npix)
-        return;
-
     WaveRay r;
-    wave_ray_load(p, base, gid, r);
+    wave_ray_load(p, base, pix, r);
 
     float h_t, h_u, h_v;
     int h_id, h_ok;
-    wave_hit_load(p, base, gid, h_t, h_u, h_v, h_id, h_ok);
+    wave_hit_load(p, base, pix, h_t, h_u, h_v, h_id, h_ok);
 
     SceneView scene;
-    WAVE_SCENE_SETUP(scene, gid)
+    WAVE_SCENE_SETUP(scene, pix)
 
     GlobalInt tri_shader = (GlobalInt)(base + p->tri_shader_offset);
     GlobalPtr arena      = (GlobalPtr)(base + p->arena_offset)
-                           + gid * (unsigned long long)p->arena_stride;
+                           + pix * (unsigned long long)p->arena_stride;
     VK_GLOBAL ShaderGlobals* sg = (VK_GLOBAL ShaderGlobals*)arena;
 
     // Two facts the device runtime cannot derive from `sg` alone: where this
@@ -1776,7 +2557,7 @@ extern "C" void osl_vk_wave_shade(GlobalPtr base)
     // table lives.  They ride in the first 16 bytes of the closure pool, which
     // the allocator never hands out (it starts at offset 16).
     const long long sg_abs = (long long)(p->arena_offset
-                                         + gid * (unsigned long long)p->arena_stride);
+                                         + pix * (unsigned long long)p->arena_stride);
     *(GlobalI64)((GlobalPtr)sg + kOffPool)     = sg_abs;
     *(GlobalI64)((GlobalPtr)sg + kOffPool + 8) = kTexTableOffsetVK;
 
@@ -1789,39 +2570,39 @@ extern "C" void osl_vk_wave_shade(GlobalPtr base)
     // the buffer and the intersection pass traced them.  Adding them here, at
     // the top of the next wave, is the same arithmetic the megakernel did in
     // place -- only the point in the wave at which it lands has moved.
-    const int pending = wf_icp(base, p->wf_nee_pending)[gid];
+    const int pending = wf_icp(base, p->wf_nee_pending)[pix];
     if (pending) {
-        if ((pending & 1) && wf_icp(base, p->wf_vis_bg)[gid]) {
-            out[gid * 4 + 0] += wf_fcp(base, p->wf_bgc_r)[gid] * inv;
-            out[gid * 4 + 1] += wf_fcp(base, p->wf_bgc_g)[gid] * inv;
-            out[gid * 4 + 2] += wf_fcp(base, p->wf_bgc_b)[gid] * inv;
+        if ((pending & 1) && wf_icp(base, p->wf_vis_bg)[pix]) {
+            out[pix * 4 + 0] += wf_fcp(base, p->wf_bgc_r)[pix] * inv;
+            out[pix * 4 + 1] += wf_fcp(base, p->wf_bgc_g)[pix] * inv;
+            out[pix * 4 + 2] += wf_fcp(base, p->wf_bgc_b)[pix] * inv;
         }
-        if ((pending & 2) && wf_icp(base, p->wf_vis_l)[gid]) {
+        if ((pending & 2) && wf_icp(base, p->wf_vis_l)[pix]) {
             // Nothing between the surface and the light: shade the point on the
             // light and multiply in its emission, as the megakernel did inline.
-            const int lid           = wf_icp(base, p->wf_l_lid)[gid];
+            const int lid           = wf_icp(base, p->wf_l_lid)[pix];
             const int lightShaderID = tri_shader[lid];
             if (lightShaderID >= 0) {
                 Ray sray;
                 sray.origin
-                    = mk(wf_fcp(base, p->wf_p_x)[gid],
-                         wf_fcp(base, p->wf_p_y)[gid],
-                         wf_fcp(base, p->wf_p_z)[gid]);
-                sray.direction = mk(wf_fcp(base, p->wf_ldir_x)[gid],
-                                    wf_fcp(base, p->wf_ldir_y)[gid],
-                                    wf_fcp(base, p->wf_ldir_z)[gid]);
+                    = mk(wf_fcp(base, p->wf_p_x)[pix],
+                         wf_fcp(base, p->wf_p_y)[pix],
+                         wf_fcp(base, p->wf_p_z)[pix]);
+                sray.direction = mk(wf_fcp(base, p->wf_ldir_x)[pix],
+                                    wf_fcp(base, p->wf_ldir_y)[pix],
+                                    wf_fcp(base, p->wf_ldir_z)[pix]);
                 sray.radius    = 0.0f;
                 sray.spread    = 0.0f;
                 Hit lhit;
                 lhit.id = lid;
-                lhit.u  = wf_fcp(base, p->wf_l_u)[gid];
-                lhit.v  = wf_fcp(base, p->wf_l_v)[gid];
-                lhit.t  = wf_fcp(base, p->wf_l_tmax)[gid];
+                lhit.u  = wf_fcp(base, p->wf_l_u)[pix];
+                lhit.v  = wf_fcp(base, p->wf_l_v)[pix];
+                lhit.t  = wf_fcp(base, p->wf_l_tmax)[pix];
                 fill_globals(sg, scene, p, sray, lhit,
                              (VK_GLOBAL const unsigned char*)base);
                 *(GlobalI64)((GlobalPtr)sg + kOffRenderstate) = 16;
                 *(GlobalI64)((GlobalPtr)sg + kOffCi)          = -1;
-                osl_vk_shade_dispatch((GlobalPtr)sg, lightShaderID);
+                wave_shade_dispatch<MAT>((GlobalPtr)sg, lightShaderID);
                 long long lci = *(GlobalI64)((GlobalPtr)sg + kOffCi);
                 if (lci >= 0) {
                     const VK_GLOBAL ClosureComponentVK* lcomp
@@ -1832,12 +2613,12 @@ extern "C" void osl_vk_wave_shade(GlobalPtr base)
                         // Scalar loads: a Vec3 lvalue living in AS1 cannot bind
                         // to a reference.
                         Vec3 lw = mk(lcomp->w.x, lcomp->w.y, lcomp->w.z);
-                        out[gid * 4 + 0]
-                            += wf_fcp(base, p->wf_lc_r)[gid] * lw.x * inv;
-                        out[gid * 4 + 1]
-                            += wf_fcp(base, p->wf_lc_g)[gid] * lw.y * inv;
-                        out[gid * 4 + 2]
-                            += wf_fcp(base, p->wf_lc_b)[gid] * lw.z * inv;
+                        out[pix * 4 + 0]
+                            += wf_fcp(base, p->wf_lc_r)[pix] * lw.x * inv;
+                        out[pix * 4 + 1]
+                            += wf_fcp(base, p->wf_lc_g)[pix] * lw.y * inv;
+                        out[pix * 4 + 2]
+                            += wf_fcp(base, p->wf_lc_b)[pix] * lw.z * inv;
                     }
                 }
                 // The light shading overwrote the block the surface's closure
@@ -1846,7 +2627,7 @@ extern "C" void osl_vk_wave_shade(GlobalPtr base)
             }
         }
         // Consumed.  The next wave publishes a fresh pair.
-        wf_ip(base, p->wf_nee_pending)[gid] = 0;
+        wf_ip(base, p->wf_nee_pending)[pix] = 0;
     }
 
     if (!r.active)
@@ -1905,7 +2686,7 @@ extern "C" void osl_vk_wave_shade(GlobalPtr base)
             sg->raytype                                   = (b > 0) ? 16 : 1;
             *(GlobalI64)((GlobalPtr)sg + kOffRenderstate) = 16;
             *(GlobalI64)((GlobalPtr)sg + kOffCi)          = -1;
-            osl_vk_shade_dispatch((GlobalPtr)sg, p->bg_shader_id);
+            wave_shade_dispatch<MAT>((GlobalPtr)sg, p->bg_shader_id);
             const Vec3 Le
                 = background_closure_color(sg, *(GlobalI64)((GlobalPtr)sg + kOffCi));
             L = add(L, mulv(w, Le));
@@ -1921,7 +2702,7 @@ extern "C" void osl_vk_wave_shade(GlobalPtr base)
             *(GlobalI64)((GlobalPtr)sg + kOffRenderstate) = 16;
             *(GlobalI64)((GlobalPtr)sg + kOffCi)          = -1;
 
-            osl_vk_shade_dispatch((GlobalPtr)sg, shaderID);
+            wave_shade_dispatch<MAT>((GlobalPtr)sg, shaderID);
 
             float er = 0.0f, eg = 0.0f, eb = 0.0f;  // emitted
             float ar = 0.0f, ag = 0.0f, ab = 0.0f;  // albedo / closure weight
@@ -1932,62 +2713,135 @@ extern "C" void osl_vk_wave_shade(GlobalPtr base)
             // one outgoing direction per component, the pdf is infinite, and
             // NEE has nothing to evaluate toward.
             int all_delta = 0;
+            // At least one component is a microfacet lobe: then NEE and the
+            // BSDF sample have to go through component_eval / mf_sample_vk
+            // instead of the Lambert shortcut below.
+            int has_microfacet = 0;
             WardVK wardp;
             long long ci = *(GlobalI64)((GlobalPtr)sg + kOffCi);
             // Flatten ADD/MUL: glass is `Ks*reflection(N,eta) +
             // Cs*refraction(N,eta)`, i.e. two components.
-            ClosureEntryVK ce0, ce1;
-            ce0.id  = -1;
-            ce1.id  = -1;
-            ce0.off = 0;
-            ce1.off = 0;
-            int ncomp   = collect_closure_entries(sg, ci, ce0, ce1);
+            //
+            // The two slots are one array picked by an *index*, not two
+            // variables picked by a `select` on their addresses.  A select
+            // between two locals is an `OpSelect` on a Function pointer once
+            // clspv lowers it (=> `CapabilityVariablePointers`, which Intel's
+            // driver aborts on), and the merged local array this front end used
+            // to build out of that pair instead makes clspv's
+            // SimplifyPointerBitcastPass oscillate between `[2 x
+            // ClosureEntryVK]`, `[16 x i64]` and `[32 x float]` views of the
+            // same storage: it adds one more GEP every round and never
+            // terminates (measured).  Indexing an array clang laid out itself
+            // keeps every access an `OpAccessChain` on the array's own type.
+            ClosureEntryVK ce[2];
+            ce[0].id  = -1;
+            ce[1].id  = -1;
+            ce[0].off = 0;
+            ce[1].off = 0;
+            int ncomp   = collect_closure_entries(sg, ci, ce[0], ce[1]);
             Vec3 alb0   = mk(0.0f, 0.0f, 0.0f);
             Vec3 alb1   = mk(0.0f, 0.0f, 0.0f);
             if (ncomp > 0) {
                 Vec3 wov0 = mul(ray.direction, -1.0f);
                 all_delta = ncomp;
-                for (int k = 0; k < ncomp; ++k) {
-                    const ClosureEntryVK& e = (k == 0) ? ce0 : ce1;
+                // Two constant-slot visits instead of a loop over the pair:
+                // `(k == 0) ? ce0 : ce1` is a `select` between two distinct
+                // objects, which clspv answers with an OpSelect on a Function
+                // pointer (pointer arithmetic, i.e. the capability Intel's
+                // compiler aborts on), and the merged local array it becomes
+                // afterwards is what makes clspv diverge on the microfacet
+                // kernel: a dynamic index into a private array of structs
+                // inside a loop of that size never comes back.
+                auto note_component = [&](const ClosureEntryVK& e,
+                                          Vec3& alb_out) {
                     if (e.id == EMISSION_ID_VK || e.id == BACKGROUND_ID_VK) {
                         er += e.w.x;
                         eg += e.w.y;
                         eb += e.w.z;
                         all_delta = 0;  // an emitter is not a delta BSDF
-                        continue;
+                        return;
                     }
-                    Vec3 alb = closure_entry_albedo(e, wov0);
-                    if (k == 0)
-                        alb0 = alb;
-                    else
-                        alb1 = alb;
+                    Vec3 alb = closure_entry_albedo<CS>(e, wov0);
+                    alb_out  = alb;
                     ar += alb.x;
                     ag += alb.y;
                     ab += alb.z;
-                    if (e.id == WARD_ID_VK) {
-                        // shading.cpp:73 WardParams { Vec3 N; Vec3 T; float ax;
-                        // float ay; } -- 32 bytes right after the 16-byte
-                        // header: N at +16, T at +28, ax at +40, ay at +44.
-                        GlobalCPtr wp = (GlobalCPtr)sg + kOffPoolClosure
-                                        + e.off + 16;
-                        wardp.N  = load_vec((GlobalCVec3)wp);
-                        wardp.T  = load_vec((GlobalCVec3)(wp + 12));
-                        wardp.ax = *(GlobalFloatCPtr)(wp + 24);
-                        wardp.ay = *(GlobalFloatCPtr)(wp + 28);
-                        is_ward   = 1;
-                        all_delta = 0;
-                    } else if (e.id == DIFFUSE_ID_VK) {
-                        all_delta = 0;
-                    } else if (!closure_entry_is_delta(e)) {
+                    if constexpr (HAS_WARD) {
+                        if (e.id == WARD_ID_VK) {
+                            // shading.cpp:73 WardParams { Vec3 N; Vec3 T;
+                            // float ax; float ay; } -- 32 bytes right after the
+                            // 16-byte header: N at +16, T at +28, ax at +40,
+                            // ay at +44.
+                            GlobalCPtr wp = (GlobalCPtr)sg + kOffPoolClosure
+                                            + e.off + 16;
+                            wardp.N  = load_vec((GlobalCVec3)wp);
+                            wardp.T  = load_vec((GlobalCVec3)(wp + 12));
+                            wardp.ax = *(GlobalFloatCPtr)(wp + 24);
+                            wardp.ay = *(GlobalFloatCPtr)(wp + 28);
+                            is_ward   = 1;
+                            all_delta = 0;
+                        }
+                    }
+                    if constexpr (HAS_DIFF) {
+                        if (e.id == DIFFUSE_ID_VK)
+                            all_delta = 0;
+                    }
+                    if constexpr (HAS_MF) {
+                        if (e.id == MICROFACET_ID_VK) {
+                            // A microfacet lobe is glossy, not delta, and it
+                            // needs its own eval/sample path instead of the
+                            // cosine one.
+                            has_microfacet = 1;
+                            all_delta      = 0;
+                        }
+                    }
+                    if constexpr (HAS_DLTA) {
+                        // Anything in this kernel that is not one of the
+                        // families above: only the delta closures are left.
+                        if (e.id != WARD_ID_VK && e.id != DIFFUSE_ID_VK
+                            && e.id != MICROFACET_ID_VK
+                            && !closure_entry_is_delta(e))
+                            all_delta = 0;
+                    } else {
+                        // No delta closure exists in this kernel, so every
+                        // non-emissive component is glossy by construction.
                         all_delta = 0;
                     }
+                };
+                if (ncomp > 0)
+                    note_component (ce[0], alb0);
+                if (ncomp > 1)
+                    note_component (ce[1], alb1);
+                if constexpr (HAS_DLTA) {
+                    if (ncomp == 1
+                        && (ce[0].id == REFLECTION_ID_VK
+                            || ce[0].id == FRESNEL_REFLECTION_ID_VK))
+                        is_mirror = 1;
                 }
-                if (ncomp == 1
-                    && (ce0.id == REFLECTION_ID_VK
-                        || ce0.id == FRESNEL_REFLECTION_ID_VK))
-                    is_mirror = 1;
                 if (all_delta > 0)
                     all_delta = 1;
+            }
+
+            // CompositeBSDF::prepare's lobe pick probabilities
+            // (shading.h:322-354): pdfs[i] = weights[i] . (path_weight *
+            // albedo_i) / sum(path_weight), normalised by their total the way
+            // prepare() does.  The NEE evaluation of a multi-lobe mixture needs
+            // them: CompositeBSDF::eval folds each lobe in with
+            // MIS::update_eval using its own pick probability, so a plain sum
+            // of the lobes gives a different (weight, pdf) pair -- visible as a
+            // systematic energy difference on glossy two-lobe materials.
+            float pk0 = 0.0f, pk1 = 0.0f;
+            {
+                const float msum = w.x + w.y + w.z;
+                if (msum > 0.0f && ncomp > 0) {
+                    pk0 = (alb0.x * w.x + alb0.y * w.y + alb0.z * w.z) / msum;
+                    pk1 = (alb1.x * w.x + alb1.y * w.y + alb1.z * w.z) / msum;
+                }
+                const float ptot = pk0 + pk1;
+                if (ptot > 0.0f) {
+                    pk0 /= ptot;
+                    pk1 /= ptot;
+                }
             }
 
             // One random triple per bounce, exactly where the CPU takes it
@@ -2038,36 +2892,29 @@ extern "C" void osl_vk_wave_shade(GlobalPtr base)
                     Vec3 bgv
                         = background_sample(p, base, xsv, ysv, bg_dir, bg_pdf);
                     float bpdf = 0.0f;
-                    float bwt  = 0.0f;
-                    if (is_ward) {
-                        Vec3 wv;
-                        ward_eval_vk(wardp, wov, bg_dir, wv, bpdf);
-                        bwt = wv.x;
-                    } else {
-                        // Diffuse: Diffuse<trans>::eval (shading.cpp:305)
-                        // returns weight = Color3(1) and pdf = max(N.wi,0)/pi.
-                        const float NLd = dot(n, bg_dir);
-                        bpdf = (NLd > 0.0f ? NLd : 0.0f) * 0.31830988618f;
-                        bwt  = 1.0f;
-                    }
+                    Vec3 bwt3  = mk(0.0f, 0.0f, 0.0f);
+                    nee_eval_vk<CS>(ce[0], ce[1], ncomp, has_microfacet, is_ward,
+                                    wardp, wov, bg_dir, n, ar, ag, ab, pk0, pk1,
+                                    bwt3, bpdf);
                     const float mis = power_heuristic_weight_weight(bg_pdf, bpdf);
-                    Vec3 contrib = mulv(mulv(w, mk(ar * bwt, ag * bwt, ab * bwt)),
-                                        mk(bgv.x * mis, bgv.y * mis, bgv.z * mis));
+                    Vec3 contrib = mulv(mulv(w, bwt3),
+                                        mk(bgv.x * mis, bgv.y * mis,
+                                           bgv.z * mis));
                     if (contrib.x + contrib.y + contrib.z > 0.0f) {
                         // Publish the shadow ray instead of tracing it: the
                         // next intersection wave walks it, the next shading
                         // wave adds `contrib` if it got through.
-                        wf_fp(base, p->wf_p_x)[gid]      = P.x;
-                        wf_fp(base, p->wf_p_y)[gid]      = P.y;
-                        wf_fp(base, p->wf_p_z)[gid]      = P.z;
-                        wf_ip(base, p->wf_s_skip1)[gid] = hit.id;
-                        wf_fp(base, p->wf_bgdir_x)[gid]  = bg_dir.x;
-                        wf_fp(base, p->wf_bgdir_y)[gid]  = bg_dir.y;
-                        wf_fp(base, p->wf_bgdir_z)[gid]  = bg_dir.z;
-                        wf_fp(base, p->wf_bgc_r)[gid]    = contrib.x;
-                        wf_fp(base, p->wf_bgc_g)[gid]    = contrib.y;
-                        wf_fp(base, p->wf_bgc_b)[gid]    = contrib.z;
-                        wf_ip(base, p->wf_nee_pending)[gid] |= 1;
+                        wf_fp(base, p->wf_p_x)[pix]      = P.x;
+                        wf_fp(base, p->wf_p_y)[pix]      = P.y;
+                        wf_fp(base, p->wf_p_z)[pix]      = P.z;
+                        wf_ip(base, p->wf_s_skip1)[pix] = hit.id;
+                        wf_fp(base, p->wf_bgdir_x)[pix]  = bg_dir.x;
+                        wf_fp(base, p->wf_bgdir_y)[pix]  = bg_dir.y;
+                        wf_fp(base, p->wf_bgdir_z)[pix]  = bg_dir.z;
+                        wf_fp(base, p->wf_bgc_r)[pix]    = contrib.x;
+                        wf_fp(base, p->wf_bgc_g)[pix]    = contrib.y;
+                        wf_fp(base, p->wf_bgc_b)[pix]    = contrib.z;
+                        wf_ip(base, p->wf_nee_pending)[pix] |= 1;
                     }
                 }
 
@@ -2087,40 +2934,33 @@ extern "C" void osl_vk_wave_shade(GlobalPtr base)
                         // CPU: b = result.bsdf.eval(-sg.I, sample.dir), so both
                         // the weight and the pdf come from the closure itself.
                         float bpdf = 0.0f;
-                        float bwt  = 0.0f;
-                        if (is_ward) {
-                            Vec3 wv;
-                            ward_eval_vk(wardp, wov, lsmp.dir, wv, bpdf);
-                            bwt = wv.x;
-                        } else {
-                            float NLd = dot(n, lsmp.dir);
-                            bpdf = (NLd > 0.0f ? NLd : 0.0f) * 0.31830988618f;
-                            bwt  = 1.0f;
-                        }
+                        Vec3 bwt3  = mk(0.0f, 0.0f, 0.0f);
+                        nee_eval_vk<CS>(ce[0], ce[1], ncomp, has_microfacet, is_ward,
+                                        wardp, wov, lsmp.dir, n, ar, ag, ab,
+                                        pk0, pk1, bwt3, bpdf);
                         float mis = power_heuristic_eval_weight(
                             light_pick_pdf * lsmp.pdf, bpdf);
                         Vec3 contrib
-                            = mulv(mulv(w, mk(ar * bwt, ag * bwt, ab * bwt)),
-                                   mk(mis, mis, mis));
+                            = mulv(mulv(w, bwt3), mk(mis, mis, mis));
                         if (contrib.x + contrib.y + contrib.z > 0.0f) {
                             // Same hand-off as the background ray above; the
                             // light point is shaded when the result comes back,
                             // because that needs `sg` and the shader dispatch.
-                            wf_fp(base, p->wf_p_x)[gid]      = P.x;
-                            wf_fp(base, p->wf_p_y)[gid]      = P.y;
-                            wf_fp(base, p->wf_p_z)[gid]      = P.z;
-                            wf_ip(base, p->wf_s_skip1)[gid] = hit.id;
-                            wf_fp(base, p->wf_ldir_x)[gid]   = lsmp.dir.x;
-                            wf_fp(base, p->wf_ldir_y)[gid]   = lsmp.dir.y;
-                            wf_fp(base, p->wf_ldir_z)[gid]   = lsmp.dir.z;
-                            wf_fp(base, p->wf_l_tmax)[gid]   = lsmp.dist;
-                            wf_fp(base, p->wf_l_u)[gid]      = lsmp.u;
-                            wf_fp(base, p->wf_l_v)[gid]      = lsmp.v;
-                            wf_ip(base, p->wf_l_lid)[gid]    = lid;
-                            wf_fp(base, p->wf_lc_r)[gid]     = contrib.x;
-                            wf_fp(base, p->wf_lc_g)[gid]     = contrib.y;
-                            wf_fp(base, p->wf_lc_b)[gid]     = contrib.z;
-                            wf_ip(base, p->wf_nee_pending)[gid] |= 2;
+                            wf_fp(base, p->wf_p_x)[pix]      = P.x;
+                            wf_fp(base, p->wf_p_y)[pix]      = P.y;
+                            wf_fp(base, p->wf_p_z)[pix]      = P.z;
+                            wf_ip(base, p->wf_s_skip1)[pix] = hit.id;
+                            wf_fp(base, p->wf_ldir_x)[pix]   = lsmp.dir.x;
+                            wf_fp(base, p->wf_ldir_y)[pix]   = lsmp.dir.y;
+                            wf_fp(base, p->wf_ldir_z)[pix]   = lsmp.dir.z;
+                            wf_fp(base, p->wf_l_tmax)[pix]   = lsmp.dist;
+                            wf_fp(base, p->wf_l_u)[pix]      = lsmp.u;
+                            wf_fp(base, p->wf_l_v)[pix]      = lsmp.v;
+                            wf_ip(base, p->wf_l_lid)[pix]    = lid;
+                            wf_fp(base, p->wf_lc_r)[pix]     = contrib.x;
+                            wf_fp(base, p->wf_lc_g)[pix]     = contrib.y;
+                            wf_fp(base, p->wf_lc_b)[pix]     = contrib.z;
+                            wf_ip(base, p->wf_nee_pending)[pix] |= 2;
                         }
                     }
                 }
@@ -2175,7 +3015,7 @@ extern "C" void osl_vk_wave_shade(GlobalPtr base)
                     }
                     if (!(prob > 0.0f))
                         break;
-                    const ClosureEntryVK& e = (pick == 0) ? ce0 : ce1;
+                    const ClosureEntryVK& e = ce[pick];
                     float cw                = 0.0f;
                     if (e.id == REFLECTION_ID_VK
                         || e.id == FRESNEL_REFLECTION_ID_VK) {
@@ -2204,6 +3044,60 @@ extern "C" void osl_vk_wave_shade(GlobalPtr base)
                     float cosNO = dot(n, wov);
                     wi          = sub(mul(n, 2.0f * cosNO), wov);
                     bsdf_pdf    = inf();
+                } else if (HAS_MF && has_microfacet) {
+                    // Glass is a two-lobe mixture (transmission + reflection).
+                    // Pick a lobe by its solid-angle share, sample that lobe,
+                    // then fold the other lobe's eval toward the chosen
+                    // direction in with the balance heuristic -- exactly
+                    // CompositeBSDF::sample (shading.h:376-403).
+                    float msum = w.x + w.y + w.z;
+                    float p0 = 0.0f, p1 = 0.0f;
+                    if (msum > 0.0f) {
+                        p0 = (alb0.x * w.x + alb0.y * w.y + alb0.z * w.z) / msum;
+                        p1 = (alb1.x * w.x + alb1.y * w.y + alb1.z * w.z) / msum;
+                    }
+                    float ptot = p0 + p1;
+                    if (!(ptot > 0.0f))
+                        break;
+                    p0 /= ptot;
+                    p1 /= ptot;
+                    int pick   = (rx < p0) ? 0 : 1;
+                    float prob = pick ? p1 : p0;
+                    if (!(prob > 0.0f))
+                        break;
+                    float u1 = pick ? (rx - p0) / prob : rx / p0;
+                    if (u1 > 0.99999994f)
+                        u1 = 0.99999994f;
+                    const ClosureEntryVK& e = ce[pick];
+                    Vec3 sw                 = mk(0.0f, 0.0f, 0.0f);
+                    float spdf              = 0.0f;
+                    if (e.id == MICROFACET_ID_VK) {
+                        float lw = 0.0f;
+                        mf_sample_vk(e, wov, u1, s3.y, s3.z, wi, lw, spdf);
+                        sw = mk(lw, lw, lw);
+                    } else if constexpr (HAS_DIFF) {
+                        if (e.id == DIFFUSE_ID_VK) {
+                            float pc = 0.0f;
+                            wi       = sample_cosine_hemisphere(e.N, u1, s3.y, pc);
+                            spdf     = pc;
+                            sw       = mk(1.0f, 1.0f, 1.0f);
+                        } else {
+                            break;  // this lobe cannot be sampled
+                        }
+                    } else {
+                        break;  // this lobe cannot be sampled
+                    }
+                    Vec3 outw = mul(mulv(e.w, sw), 1.0f / prob);
+                    spdf *= prob;
+                    const ClosureEntryVK& oe = ce[pick ? 0 : 1];
+                    if (oe.id >= 0 && oe.id != EMISSION_ID_VK
+                        && oe.id != BACKGROUND_ID_VK) {
+                        float op = 0.0f;
+                        Vec3 ow  = component_eval<CS>(oe, wardp, wov, wi, n, op);
+                        mis_update_eval_vk(outw, spdf, ow, op, pick ? p0 : p1);
+                    }
+                    w        = mulv(w, outw);
+                    bsdf_pdf = spdf;
                 } else if (is_ward) {
                     Vec3 wv;
                     float wp = 0.0f;
@@ -2215,15 +3109,17 @@ extern "C" void osl_vk_wave_shade(GlobalPtr base)
                         w.y = 0.0f;
                         w.z = 0.0f;
                     }
-                } else {
+                } else if constexpr (HAS_DIFF) {
                     // Sampling::sample_cosine_hemisphere (sampling.h:92).
                     float pdf_cos = 0.0f;
                     wi            = sample_cosine_hemisphere(n, rx, s3.y, pdf_cos);
                     bsdf_pdf      = pdf_cos;
+                } else {
+                    break;  // no family in this kernel can sample this BSDF
                 }
                 if (all_delta) {
                     w = mulv(w, mk(wmulr, wmulg, wmulb));
-                } else {
+                } else if (!(HAS_MF && has_microfacet)) {
                     w = mulv(w, mk(ar * sweight, ag * sweight, ab * sweight));
                 }
                 r.org    = P;
@@ -2246,10 +3142,126 @@ extern "C" void osl_vk_wave_shade(GlobalPtr base)
     // Accumulate this bounce's radiance into the sample's image.  The vendor
     // path divides by the sample count here, and the host sums one image per
     // sample, so the mean comes out identical to the megakernel's.
-    out[gid * 4 + 0] += L.x * inv;
-    out[gid * 4 + 1] += L.y * inv;
-    out[gid * 4 + 2] += L.z * inv;
+    out[pix * 4 + 0] += L.x * inv;
+    out[pix * 4 + 1] += L.y * inv;
+    out[pix * 4 + 2] += L.z * inv;
 
     // Publish the next wave's ray (or the dead flag) for the intersect pass.
-    wave_ray_store(p, base, gid, r);
+    wave_ray_store(p, base, pix, r);
 }
+
+// ---- pass 3, one kernel per material ---------------------------------------
+//
+// The host sorts the wave by material and dispatches one bucket per material,
+// so every invocation of a given kernel takes the same branch of the shader
+// dispatch and the module only has to carry that shader.  The pixel index
+// comes from `wf_bucket_index`; past the end of a bucket the host leaves a
+// negative sentinel, because a dispatch always rounds up to whole workgroups.
+
+template <int MAT, unsigned CS>
+inline void wave_shade_entry(GlobalPtr base)
+{
+    VK_GLOBAL const FrameParams* p
+        = (VK_GLOBAL const FrameParams*)(base + kFrameParamsOffset);
+    const unsigned npix = (unsigned)p->width * (unsigned)p->height;
+    if (npix == 0)
+        return;
+    const unsigned slot = (unsigned)get_global_id(0);
+    const int pix = wf_icp(base, p->wf_bucket_index)
+                        [(unsigned)p->shade_bucket_base + slot];
+    if (pix < 0 || (unsigned)pix >= npix)
+        return;
+    wave_shade_body<MAT, CS>(base, (unsigned)pix);
+}
+
+//
+// Four flavours per material, one per closure set the testrender scenes
+// actually produce: `_bg` (background only: the envmap's own shader and the
+// light group's emission), `_diff` (matte), `_mf` (microfacet / glass) and
+// `_all` (everything, the fallback for any other mix).
+//
+// This replaces the earlier `MF=true/false` pair, which only covered the
+// microfacet family.  The reason it is worth the instantiations: the device
+// runtime is force-inlined before clspv, so every `if (e.id == ...)` keeps its
+// layer's code in every kernel, and the microfacet scene carries three glass
+// groups -- each kernel paid for the cosine sampler, Ward, the Fresnel path
+// and the Beckmann lobes whether its shader could reach them or not.
+//
+// A set that has no instantiation here gets `_all`; the module builder falls
+// back to it by name, so an unlisted scene stays correct.
+//
+// Internal linkage on purpose: the module builder keeps only the bodies a
+// kernel actually calls and erases the rest before clspv runs (vulkan_module.
+// cpp).  With external linkage every combination would survive the link and
+// be carried through the inliner, which turned a 30 second module build into
+// 20 minutes once there were four sets instead of two.  The `extern "C"
+// { static ... }` block form is what gives an internal symbol with the plain
+// C name on both clang and MSVC (`extern "C" static` as a specifier list is
+// rejected).
+//
+// `used` is load bearing twice over: nothing in this translation unit calls
+// these, so clang would drop every `static` one as dead before the module is
+// ever linked -- and the builder then fails to find them by name.
+#if defined(__clang__)
+#    define VK_ENTRY_USED __attribute__((used))
+#else
+#    define VK_ENTRY_USED
+#endif
+#define OSL_VK_SHADE_ENTRY(n)                                                  \
+    extern "C" {                                                               \
+    static VK_ENTRY_USED void osl_vk_wave_shade##n##_all(GlobalPtr base)                     \
+    {                                                                          \
+        wave_shade_entry<n, CS_ALL>(base);                                     \
+    }                                                                          \
+    static VK_ENTRY_USED void osl_vk_wave_shade##n##_bg(GlobalPtr base)                      \
+    {                                                                          \
+        wave_shade_entry<n, CS_BG>(base);                                      \
+    }                                                                          \
+    static VK_ENTRY_USED void osl_vk_wave_shade##n##_diff(GlobalPtr base)                    \
+    {                                                                          \
+        wave_shade_entry<n, CS_DIFF>(base);                                    \
+    }                                                                          \
+    static VK_ENTRY_USED void osl_vk_wave_shade##n##_mf(GlobalPtr base)                      \
+    {                                                                          \
+        wave_shade_entry<n, CS_MF>(base);                                      \
+    }                                                                          \
+    static VK_ENTRY_USED void osl_vk_wave_shade##n##_delta(GlobalPtr base)                   \
+    {                                                                          \
+        wave_shade_entry<n, CS_DELTA>(base);                                   \
+    }                                                                          \
+    }
+
+OSL_VK_SHADE_ENTRY(0)
+OSL_VK_SHADE_ENTRY(1)
+OSL_VK_SHADE_ENTRY(2)
+OSL_VK_SHADE_ENTRY(3)
+OSL_VK_SHADE_ENTRY(4)
+OSL_VK_SHADE_ENTRY(5)
+OSL_VK_SHADE_ENTRY(6)
+OSL_VK_SHADE_ENTRY(7)
+
+// Slots 8..15 carry the fallback body only.  The five-set instantiations exist
+// to slim down the scenes the shading work is measured on, and every one of
+// those has at most eight groups; a scene with nine or more (render-mx-furnace-*
+// has twelve, one group per sphere) just needs *a* kernel per material, and the
+// `_all` body is what the module builder would fall back to anyway.  Adding
+// only the fallback keeps the extra template instantiation cost at eight bodies
+// instead of forty.
+#define OSL_VK_SHADE_ENTRY_ALL(n)                                               \
+    extern "C" {                                                               \
+    static VK_ENTRY_USED void osl_vk_wave_shade##n##_all(GlobalPtr base)                     \
+    {                                                                          \
+        wave_shade_entry<n, CS_ALL>(base);                                     \
+    }                                                                          \
+    }
+
+OSL_VK_SHADE_ENTRY_ALL(8)
+OSL_VK_SHADE_ENTRY_ALL(9)
+OSL_VK_SHADE_ENTRY_ALL(10)
+OSL_VK_SHADE_ENTRY_ALL(11)
+OSL_VK_SHADE_ENTRY_ALL(12)
+OSL_VK_SHADE_ENTRY_ALL(13)
+OSL_VK_SHADE_ENTRY_ALL(14)
+OSL_VK_SHADE_ENTRY_ALL(15)
+
+

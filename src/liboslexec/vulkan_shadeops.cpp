@@ -425,18 +425,22 @@ osl_vk_arena_alloc(GlobalPtr sg_, long long size, long long /*align*/)
 // Closure allocation
 // ---------------------------------------------------------------------------
 
-/// Allocate a closure component with an explicit weight.  Returns null (and
-/// allocates nothing) when the weight is black, which is what lets OSL skip
-/// building a component that cannot contribute -- same behaviour as the CUDA
-/// runtime.
+/// Allocate a closure component with an explicit weight.
+///
+/// A black weight still gets a component, carrying a zero weight.  It used to
+/// return a null pointer (the CPU does that, and OSL's front end then emits
+/// `if (comp) { ... }` around the result), but a null test on a device pointer
+/// is an `OpPtrNotEqual`, and SPIR-V only allows one with
+/// `CapabilityVariablePointers` -- exactly the capability Intel's driver aborts
+/// on at pipeline creation.  So the device module keeps the invariant that no
+/// pointer is ever null: a black weight becomes a zero-weight component that
+/// contributes nothing.  vulkan_module.cpp folds the now-constant null tests
+/// away on the strength of that invariant.
 GlobalPtr
 osl_allocate_weighted_closure_component(GlobalPtr sg_, int id, int size,
                                         const GlobalPtr w)
 {
     GlobalVec3CPtr wc = (GlobalVec3CPtr)w;
-
-    if (wc->x == 0.0f && wc->y == 0.0f && wc->z == 0.0f)
-        return (GlobalPtr)0;
 
     if (size < 4)
         size = 4;
@@ -484,10 +488,6 @@ osl_mul_closure_color(GlobalPtr sg_, GlobalPtr a, const GlobalPtr w)
 {
     GlobalVec3CPtr wc = (GlobalVec3CPtr)w;
 
-    if (a == (GlobalPtr)0)
-        return (GlobalPtr)0;
-    if (wc->x == 0.0f && wc->y == 0.0f && wc->z == 0.0f)
-        return (GlobalPtr)0;
     if (wc->x == 1.0f && wc->y == 1.0f && wc->z == 1.0f)
         return a;
 
@@ -520,8 +520,6 @@ osl_mul_closure_color(GlobalPtr sg_, GlobalPtr a, const GlobalPtr w)
 GlobalPtr
 osl_mul_closure_float(GlobalPtr sg_, GlobalPtr a, float w)
 {
-    if (a == (GlobalPtr)0 || w == 0.0f)
-        return (GlobalPtr)0;
     if (w == 1.0f)
         return a;
 
@@ -564,11 +562,6 @@ static_assert(sizeof(ClosureAddVK) == 24, "add node keeps the CPU layout");
 GlobalPtr
 osl_add_closure_closure(GlobalPtr sg_, GlobalPtr a, GlobalPtr b)
 {
-    if (a == (GlobalPtr)0)
-        return b;
-    if (b == (GlobalPtr)0)
-        return a;
-
     // 24 bytes rounded up to 32: arena_bump() assumes every allocation is a
     // multiple of 16 so the next component keeps its 16-byte alignment.
     long long off       = 0;

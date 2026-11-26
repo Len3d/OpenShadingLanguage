@@ -49,6 +49,19 @@
 
 namespace osl_vk_abi {
 
+/// Closure families a group's shaders can produce, as a compile-time bit set.
+/// The device kernels are instantiated per set (`osl_vk_wave_shade<n>_<tag>`),
+/// and the module builder reads the same bits off the group IR before choosing
+/// the kernel, so both sides have to agree on the numbering: it lives here
+/// rather than in vulkan_render.cpp for exactly that reason.
+static const unsigned kClosureSetBG    = 1u << 0;  // background / emission
+static const unsigned kClosureSetDiff  = 1u << 1;  // diffuse
+static const unsigned kClosureSetWard  = 1u << 2;  // ward
+static const unsigned kClosureSetMF    = 1u << 3;  // microfacet
+static const unsigned kClosureSetDelta = 1u << 4;  // mirror / refraction /
+                                                   // transparent
+static const unsigned kClosureSetAll   = 31u;
+
 struct Vec3 {
     float x, y, z;
 };
@@ -353,6 +366,13 @@ struct FrameParams {
     long long wf_l_lid;                   ///< int, light primitive
     long long wf_s_skip1;                 ///< int, the surface both rays left
     long long wf_vis_bg, wf_vis_l;        ///< int, 1 when the ray got through
+    /// Material buckets.  The host sorts the wave by material and dispatches
+    /// one bucket per material, so a shading kernel only ever sees its own
+    /// shader; `shade_bucket_base` is where this kernel's list starts in
+    /// `wf_bucket_index` (int array, one list per material).
+    long long wf_bucket_index;
+    int shade_bucket_base;
+    int pad_bucket;
 };
 
 /// Where FrameParams sits: the first bytes of the buffer, so the kernel can
