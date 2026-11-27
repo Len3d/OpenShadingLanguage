@@ -368,11 +368,13 @@ struct FrameParams {
     long long wf_vis_bg, wf_vis_l;        ///< int, 1 when the ray got through
     /// Material buckets.  The host sorts the wave by material and dispatches
     /// one bucket per material, so a shading kernel only ever sees its own
-    /// shader; `shade_bucket_base` is where this kernel's list starts in
-    /// `wf_bucket_index` (int array, one list per material).
+    /// shader.  `wf_bucket_index` is the int array holding every material's
+    /// list, and the list of material `m` starts at
+    /// `m * (npix + kWorkgroupSize)` ints into it.  The kernel derives that
+    /// base from the material its entry point was instantiated for, so the
+    /// host does not rewrite FrameParams between the per-material dispatches
+    /// -- which is what lets it record them all into one command buffer.
     long long wf_bucket_index;
-    int shade_bucket_base;
-    int pad_bucket;
 };
 
 /// Where FrameParams sits: the first bytes of the buffer, so the kernel can

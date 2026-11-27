@@ -2151,7 +2151,6 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
     fp.wf_vis_bg         = (long long)wf_vis_bg;
     fp.wf_vis_l          = (long long)wf_vis_l;
     fp.wf_bucket_index   = (long long)wf_bucket_index;
-    fp.shade_bucket_base = 0;
     fp.lightprim_offset  = (long long)lp_off;
     fp.num_lightprims    = (int)lp_count;
     fp.area_offset       = (long long)area_off;
@@ -2305,6 +2304,7 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
     std::vector<float> one(npix * 4);
     const int bounces = std::max(0, fp.max_bounces);
     int waves_skipped = 0;
+    const unsigned long submits0 = m_vk->submissions();
     if (frame_samples > 1)
         fprintf(stderr,
                 "[vulkan] wavefront: %d samples x %d intersect/shade pairs, "
@@ -2350,7 +2350,8 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
                                 npix * sizeof(int), err)) {
                 errhandler().errorfmt(
                     "[vulkan] sample {} bounce {}: hit read-back failed: {}",
-                    s, b, err);                return false;
+                    s, b, err);
+                return false;
             }
             std::fill(counts.begin(), counts.end(), 0);
             const int nm       = (int)nmat;
@@ -2416,23 +2417,36 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
                     return false;
                 }
             }
+            // One batch for the whole wave: every material's kernel reads the
+            // same FrameParams and the same bucket array, and each derives its
+            // list base from the material id it was compiled for (see
+            // wave_shade_entry), so nothing has to be rewritten between them.
+            // That turns `nmat` submissions per bounce into one.  A wave with
+            // no bucket at all still ends the batch: an empty command buffer is
+            // cheaper than tracking the open/closed state here.
+            if (!m_vk->begin_batch(err)) {
+                errhandler().errorfmt(
+                    "[vulkan] sample {} bounce {}: batch begin failed: {}", s,
+                    b, err);
+                return false;
+            }
             for (int m = 0; m < nm; ++m) {
                 const unsigned g = (counts[m] + kWorkgroupSize - 1)
                                    / kWorkgroupSize;
                 if (!g)
                     continue;
-                fp.shade_bucket_base = (int)((size_t)m * bucket_stride);
-                if (!m_vk->upload(kFrameParamsOffset, &fp, sizeof(fp), err)) {
-                    errhandler().errorfmt(
-                        "[vulkan] FrameParams upload failed: {}", err);
-                    return false;
-                }
-                if (!m_vk->dispatch(m_vk_shade[m], g, err)) {
+                if (!m_vk->record_dispatch(m_vk_shade[m], g, err)) {
                     errhandler().errorfmt(
                         "[vulkan] sample {} bounce {}: shade {} failed: {}", s,
                         b, m, err);
                     return false;
                 }
+            }
+            if (!m_vk->end_batch(err)) {
+                errhandler().errorfmt(
+                    "[vulkan] sample {} bounce {}: shade submit failed: {}", s,
+                    b, err);
+                return false;
             }
             // ---- is another wave worth dispatching? -------------------------
             // Nothing below reads a dead path: the shading pass returns before it
@@ -2482,6 +2496,12 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
                 "[vulkan] early-out: skipped %d of %d intersect/shade waves "
                 "(no live path, no pending NEE)\n",
                 waves_skipped, frame_samples * (bounces + 1));
+    fprintf(stderr,
+            "[vulkan] queue submissions: %lu for %d samples, %d bounces "
+            "(%.1f per wave)\n",
+            m_vk->submissions() - submits0, frame_samples, bounces,
+            (double)(m_vk->submissions() - submits0)
+                / (double)std::max(1, frame_samples * (bounces + 1)));
 
     if (fp.pad_light) {
         // Mode 2: per-material radiance, written with the material in alpha.

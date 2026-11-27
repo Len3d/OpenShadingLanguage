@@ -102,6 +102,11 @@ struct VulkanShading::Impl {
     std::mutex submit_mutex;
     std::string device_name;
     bool inited = false;
+    // True between begin_batch() and end_batch(): the command buffer is being
+    // recorded, so a one-shot dispatch() (or a host memcpy that the device is
+    // expected to see in order) would corrupt it.
+    bool batching = false;
+    unsigned long submits = 0;
 
     ~Impl() { destroy(); }
 
@@ -585,6 +590,11 @@ bool VulkanShading::upload(size_t offset, const void* src, size_t bytes,
         err = "VulkanShading::upload before init";
         return false;
     }
+    if (I.batching) {
+        err = "upload() inside a batch: the command buffer is being recorded, "
+              "the copy would race with the submitted work";
+        return false;
+    }
     if (offset > I.buffer_bytes || bytes > I.buffer_bytes - offset) {
         err = "upload out of range (offset " + std::to_string(offset)
               + ", bytes " + std::to_string(bytes) + ", buffer "
@@ -604,6 +614,11 @@ bool VulkanShading::download(size_t offset, void* dst, size_t bytes,
         err = "VulkanShading::download before init";
         return false;
     }
+    if (I.batching) {
+        err = "download() inside a batch: the device work has not been "
+              "submitted yet";
+        return false;
+    }
     if (offset > I.buffer_bytes || bytes > I.buffer_bytes - offset) {
         err = "download out of range";
         return false;
@@ -613,19 +628,20 @@ bool VulkanShading::download(size_t offset, void* dst, size_t bytes,
 }
 
 
-bool VulkanShading::dispatch(int id, unsigned groups, std::string& err)
+bool VulkanShading::begin_batch(std::string& err)
 {
     Impl& I = *m_impl;
     std::lock_guard<std::mutex> lock(I.submit_mutex);
     if (!I.inited) {
-        err = "VulkanShading::dispatch before init";
+        err = "VulkanShading::begin_batch before init";
         return false;
     }
-    if (id < 0 || id >= (int)I.pipelines.size()) {
-        err = "VulkanShading::dispatch with an unknown pipeline id";
+    if (I.batching) {
+        err = "begin_batch() while a batch is already open";
         return false;
     }
-
+    // Everything submitted so far has been waited for (end_batch() always
+    // waits), so the fence and the command buffer are both idle here.
     VK_TRY(vkResetFences(I.device, 1, &I.fence), err);
     VK_TRY(vkResetCommandBuffer(I.cmdbuf, 0), err);
 
@@ -633,11 +649,41 @@ bool VulkanShading::dispatch(int id, unsigned groups, std::string& err)
     cbbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VK_TRY(vkBeginCommandBuffer(I.cmdbuf, &cbbi), err);
+    I.batching = true;
+    return true;
+}
+
+
+bool VulkanShading::record_dispatch(int id, unsigned groups, std::string& err)
+{
+    Impl& I = *m_impl;
+    if (!I.batching) {
+        err = "record_dispatch() outside a batch";
+        return false;
+    }
+    if (id < 0 || id >= (int)I.pipelines.size()) {
+        err = "record_dispatch with an unknown pipeline id";
+        return false;
+    }
     vkCmdBindPipeline(I.cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE,
                       I.pipelines[id].pipe);
     vkCmdBindDescriptorSets(I.cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE,
                             I.pipelines[id].layout, 0, 1, &I.dset, 0, nullptr);
     vkCmdDispatch(I.cmdbuf, groups ? groups : 1, 1, 1);
+    return true;
+}
+
+
+
+bool VulkanShading::end_batch(std::string& err)
+{
+    Impl& I = *m_impl;
+    std::lock_guard<std::mutex> lock(I.submit_mutex);
+    if (!I.batching) {
+        err = "end_batch() without begin_batch()";
+        return false;
+    }
+    I.batching = false;
     VK_TRY(vkEndCommandBuffer(I.cmdbuf), err);
 
     VkSubmitInfo si {};
@@ -645,8 +691,36 @@ bool VulkanShading::dispatch(int id, unsigned groups, std::string& err)
     si.commandBufferCount = 1;
     si.pCommandBuffers    = &I.cmdbuf;
     VK_TRY(vkQueueSubmit(I.queue, 1, &si, I.fence), err);
+    ++I.submits;
     VK_TRY(vkWaitForFences(I.device, 1, &I.fence, VK_TRUE, UINT64_MAX), err);
     return true;
+}
+
+
+bool VulkanShading::dispatch(int id, unsigned groups, std::string& err)
+{
+    Impl& I = *m_impl;
+    if (!I.inited) {
+        err = "VulkanShading::dispatch before init";
+        return false;
+    }
+    // A one-shot dispatch is just a batch of one.  It must not interleave with
+    // an open batch: both use the same command buffer.
+    if (!begin_batch(err))
+        return false;
+    if (!record_dispatch(id, groups, err)) {
+        I.batching = false;
+        // Leave the command buffer in the executable state, not mid-recording.
+        vkEndCommandBuffer(I.cmdbuf);
+        return false;
+    }
+    return end_batch(err);
+}
+
+
+unsigned long VulkanShading::submissions() const
+{
+    return m_impl ? m_impl->submits : 0;
 }
 
 #endif  // OSL_USE_VULKAN_HOST

@@ -66,8 +66,23 @@ public:
     bool download(size_t offset, void* dst, size_t bytes, std::string& err);
 
     /// One dispatch of a whole-frame pipeline: `groups` workgroups of
-    /// kWorkgroupSize invocations, one invocation per pixel.
+    /// kWorkgroupSize invocations, one invocation per pixel.  One submit and
+    /// one fence wait per call; use the batch below to amortise that.
     bool dispatch(int id, unsigned groups, std::string& err);
+
+    /// Record several dispatches into one command buffer and submit them once.
+    /// The wavefront host loop issues one dispatch per material and they all
+    /// read the same FrameParams, so between `begin_batch()` and `end_batch()`
+    /// they cost one submit instead of one each -- on a 160x120 aa8 render that
+    /// is ~5k submissions per frame turning into ~2k.
+    bool begin_batch(std::string& err);
+    bool record_dispatch(int id, unsigned groups, std::string& err);
+    bool end_batch(std::string& err);
+
+    /// How many queue submissions this instance has made.  Each one costs a
+    /// fence round trip (~0.3 ms on the Intel UHD here) on top of its own work,
+    /// so this is the part of the frame loop that batching is meant to shrink.
+    unsigned long submissions() const;
 
     bool ready() const;
 

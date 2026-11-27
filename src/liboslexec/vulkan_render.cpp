@@ -3167,8 +3167,14 @@ inline void wave_shade_entry(GlobalPtr base)
     if (npix == 0)
         return;
     const unsigned slot = (unsigned)get_global_id(0);
-    const int pix = wf_icp(base, p->wf_bucket_index)
-                        [(unsigned)p->shade_bucket_base + slot];
+    // Bucket layout, fixed with the host (simpleraytracer.cpp): one list per
+    // material, `npix + kWorkgroupSize` ints each -- the stride rounds the
+    // workgroup tail up.  A dispatch only ever reads the slots of the list
+    // belonging to the material this entry point was instantiated for, so the
+    // base is a compile-time product and the host does not have to rewrite
+    // FrameParams between the per-material dispatches.
+    const int mat_base = MAT * (int)(npix + (unsigned)kWorkgroupSize);
+    const int pix = wf_icp(base, p->wf_bucket_index)[mat_base + (int)slot];
     if (pix < 0 || (unsigned)pix >= npix)
         return;
     wave_shade_body<MAT, CS>(base, (unsigned)pix);
