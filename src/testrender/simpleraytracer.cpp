@@ -1346,6 +1346,12 @@ SimpleRaytracer::init_vulkan_shading()
     if (!m_vulkan_requested)
         return;
 
+    // Everything below is paid once per process, not per frame: device
+    // creation, the OSO -> module IR assembly, clspv, one pipeline per kernel,
+    // and the texture decode.  Report it on its own line so a run's wall clock
+    // can be split into setup (mostly shader compilation) and frame time.
+    OIIO::Timer t_setup;
+
     m_vk.reset(new VulkanShading);
     std::string err;
     if (!m_vk->init(err)) {
@@ -1486,6 +1492,10 @@ SimpleRaytracer::init_vulkan_shading()
             "[vulkan] wavefront pipeline ready (gen %d, intersect %d, %zu shade "
             "kernels, light group %d)\n",
             m_vk_gen, m_vk_intersect, m_vk_shade.size(), m_vk_light_group);
+    fprintf(stderr,
+            "[vulkan] setup: %.2f s (device, shader compile, pipelines, "
+            "textures)\n",
+            t_setup());
 }
 
 
@@ -1955,6 +1965,11 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
     if (!m_vk || !m_vk->ready() || m_vk_gen < 0 || m_vk_intersect < 0
         || m_vk_compact < 0 || m_vk_bucket_tail < 0 || m_vk_shade.empty())
         return false;
+
+    // Times everything the frame costs on this side: the buffer uploads,
+    // the wavefront dispatches and the read-back -- but not the pipeline setup,
+    // which init_vulkan_shading already reported separately.
+    OIIO::Timer t;
 
     size_t cursor = (m_vk->texture_end() + 15) & ~(size_t)15;
     if (cursor < kFrameParamsOffset + sizeof(FrameParams))
@@ -2539,7 +2554,6 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
     // pending bit behind them is set, so launching slots 1 and 2 would be pure
     // overhead.
     unsigned groups_path = groups;
-    OIIO::Timer t;
     std::vector<float> image(npix * 4);
     // Wavefront loop: per antialiasing sample, generate the primary rays and
     // then alternate intersect / shade once per bounce.  Every pass is a full
@@ -2767,8 +2781,6 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
         for (size_t i = 0; i < image.size(); ++i)
             image[i] += one[i];
     }
-    (void)t;
-
     if (waves_skipped)
         fprintf(stderr,
                 "[vulkan] early-out: skipped %d of %d intersect/shade waves "
@@ -3223,6 +3235,9 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
                          "device ({} workgroups)",
                          xres, yres, aa * aa,
                          OIIO::Strutil::timeintervalformat(t(), 2), groups);
+    fprintf(stderr,
+            "[vulkan] render: %.2f s (frame upload, dispatch, read-back)\n",
+            t());
     return true;
 }
 
