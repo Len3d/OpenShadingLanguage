@@ -934,6 +934,9 @@ bool vulkan_build_render_module (const std::vector<std::string>& group_ir,
                                 cs |= osl_vk_abi::kClosureSetBG;
                                 break;
                             case 3: cs |= osl_vk_abi::kClosureSetDiff; break;
+                            case 4:  // oren_nayar
+                                cs |= osl_vk_abi::kClosureSetON;
+                                break;
                             case 6:  // phong
                                 cs |= osl_vk_abi::kClosureSetPhong;
                                 break;

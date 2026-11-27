@@ -61,10 +61,11 @@ static const unsigned kClosureSetMF    = 1u << 3;  // microfacet
 static const unsigned kClosureSetDelta = 1u << 4;  // mirror / refraction /
                                                    // transparent
 static const unsigned kClosureSetPhong = 1u << 5;  // phong: glossy, one lobe
+static const unsigned kClosureSetON    = 1u << 6;  // oren_nayar: rough diffuse
 // Every family, including the ones no instantiation is tagged for: a set with
 // no entry of its own resolves to the `_all` body, which is instantiated with
 // this value, so `if constexpr (CS & kClosureSetPhong)` is live there.
-static const unsigned kClosureSetAll   = 63u;
+static const unsigned kClosureSetAll   = 127u;
 
 struct Vec3 {
     float x, y, z;

@@ -1153,6 +1153,7 @@ struct ClosureEntryVK {
     float xalpha, yalpha;  ///< microfacet roughness
     int refract;           ///< microfacet lobe: 0 reflection, 1 transmission
     float exponent;        ///< phong falloff exponent (PhongParams.exponent)
+    float sigma;           ///< oren_nayar roughness (OrenNayarParams.sigma)
     long long off;  ///< arena offset of the node, for parameters read on demand
 };
 
@@ -1415,6 +1416,149 @@ inline void phong_sample_vk(const ClosureEntryVK& p, const Vec3& wo, float rx,
     }
 }
 
+/// `BsdfGlobals::visible_normal` (BSDL/bsdf_impl.h:48-78), device side: the
+/// shading normal, or -- if it faces away from the viewer -- a normal in the
+/// plane of `wo` and `N` that does face it.  BSDL's lobes are built on this, so
+/// the Oren-Nayar lobe has to use it too; a plain flip would put the lobe on a
+/// different axis than the CPU's at grazing angles on a curved surface.
+///
+/// The degenerate case (N parallel to wo) is the one place this differs from
+/// the CPU: it falls back to the flip, since the CPU's own fallback needs the
+/// geometric normal, which the closure pool does not carry.
+inline Vec3 visible_normal_vk (const Vec3& wo, const Vec3& N)
+{
+    if (dot (wo, N) > 0.0f)
+        return N;
+    Vec3 V   = cross (wo, N);
+    float mx = __builtin_fabsf (V.x), my = __builtin_fabsf (V.y),
+          mz = __builtin_fabsf (V.z);
+    float m = mx > my ? mx : my;
+    m       = m > mz ? m : mz;
+    if (m < 1e-4f)
+        return mul (N, -1.0f);
+    V = normalize (V);
+    return normalize (add (cross (V, wo), mul (wo, 1e-4f)));
+}
+
+/// The Oren-Nayar diffuse lobe (`oren_nayar(N, sigma)`), device side.
+///
+/// testrender has no implementation of this closure of its own: shading.cpp:
+/// 1498-1503 converts it into BSDL's `oren_nayar_diffuse_bsdf` with the lobe
+/// albedo pinned to white (the closure weight carries the colour) and
+/// `energy_compensation` off.  That leaves the "tiny improvement of Oren-Nayar"
+/// QON model, which is the classic model written in a numerically nicer form
+/// (bsdf_oren_nayar_diffuse_impl.h:56-69):
+///
+///     s = cosIO - cosNI*cosNO
+///     A = 1 - 0.5*sigma^2/(sigma^2+0.33)     B = 0.45*sigma^2/(sigma^2+0.09)
+///     f = (A + B * max(s,0)/max(cosNI,cosNO)) / pi
+///
+/// The lobe is sampled with the cosine hemisphere, so its direction pdf stays
+/// `cosNI/pi` and the (weight, pdf) pair it reports has the same shape as
+/// Lambert's -- `weight` is `f*pi`, i.e. dimensionless, and the albedo arrives
+/// with the closure weight.  `sigma` is not clamped by the CPU either (it only
+/// clamps `MxOrenNayarDiffuse::Data::roughness` when called through the
+/// MaterialX closure, which is a different path), so a sigma outside [0,1]
+/// keeps the same formula on both sides.
+inline void on_eval_vk (const ClosureEntryVK& p, const Vec3& wo, const Vec3& wi,
+                        float& weight, float& pdf)
+{
+#pragma clang fp contract(off)
+    weight      = 0.0f;
+    pdf         = 0.0f;
+    Vec3 N      = visible_normal_vk (wo, p.N);
+    float cosNI = dot (N, wi);
+    float cosNO = dot (N, wo);
+    if (cosNI > 1.0f)
+        cosNI = 1.0f;
+    if (cosNO > 1.0f)
+        cosNO = 1.0f;
+    if (!(cosNI > 0.0f) || !(cosNO > 0.0f))
+        return;
+    float cosIO = dot (wo, wi);
+    if (cosIO > 1.0f)
+        cosIO = 1.0f;
+    if (cosIO < -1.0f)
+        cosIO = -1.0f;
+    const float s = cosIO - cosNI * cosNO;
+    pdf           = cosNI * 0.31830988618f;
+    const float s2 = p.sigma * p.sigma;
+    const float A  = 1.0f - 0.5f * s2 / (s2 + 0.33f);
+    const float B  = 0.45f * s2 / (s2 + 0.09f);
+    float stinv    = 0.0f;
+    if (s > 0.0f) {
+        const float mx = cosNI > cosNO ? cosNI : cosNO;
+        stinv          = s / mx;
+    }
+    weight = A + B * stinv;
+}
+
+/// BSDL's cosine-hemisphere mapper (tools.h:261-278), device side: Clarberg's
+/// quadrant mapping with the two minimax polynomials.  It is *not* the same
+/// function as testrender's `Sampling::sample_cosine_hemisphere` (sampling.h:
+/// 93-101): for a given (randu, randv) the two land on different directions
+/// (the CPU's own diffuse lobe uses testrender's, BSDL's lobes use this one),
+/// so an Oren-Nayar path sampled with the wrong one diverges from the CPU on
+/// every bounce and shows up as speckle across the whole sphere even though
+/// both BRDFs agree exactly.
+inline float fast_cos_quadrant_vk (float x)
+{
+    // minimax approximation of cos(x*pi/4) on [-2,2]
+    const float c1 = 0.99998736f, c2 = -0.30837047f, c3 = 0.01578646f,
+                c4 = -0.00029826362f;
+    float x2 = x * x;
+    float cp = c3 + c4 * x2;
+    cp       = c2 + cp * x2;
+    return c1 + cp * x2;
+}
+
+inline float fast_sin_quadrant_vk (float x)
+{
+    // minimax approximation of sin(x*pi/4) on [-2,2]
+    const float s1 = 0.7853975892066955566406250000000000f,
+                s2 = -0.0807407423853874206542968750000000f,
+                s3 = 0.0024843954015523195266723632812500f,
+                s4 = -0.0000341485538228880614042282104492f;
+    float x2 = x * x;
+    float sp = s3 + s4 * x2;
+    sp       = s2 + sp * x2;
+    sp       = s1 + sp * x2;
+    return sp * x;
+}
+
+inline Vec3 cos_hemisphere_local_vk (float randu, float randv)
+{
+    // stretch unit square + get quadrant
+    const float a = 2.0f * randu - 1.0f, qa = __builtin_fabsf (a);
+    const float b = 2.0f * randv - 1.0f, qb = __builtin_fabsf (b);
+    // map to radius / angle
+    const float rad = qa > qb ? qa : qb;
+    const float phi = qa > qb ? (qb / qa)
+                              : ((qa == qb) ? 1.0f : 2.0f - qa / qb);
+    // map to the disk, then flip back into the original quadrant
+    const float x = __builtin_copysignf (rad * fast_cos_quadrant_vk (phi), a);
+    const float y = __builtin_copysignf (rad * fast_sin_quadrant_vk (phi), b);
+    // cosine-weighted hemisphere
+    float cz      = 1.0f - rad * rad;
+    cz            = cz > 0.0f ? __builtin_sqrtf (cz) : 0.0f;
+    return mk (x, y, cz);
+}
+
+/// `OrenNayarDiffuseLobe::sample_impl`: the cosine hemisphere about the lobe's
+/// visible normal, then `eval` at the drawn direction -- which is why the
+/// sampled weight carries `f` and not just the albedo.  Same shape as
+/// `phong_sample_vk`, so the caller can reuse the Ward/Phong pipeline.
+inline void on_sample_vk (const ClosureEntryVK& p, const Vec3& wo, float rx,
+                          float ry, Vec3& wi, float& weight, float& pdf)
+{
+    Vec3 N = visible_normal_vk (wo, p.N);
+    Vec3 u, v;
+    pixar_frame (N, u, v);
+    Vec3 l = cos_hemisphere_local_vk (rx, ry);
+    wi     = add (add (mul (u, l.x), mul (v, l.y)), mul (N, l.z));
+    on_eval_vk (p, wo, wi, weight, pdf);
+}
+
 /// Scene::sample() from raytracer.h, device side: the Heitz low-distortion
 /// triangle/square map, then the solid-angle pdf of the resulting direction.
 /// The sample point is expressed in barycentrics (u,v) so the light shader can
@@ -1490,6 +1634,15 @@ inline float shape_pdf(const SceneView& s, int primID, const Vec3& x,
 static const int EMISSION_ID_VK   = 1;
 static const int BACKGROUND_ID_VK = 2;
 static const int DIFFUSE_ID_VK    = 3;
+/// `oren_nayar(N, sigma)` is *not* a Lambert lobe with a different colour: its
+/// eval depends on both directions, so the accumulated-albedo shortcut shades
+/// it as a plain diffuse surface (the roughness only shows up as a slightly
+/// different overall level, and the grazing-angle brightening is missing
+/// entirely).  testrender does not use the classic four-term formula either --
+/// shading.cpp:1498 turns this closure into BSDL's `oren_nayar_diffuse_bsdf`
+/// lobe, whose `energy_compensation` flag is off, which leaves the QON model;
+/// see `on_eval_vk` below for the exact expression and the CPU/device match.
+static const int OREN_NAYAR_ID_VK = 4;
 /// `microfacet(dist, N, U, xalpha, yalpha, eta, refract)` is testrender's
 /// Masking-Shadowing-Microfacet closure.  `refract` selects the lobe: 0 is the
 /// reflection lobe, 1 the transmission lobe, 2 both.  glass is the pair
@@ -1539,6 +1692,7 @@ static const unsigned CS_WARD  = osl_vk_abi::kClosureSetWard;
 static const unsigned CS_MF    = osl_vk_abi::kClosureSetMF;
 static const unsigned CS_DELTA = osl_vk_abi::kClosureSetDelta;
 static const unsigned CS_PHONG = osl_vk_abi::kClosureSetPhong;
+static const unsigned CS_ON    = osl_vk_abi::kClosureSetON;
 static const unsigned CS_ALL   = osl_vk_abi::kClosureSetAll;
 
 /// testrender/optics.h:13, verbatim.  TIR returns 1, eta == 0 means "no Fresnel".
@@ -1611,6 +1765,7 @@ fill_closure_entry (ClosureEntryVK& e, int id, long long off, const Vec3& w,
     e.yalpha = 1.0f;
     e.refract = 0;
     e.exponent = 0.0f;
+    e.sigma    = 0.0f;
     if (id == FRESNEL_REFLECTION_ID_VK || id == REFRACTION_ID_VK) {
         // ReflectionParams / RefractionParams { Vec3 N; float eta }
         e.N   = load_vec ((GlobalCVec3)(node + 16));
@@ -1631,6 +1786,11 @@ fill_closure_entry (ClosureEntryVK& e, int id, long long off, const Vec3& w,
         // PhongParams { Vec3 N; float exponent } (testrender/shading.h:74).
         e.N        = load_vec ((GlobalCVec3)(node + 16));
         e.exponent = *(VK_GLOBAL const float*)(node + 28);
+    } else if (id == OREN_NAYAR_ID_VK) {
+        // OrenNayarParams { Vec3 N; float sigma } (shading.h:70) -- the same
+        // byte layout as PhongParams above.
+        e.N     = load_vec ((GlobalCVec3)(node + 16));
+        e.sigma = *(VK_GLOBAL const float*)(node + 28);
     }
 }
 
@@ -1799,6 +1959,14 @@ inline Vec3 component_eval (const ClosureEntryVK& e, const WardVK& wardp,
             return e.w;
         }
     }
+    if constexpr (CS & CS_ON) {
+        if (e.id == OREN_NAYAR_ID_VK) {
+            float lw = 0.0f, lp = 0.0f;
+            on_eval_vk (e, wov, wi, lw, lp);
+            pdf = lp;
+            return mul (e.w, lw);
+        }
+    }
     if constexpr (CS & CS_WARD) {
         if (e.id == WARD_ID_VK) {
             Vec3 wv;
@@ -1878,10 +2046,20 @@ inline void components_eval_sum (const ClosureEntryVK& e0,
 template <unsigned CS>
 inline void nee_eval_vk (const ClosureEntryVK& ce0, const ClosureEntryVK& ce1,
                          int ncomp, int has_microfacet, int is_ward,
-                         int has_phong, const WardVK& wardp, const Vec3& wov,
-                         const Vec3& wi, const Vec3& n, float ar, float ag,
-                         float ab, float b0, float b1, Vec3& w, float& pdf)
+                         int has_phong, int has_on, const WardVK& wardp,
+                         const Vec3& wov, const Vec3& wi, const Vec3& n,
+                         float ar, float ag, float ab, float b0, float b1,
+                         Vec3& w, float& pdf)
 {
+    if constexpr (CS & CS_ON) {
+        // Oren-Nayar's eval depends on the roughness between the two
+        // directions, so it cannot ride on the accumulated albedo either.
+        if (has_on) {
+            components_eval_sum<CS> (ce0, ce1, ncomp, wardp, wov, wi, n, b0,
+                                     b1, w, pdf);
+            return;
+        }
+    }
     if constexpr (CS & CS_MF) {
         if (has_microfacet) {
             components_eval_sum<CS> (ce0, ce1, ncomp, wardp, wov, wi, n, b0,
@@ -2638,6 +2816,7 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
     constexpr bool HAS_DIFF = (CS & CS_DIFF) != 0;
     constexpr bool HAS_DLTA = (CS & CS_DELTA) != 0;
     constexpr bool HAS_PHONG = (CS & CS_PHONG) != 0;
+    constexpr bool HAS_ON    = (CS & CS_ON) != 0;
 
     VK_GLOBAL const FrameParams* p
         = (VK_GLOBAL const FrameParams*)(base + kFrameParamsOffset);
@@ -2827,6 +3006,10 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
             // shade a glossy plate as a diffuse one (uniform instead of a
             // mirror-direction highlight).
             int has_phong = 0;
+            // At least one component is an Oren-Nayar lobe: its eval is not
+            // constant in the two directions, so it needs component_eval on
+            // the NEE side and its own sample weight on the BSDF side.
+            int has_on = 0;
             WardVK wardp;
             long long ci = *(GlobalI64)((GlobalPtr)sg + kOffCi);
             // Flatten ADD/MUL: glass is `Ks*reflection(N,eta) +
@@ -2909,6 +3092,14 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                         if (e.id == PHONG_ID_VK) {
                             // Same for phong: glossy, its own eval/sample.
                             has_phong = 1;
+                            all_delta = 0;
+                        }
+                    }
+                    if constexpr (HAS_ON) {
+                        if (e.id == OREN_NAYAR_ID_VK) {
+                            // Rough diffuse: cosine sampling, but the weight
+                            // carries f(sigma) instead of a flat albedo.
+                            has_on    = 1;
                             all_delta = 0;
                         }
                     }
@@ -3011,8 +3202,8 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                     float bpdf = 0.0f;
                     Vec3 bwt3  = mk(0.0f, 0.0f, 0.0f);
                     nee_eval_vk<CS>(ce[0], ce[1], ncomp, has_microfacet, is_ward,
-                                    has_phong, wardp, wov, bg_dir, n, ar, ag,
-                                    ab, pk0, pk1, bwt3, bpdf);
+                                    has_phong, has_on, wardp, wov, bg_dir, n,
+                                    ar, ag, ab, pk0, pk1, bwt3, bpdf);
                     const float mis = power_heuristic_weight_weight(bg_pdf, bpdf);
                     Vec3 contrib = mulv(mulv(w, bwt3),
                                         mk(bgv.x * mis, bgv.y * mis,
@@ -3053,8 +3244,8 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                         float bpdf = 0.0f;
                         Vec3 bwt3  = mk(0.0f, 0.0f, 0.0f);
                         nee_eval_vk<CS>(ce[0], ce[1], ncomp, has_microfacet, is_ward,
-                                        has_phong, wardp, wov, lsmp.dir, n, ar,
-                                        ag, ab, pk0, pk1, bwt3, bpdf);
+                                        has_phong, has_on, wardp, wov, lsmp.dir,
+                                        n, ar, ag, ab, pk0, pk1, bwt3, bpdf);
                         float mis = power_heuristic_eval_weight(
                             light_pick_pdf * lsmp.pdf, bpdf);
                         Vec3 contrib
@@ -3236,6 +3427,21 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                     bsdf_pdf = pw * pdf0;
                     sweight  = pweight;
                     if (!(pw > 0.0f)) {
+                        w.x = 0.0f;
+                        w.y = 0.0f;
+                        w.z = 0.0f;
+                    }
+                } else if (HAS_ON && has_on) {
+                    // OrenNayarDiffuseLobe::sample_impl: cosine hemisphere
+                    // about the lobe's visible normal, then eval there.  The
+                    // direction pdf is Lambert's, so only the weight differs
+                    // from the diffuse branch below (`f` instead of 1).
+                    float ow = 0.0f;
+                    float op = 0.0f;
+                    on_sample_vk(ce[0], wov, rx, s3.y, wi, ow, op);
+                    bsdf_pdf = op * pdf0;
+                    sweight  = ow;
+                    if (!(op > 0.0f)) {
                         w.x = 0.0f;
                         w.y = 0.0f;
                         w.z = 0.0f;
