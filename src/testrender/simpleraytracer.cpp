@@ -1312,6 +1312,8 @@ SimpleRaytracer::init_vulkan_shading()
     m_vulkan_failure_reported = false;
     m_vk_gen                  = -1;
     m_vk_intersect            = -1;
+    m_vk_compact              = -1;
+    m_vk_bucket_tail          = -1;
     m_vk_shade.clear();
     m_vk_light_group          = -1;
     m_vk.reset();
@@ -1424,6 +1426,8 @@ SimpleRaytracer::init_vulkan_shading()
     const PassSpec passes[] = {
         { "osl_kernel_gen", &m_vk_gen },
         { "osl_kernel_intersect", &m_vk_intersect },
+        { "osl_kernel_compact", &m_vk_compact },
+        { "osl_kernel_bucket_tail", &m_vk_bucket_tail },
     };
     for (auto& ps : passes) {
         fprintf(stderr, "[vulkan] creating pipeline '%s'...\n", ps.entry);
@@ -1773,7 +1777,7 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
     using namespace osl_vk_abi;
     std::string err;
     if (!m_vk || !m_vk->ready() || m_vk_gen < 0 || m_vk_intersect < 0
-        || m_vk_shade.empty())
+        || m_vk_compact < 0 || m_vk_bucket_tail < 0 || m_vk_shade.empty())
         return false;
 
     size_t cursor = (m_vk->texture_end() + 15) & ~(size_t)15;
@@ -1898,10 +1902,16 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
     size_t wf_vis_l    = take(npix * sizeof(int));
     // One bucket of pixel indices per material.  Each bucket is padded to a
     // whole workgroup because a dispatch always covers whole workgroups; the
-    // padding is filled with a negative sentinel the shading kernel skips.
+    // device's bucket_tail pass fills the padding with the sentinel the
+    // shading kernel skips.
     const size_t bucket_stride = npix + kWorkgroupSize;
     const size_t nmat          = m_vk_shade.size();
     size_t wf_bucket_index = take(nmat * bucket_stride * sizeof(int));
+    // The compaction state: one cursor per material (the device bumps them
+    // with an atomic add, and bucket_tail resets them after use) plus the
+    // `uint[3]` group-count triple each bucket's vkCmdDispatchIndirect reads.
+    size_t wf_mat_count     = take(nmat * sizeof(int));
+    size_t wf_dispatch_args = take(nmat * 3 * sizeof(unsigned));
     size_t arena_off = take(npix * (size_t)kShadeBlockStride);
     /// The background importance table (Background::prepare), uploaded so the
     /// device's *indirect* rays can evaluate the background the way the CPU
@@ -2151,6 +2161,10 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
     fp.wf_vis_bg         = (long long)wf_vis_bg;
     fp.wf_vis_l          = (long long)wf_vis_l;
     fp.wf_bucket_index   = (long long)wf_bucket_index;
+    fp.wf_mat_count      = (long long)wf_mat_count;
+    fp.wf_dispatch_args  = (long long)wf_dispatch_args;
+    fp.num_materials     = (int)nmat;
+    fp.fallback_mat      = m_vk_light_group >= 0 ? m_vk_light_group : 0;
     fp.lightprim_offset  = (long long)lp_off;
     fp.num_lightprims    = (int)lp_count;
     fp.area_offset       = (long long)area_off;
@@ -2317,16 +2331,26 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
                                   err);
             return false;
         }
+        // The compaction cursors are reset by bucket_tail once it has used
+        // them, so only the first wave of a sample has to have them armed from
+        // the host.  It is `nmat` ints, cheap enough to do unconditionally.
+        {
+            std::vector<int> zero_counts(nmat, 0);
+            if (!m_vk->upload(wf_mat_count, zero_counts.data(),
+                              nmat * sizeof(int), err)) {
+                errhandler().errorfmt(
+                    "[vulkan] sample {}: material counter upload failed: {}", s,
+                    err);
+                return false;
+            }
+        }
         if (!m_vk->dispatch(m_vk_gen, groups, err)) {
             errhandler().errorfmt(
                 "[vulkan] sample {}: ray generation failed: {}", s, err);
             return false;
         }
-        std::vector<int> hitids(npix);
         std::vector<int> live(npix);
         std::vector<int> pending(npix);
-        std::vector<int> bucket(nmat * bucket_stride, -1);
-        std::vector<int> counts(nmat, 0);
         // A wave is worth dispatching only while some path can still continue
         // or some NEE shadow ray is outstanding.  The generation pass cleared
         // every pending bit, so the first wave's intersection pass needs the
@@ -2334,29 +2358,77 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
         bool nee_pending = false;
         for (int b = 0; b <= bounces; ++b) {
             const unsigned nray = nee_pending ? groups_ray : groups_path;
-            if (!m_vk->dispatch(m_vk_intersect, nray, err)) {
+            const int nm        = (int)nmat;
+            const size_t argstep = 3 * sizeof(unsigned);
+            // One command buffer for the whole wave: intersect, compact, close
+            // the buckets, then one indirect dispatch per material.  The chain
+            // is exactly what the host used to do between two submits -- read
+            // the hit ids back, bin them per material, size each bucket, upload
+            // it -- and it now happens on the device, so a wave costs a single
+            // fence round trip instead of one plus one per bucket.
+            if (!m_vk->begin_batch(err)) {
+                errhandler().errorfmt(
+                    "[vulkan] sample {} bounce {}: batch begin failed: {}", s,
+                    b, err);
+                return false;
+            }
+            // Intersection writes the hit ids; compaction reads them.
+            if (!m_vk->record_dispatch(m_vk_intersect, nray, err)
+                || !m_vk->record_barrier(err)) {
                 errhandler().errorfmt(
                     "[vulkan] sample {} bounce {}: intersect failed: {}", s, b,
                     err);
                 return false;
             }
-            // ---- sort the wave by material ---------------------------------
-            // The buckets are what makes a per-material kernel possible: each
-            // dispatch only sees pixels whose hit carries that material, so the
-            // shader dispatch inside the kernel never diverges.  Sorting on the
-            // host costs one small read-back per bounce; it is the price of the
-            // split, not an oversight.
-            if (!m_vk->download(fp.wf_hit_id, hitids.data(),
-                                npix * sizeof(int), err)) {
+            // Material compaction, one invocation per pixel
+            // (osl_vk_wave_compact): the atomic cursor per material is what the
+            // host's bin loop used to increment.
+            if (!m_vk->record_dispatch(m_vk_compact, groups_path, err)
+                || !m_vk->record_barrier(err)) {
                 errhandler().errorfmt(
-                    "[vulkan] sample {} bounce {}: hit read-back failed: {}",
-                    s, b, err);
+                    "[vulkan] sample {} bounce {}: compaction failed: {}", s, b,
+                    err);
                 return false;
             }
-            std::fill(counts.begin(), counts.end(), 0);
-            const int nm       = (int)nmat;
-            const int fallback = m_vk_light_group >= 0 ? m_vk_light_group : 0;
+            // Close the buckets, one invocation per material
+            // (osl_vk_wave_bucket_tail): sentinel tails, the group counts
+            // vkCmdDispatchIndirect reads, and the cursor reset for the next
+            // wave -- three things the host used to compute or do itself.
+            if (!m_vk->record_dispatch(m_vk_bucket_tail, 1, err)
+                || !m_vk->record_barrier(err)) {
+                errhandler().errorfmt(
+                    "[vulkan] sample {} bounce {}: bucket tail failed: {}", s,
+                    b, err);
+                return false;
+            }
+            for (int m = 0; m < nm; ++m) {
+                if (!m_vk->record_dispatch_indirect(
+                        m_vk_shade[m], wf_dispatch_args + (size_t)m * argstep,
+                        err)) {
+                    errhandler().errorfmt(
+                        "[vulkan] sample {} bounce {}: shade {} failed: {}", s,
+                        b, m, err);
+                    return false;
+                }
+            }
+            if (!m_vk->end_batch(err)) {
+                errhandler().errorfmt(
+                    "[vulkan] sample {} bounce {}: wave submit failed: {}", s,
+                    b, err);
+                return false;
+            }
             if (getenv("OSL_VK_DEBUG_FRAME")) {
+                // The hit ids only exist on the device now, so this asks for
+                // them explicitly -- after the wave, never during it.
+                std::vector<int> hitids(npix);
+                if (!m_vk->download(fp.wf_hit_id, hitids.data(),
+                                    npix * sizeof(int), err)) {
+                    errhandler().errorfmt(
+                        "[vulkan] sample {} bounce {}: hit read-back "
+                        "failed: {}",
+                        s, b, err);
+                    return false;
+                }
                 int hits = 0;
                 for (size_t i = 0; i < npix; ++i)
                     if (hitids[i] >= 0)
@@ -2377,76 +2449,11 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
                     m_vk->download(fp.wf_dir_z, dz.data(), npix * 4, err);
                     for (size_t i = 0; i < npix && i < 3; ++i)
                         fprintf(stderr,
-                                "[vulkan] debug: ray%zu org=%g,%g,%g dir=%g,%g,%g\n",
+                                "[vulkan] debug: ray%zu org=%g,%g,%g "
+                                "dir=%g,%g,%g\n",
                                 i, (double)ox[i], (double)oy[i], (double)oz[i],
                                 (double)dx[i], (double)dy[i], (double)dz[i]);
                 }
-            }
-            for (size_t i = 0; i < npix; ++i) {
-                const int tid = hitids[i];
-                int mat       = (tid >= 0 && tid < (int)scene.shaderids.size())
-                                    ? scene.shaderids[tid]
-                                    : -1;
-                // Misses and dead paths have no material; they still have to run
-                // the shading kernel (it settles the previous wave's NEE
-                // requests), and every kernel can shade the light, so the light
-                // bucket takes them.
-                if (mat < 0 || mat >= nm)
-                    mat = fallback;
-                bucket[(size_t)mat * bucket_stride + counts[mat]++] = (int)i;
-            }
-            for (int m = 0; m < nm; ++m) {
-                const unsigned g = (counts[m] + kWorkgroupSize - 1)
-                                   / kWorkgroupSize;
-                if (!g)
-                    continue;
-                const size_t base = (size_t)m * bucket_stride;
-                // The kernel is dispatched in whole workgroups, so the slots
-                // past the last real index have to carry the sentinel it skips.
-                // Only that tail is touched now: filling every bucket to
-                // bucket_stride on every bounce cost more host time than the
-                // sort itself.
-                for (int k = counts[m]; k < (int)(g * kWorkgroupSize); ++k)
-                    bucket[base + (size_t)k] = -1;
-                if (!m_vk->upload(wf_bucket_index + base * sizeof(int),
-                                  bucket.data() + base,
-                                  g * kWorkgroupSize * sizeof(int), err)) {
-                    errhandler().errorfmt(
-                        "[vulkan] sample {} bounce {}: bucket upload failed: {}",
-                        s, b, err);
-                    return false;
-                }
-            }
-            // One batch for the whole wave: every material's kernel reads the
-            // same FrameParams and the same bucket array, and each derives its
-            // list base from the material id it was compiled for (see
-            // wave_shade_entry), so nothing has to be rewritten between them.
-            // That turns `nmat` submissions per bounce into one.  A wave with
-            // no bucket at all still ends the batch: an empty command buffer is
-            // cheaper than tracking the open/closed state here.
-            if (!m_vk->begin_batch(err)) {
-                errhandler().errorfmt(
-                    "[vulkan] sample {} bounce {}: batch begin failed: {}", s,
-                    b, err);
-                return false;
-            }
-            for (int m = 0; m < nm; ++m) {
-                const unsigned g = (counts[m] + kWorkgroupSize - 1)
-                                   / kWorkgroupSize;
-                if (!g)
-                    continue;
-                if (!m_vk->record_dispatch(m_vk_shade[m], g, err)) {
-                    errhandler().errorfmt(
-                        "[vulkan] sample {} bounce {}: shade {} failed: {}", s,
-                        b, m, err);
-                    return false;
-                }
-            }
-            if (!m_vk->end_batch(err)) {
-                errhandler().errorfmt(
-                    "[vulkan] sample {} bounce {}: shade submit failed: {}", s,
-                    b, err);
-                return false;
             }
             // ---- is another wave worth dispatching? -------------------------
             // Nothing below reads a dead path: the shading pass returns before it

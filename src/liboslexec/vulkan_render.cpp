@@ -3150,13 +3150,93 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
     wave_ray_store(p, base, pix, r);
 }
 
+// ---- pass 3a: material compaction, on the device ---------------------------
+//
+// The host used to read the wave's hit ids back, bin them by material, fill the
+// workgroup tails and upload the buckets -- one round trip per bounce, and the
+// one thing that kept a wave from being a single command buffer.  Everything
+// the binning needs is already in the frame buffer: `wf_hit_id` from the pass
+// that just ran, and the primitive -> material table the shading pass reads
+// anyway.  So the sort is one more device pass, and the host only zeroes the
+// counters once per sample.
+//
+// `wf_mat_count` is the per-material cursor, bumped with an atomic add: the
+// order inside a bucket is not deterministic, but the shading pass sums
+// radiance per pixel, so bucket order does not affect the image (the host's
+// sort was ordered only because it happened to walk pixels in order).
+
+extern "C" void osl_vk_wave_compact(GlobalPtr base)
+{
+    VK_GLOBAL const FrameParams* p
+        = (VK_GLOBAL const FrameParams*)(base + kFrameParamsOffset);
+    const unsigned npix = (unsigned)p->width * (unsigned)p->height;
+    if (npix == 0)
+        return;
+    const unsigned pix = (unsigned)get_global_id(0);
+    if (pix >= npix)
+        return;
+    const int nm = p->num_materials;
+    if (nm <= 0)
+        return;
+
+    // The rule the host applied while it owned the sort: a hit carries the
+    // material of its primitive, and a miss or a dead path goes to the fallback
+    // bucket (the light group), because every shading kernel can shade the
+    // light and those pixels still have to settle the previous wave's NEE.
+    const int tid = wf_icp(base, p->wf_hit_id)[pix];
+    int mat       = -1;
+    if (tid >= 0 && tid < p->num_triangles)
+        mat = wf_icp(base, p->tri_shader_offset)[tid];
+    if (mat < 0 || mat >= nm)
+        mat = p->fallback_mat;
+
+    const int slot = __atomic_fetch_add(wf_ip(base, p->wf_mat_count) + mat, 1,
+                                        __ATOMIC_RELAXED);
+    // Same list layout the shading entry derives at compile time: one
+    // `npix + kWorkgroupSize` block per material.
+    const int stride = (int)(npix + (unsigned)kWorkgroupSize);
+    wf_ip(base, p->wf_bucket_index)[mat * stride + slot] = (int)pix;
+}
+
+/// Close the buckets and publish the dispatch sizes: one invocation per
+/// material writes the `-1` sentinel into the slots past the last real index,
+/// the group count vkCmdDispatchIndirect will read, and resets the cursor for
+/// the next wave.  This is the pass that lets the host stop asking how big each
+/// bucket is.
+extern "C" void osl_vk_wave_bucket_tail(GlobalPtr base)
+{
+    VK_GLOBAL const FrameParams* p
+        = (VK_GLOBAL const FrameParams*)(base + kFrameParamsOffset);
+    const unsigned m  = (unsigned)get_global_id(0);
+    const int nm      = p->num_materials;
+    if (nm <= 0 || (int)m >= nm)
+        return;
+    const unsigned npix = (unsigned)p->width * (unsigned)p->height;
+    const int stride    = (int)(npix + (unsigned)kWorkgroupSize);
+
+    VK_GLOBAL int* count  = wf_ip(base, p->wf_mat_count) + (int)m;
+    VK_GLOBAL int* bucket = wf_ip(base, p->wf_bucket_index) + (int)m * stride;
+    const int n           = count[0];
+    const int g = (n + (int)kWorkgroupSize - 1) / (int)kWorkgroupSize;
+    for (int k = n; k < g * (int)kWorkgroupSize; ++k)
+        bucket[k] = -1;
+
+    VK_GLOBAL int* args = wf_ip(base, p->wf_dispatch_args) + (int)m * 3;
+    args[0]             = g;
+    args[1]             = 1;
+    args[2]             = 1;
+
+    count[0] = 0;  // armed for the next wave
+}
+
 // ---- pass 3, one kernel per material ---------------------------------------
 //
-// The host sorts the wave by material and dispatches one bucket per material,
-// so every invocation of a given kernel takes the same branch of the shader
-// dispatch and the module only has to carry that shader.  The pixel index
-// comes from `wf_bucket_index`; past the end of a bucket the host leaves a
-// negative sentinel, because a dispatch always rounds up to whole workgroups.
+// The device sorts the wave by material (pass 3a) and dispatches one bucket
+// per material, so every invocation of a given kernel takes the same branch of
+// the shader dispatch and the module only has to carry that shader.  The pixel
+// index comes from `wf_bucket_index`; past the end of a bucket
+// `wave_bucket_tail` leaves a negative sentinel, because a dispatch always
+// rounds up to whole workgroups.
 
 template <int MAT, unsigned CS>
 inline void wave_shade_entry(GlobalPtr base)

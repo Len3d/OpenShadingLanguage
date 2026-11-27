@@ -179,11 +179,16 @@ private:
     // the background shader.
     std::vector<int> m_vk_dispatch_id;
     // The wavefront pipelines, all built from the same module: generation,
-    // intersection, and one shading pipeline per material (the host sorts the
-    // wave by material and dispatches each bucket to its own pipeline).  The
-    // host runs gen -> intersect -> {shade buckets} per bounce, per sample.
-    int m_vk_gen       = -1;
-    int m_vk_intersect = -1;
+    // intersection, material compaction, and one shading pipeline per material
+    // (the device sorts the wave by material -- osl_vk_wave_compact -- and the
+    // host dispatches each bucket to its own pipeline indirectly, because the
+    // bucket sizes are only known on the device).  The host runs
+    // gen -> [intersect -> compact -> bucket_tail -> {shade buckets}] per
+    // bounce, per sample.
+    int m_vk_gen         = -1;
+    int m_vk_intersect   = -1;
+    int m_vk_compact     = -1;
+    int m_vk_bucket_tail = -1;
     std::vector<int> m_vk_shade;
     // The material that shades the light primitives, as a dispatch id.  Every
     // shading kernel has to reach it for the explicit light sample.

@@ -366,15 +366,29 @@ struct FrameParams {
     long long wf_l_lid;                   ///< int, light primitive
     long long wf_s_skip1;                 ///< int, the surface both rays left
     long long wf_vis_bg, wf_vis_l;        ///< int, 1 when the ray got through
-    /// Material buckets.  The host sorts the wave by material and dispatches
-    /// one bucket per material, so a shading kernel only ever sees its own
-    /// shader.  `wf_bucket_index` is the int array holding every material's
-    /// list, and the list of material `m` starts at
-    /// `m * (npix + kWorkgroupSize)` ints into it.  The kernel derives that
-    /// base from the material its entry point was instantiated for, so the
-    /// host does not rewrite FrameParams between the per-material dispatches
-    /// -- which is what lets it record them all into one command buffer.
+    /// Material buckets.  The *device* sorts the wave by material (see
+    /// osl_vk_wave_compact in vulkan_render.cpp) and dispatches one bucket per
+    /// material, so a shading kernel only ever sees its own shader.
+    /// `wf_bucket_index` is the int array holding every material's list, and
+    /// the list of material `m` starts at `m * (npix + kWorkgroupSize)` ints
+    /// into it.  The kernel derives that base from the material its entry
+    /// point was instantiated for, so the host does not rewrite FrameParams
+    /// between the per-material dispatches -- which is what lets it record
+    /// them all into one command buffer.
     long long wf_bucket_index;
+    /// The compaction state, also device-side: one int counter per material
+    /// (always zero at the start of a wave -- osl_vk_wave_bucket_tail resets
+    /// it once it has used it), and the `uint[3]` group-count triple per
+    /// material that vkCmdDispatchIndirect reads, so the host never has to
+    /// learn how many pixels each bucket ended up with.
+    long long wf_mat_count;
+    long long wf_dispatch_args;
+    /// Material count and the material a wave falls back to when a pixel has
+    /// no hit (a miss or a dead path).  Every shading kernel can shade the
+    /// light, so misses go to the light group -- exactly what the host used to
+    /// decide while it owned the sort.
+    int num_materials;
+    int fallback_mat;
 };
 
 /// Where FrameParams sits: the first bytes of the buffer, so the kernel can

@@ -1100,6 +1100,13 @@ bool vulkan_build_render_module (const std::vector<std::string>& group_ir,
         std::vector<std::pair<std::string, std::string>> kernels;
         kernels.push_back({ "osl_kernel_gen", "osl_vk_wave_gen" });
         kernels.push_back({ "osl_kernel_intersect", "osl_vk_wave_intersect" });
+        // Material compaction runs on the device (vulkan_render.cpp pass 3a):
+        // `compact` bins the wave by material with an atomic cursor per
+        // material, `bucket_tail` closes the buckets, publishes the
+        // vkCmdDispatchIndirect group counts and resets the cursors step.
+        kernels.push_back({ "osl_kernel_compact", "osl_vk_wave_compact" });
+        kernels.push_back({ "osl_kernel_bucket_tail",
+                            "osl_vk_wave_bucket_tail" });
         auto closure_set_tag = [&](size_t i) -> std::string {
             const unsigned cs = group_cs[i];
             if (cs == osl_vk_abi::kClosureSetBG)

@@ -347,7 +347,11 @@ bool VulkanShading::init(std::string& err)
     VkBufferCreateInfo bci {};
     bci.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bci.size        = I.buffer_bytes;
-    bci.usage       = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    // INDIRECT: the material buckets are sized on the device (pass 3a writes
+    // the group counts), so their dispatches go through vkCmdDispatchIndirect
+    // with an argument block inside this same buffer.
+    bci.usage       = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                    | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
     bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     VK_TRY(vkCreateBuffer(I.device, &bci, nullptr, &I.buffer), err);
 
@@ -673,6 +677,55 @@ bool VulkanShading::record_dispatch(int id, unsigned groups, std::string& err)
     return true;
 }
 
+
+
+bool VulkanShading::record_dispatch_indirect(int id, size_t args,
+                                             std::string& err)
+{
+    Impl& I = *m_impl;
+    if (!I.batching) {
+        err = "record_dispatch_indirect() outside a batch";
+        return false;
+    }
+    if (id < 0 || id >= (int)I.pipelines.size()) {
+        err = "record_dispatch_indirect with an unknown pipeline id";
+        return false;
+    }
+    // VkDispatchIndirectCommand is three uint32, and vkCmdDispatchIndirect
+    // wants a 4-byte aligned offset.
+    if (args % 4 || args + 12 > I.buffer_bytes) {
+        err = "record_dispatch_indirect args out of range";
+        return false;
+    }
+    vkCmdBindPipeline(I.cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                      I.pipelines[id].pipe);
+    vkCmdBindDescriptorSets(I.cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            I.pipelines[id].layout, 0, 1, &I.dset, 0, nullptr);
+    vkCmdDispatchIndirect(I.cmdbuf, I.buffer, args);
+    return true;
+}
+
+
+bool VulkanShading::record_barrier(std::string& err)
+{
+    Impl& I = *m_impl;
+    if (!I.batching) {
+        err = "record_barrier() outside a batch";
+        return false;
+    }
+    // One storage buffer holds everything the passes hand to each other, so a
+    // whole-buffer barrier is the honest one: the passes write disjoint ranges,
+    // but the ranges are not known here, and a narrower barrier that misses one
+    // of them is a race that shows up as a few wrong pixels.
+    VkMemoryBarrier mb {};
+    mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(I.cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0,
+                         nullptr, 0, nullptr);
+    return true;
+}
 
 
 bool VulkanShading::end_batch(std::string& err)

@@ -77,6 +77,16 @@ public:
     /// is ~5k submissions per frame turning into ~2k.
     bool begin_batch(std::string& err);
     bool record_dispatch(int id, unsigned groups, std::string& err);
+    /// Same dispatch, but the group count comes from device memory: `args` is a
+    /// byte offset into the storage buffer of a `uint[3]` (groupCountX/Y/Z)
+    /// triple, which the device writes to.  This is what lets a bucket whose
+    /// size only the device knows still be dispatched by the host.
+    bool record_dispatch_indirect(int id, size_t args, std::string& err);
+    /// Storage-buffer barrier between two dispatches in the same command
+    /// buffer.  Batched passes hand data to each other through the frame
+    /// buffer (intersect -> compaction -> shading), and Vulkan only orders them
+    /// if the host says so.
+    bool record_barrier(std::string& err);
     bool end_batch(std::string& err);
 
     /// How many queue submissions this instance has made.  Each one costs a
