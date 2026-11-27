@@ -844,7 +844,7 @@ bool vulkan_collect_entry_names (llvm::Module& M, std::vector<std::string>& out,
 bool vulkan_build_render_module (const std::vector<std::string>& group_ir,
                                  const std::vector<std::vector<std::string>>& entries,
                                  std::string& out_ir, std::string& out_log,
-                                 int light_group)
+                                 const std::vector<int>& light_groups)
 {
     if (group_ir.size() != entries.size()) {
         out_log = "group IR and entry list sizes differ";
@@ -942,6 +942,9 @@ bool vulkan_build_render_module (const std::vector<std::string>& group_ir,
                                 break;
                             case 7: cs |= osl_vk_abi::kClosureSetWard; break;
                             case 8: cs |= osl_vk_abi::kClosureSetMF; break;
+                            case 18:  // conductor_bsdf (MaterialX)
+                                cs |= osl_vk_abi::kClosureSetMXC;
+                                break;
                             case 9:   // reflection
                             case 10:  // fresnel reflection
                             case 11:  // refraction
@@ -1054,11 +1057,15 @@ bool vulkan_build_render_module (const std::vector<std::string>& group_ir,
             return true;
         };
 
-        // One dispatcher per material, each restricted to that group plus the
+        // One dispatcher per material, each restricted to that group plus every
         // light group.  A per-material shading kernel calls only its own
         // dispatcher, so clspv sees the other groups as unreachable and drops
         // them from that kernel; without the restriction every kernel would
-        // pull in every shader and the split would be pointless.
+        // pull in every shader and the split would be pointless.  It has to be
+        // *every* light group: a scene can have more than one emitter (the
+        // shaderball scene has two, one per side), and a light primitive shaded
+        // through a dispatcher that cannot reach its group emits nothing, which
+        // silently drops the whole explicit-light contribution of that emitter.
         {
             std::vector<size_t> all;
             for (size_t i = 0; i < entries.size(); ++i)
@@ -1067,9 +1074,9 @@ bool vulkan_build_render_module (const std::vector<std::string>& group_ir,
                 return false;
             for (size_t i = 0; i < entries.size(); ++i) {
                 std::vector<size_t> allowed { i };
-                if (light_group >= 0 && (size_t)light_group < entries.size()
-                    && (size_t)light_group != i)
-                    allowed.push_back((size_t)light_group);
+                for (int lg : light_groups)
+                    if (lg >= 0 && (size_t)lg < entries.size() && (size_t)lg != i)
+                        allowed.push_back((size_t)lg);
                 if (!build_dispatch(
                         "osl_vk_shade_dispatch_" + std::to_string(i), allowed))
                     return false;

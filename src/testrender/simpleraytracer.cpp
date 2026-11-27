@@ -17,9 +17,16 @@ namespace pugi = OIIO::pugi;
 #    include "raytracer.h"
 #    include "shading.h"
 #    include "simpleraytracer.h"
+// For MiniMicrofacetGGX::get_energy(), whose table BSDL bakes into
+// BSDL/SPI/microfacet_tools_luts.h (pulled in by the impl header when
+// BAKE_BSDL_TABLES is not defined).  The conforming header has to pull in BSDL's
+// core declarations first, which is what bsdf_conductor_impl.h is here for.
+#    include <BSDL/MTX/bsdf_conductor_impl.h>
+#    include <BSDL/microfacet_tools_impl.h>
 #endif
 
 #include <cmath>
+#include <cstring>
 
 // The host-side Vulkan compute backend lives in liboslexec and pulls in LLVM,
 // std::string, <OSL/oslconfig.h> -- none of which can be compiled for the CUDA
@@ -31,6 +38,9 @@ namespace pugi = OIIO::pugi;
 #    include "vulkan_types.h"
 #    include "vulkan_module.h"
 #    include "clspv_util.h"
+#    include <OpenImageIO/imagebuf.h>
+#    include <OpenImageIO/imagebufalgo.h>
+#    include <cmath>
 #endif
 #include <algorithm>
 
@@ -1249,6 +1259,16 @@ SimpleRaytracer::antialias_pixel(int x, int y, ShadingContext* ctx)
         // trace eye ray (apply jitter from center of the pixel)
         Color3 r = subpixel_radiance(x + 0.5f + j.x, y + 0.5f + j.y, sampler,
                                      ctx);
+        // Per-sample dump of one pixel, the CPU counterpart of the Vulkan
+        // path's OSL_VULKAN_DEBUG_PIXEL print: with it the two tracers' four
+        // samples can be compared one by one instead of only their average.
+        if (const char* dbg = getenv("OSL_VULKAN_DEBUG_PIXEL")) {
+            int px = -1, py = -1;
+            if (sscanf(dbg, "%d,%d", &px, &py) == 2 && px == x && py == y)
+                fprintf(stderr, "[cpu] sample %d px(%d,%d) jitter(%.6f,%.6f) "
+                                "= %g %g %g\n",
+                        si, x, y, j.x, j.y, r.x, r.y, r.z);
+        }
         // mix in result via lerp for numerical stability
         result = OIIO::lerp(result, r, 1.0f / (si + 1));
     }
@@ -1273,7 +1293,10 @@ const size_t kShadeBlockStride = 640;
 
 
 static bool
-decode_texture(const std::string& filename, VulkanShading::Texture& out);
+decode_texture(const std::string& filename, VulkanShading::Texture& out,
+               int cap);
+static int
+choose_texture_cap(const std::vector<ustring>& names, double budget);
 
 
 bool
@@ -1364,18 +1387,22 @@ SimpleRaytracer::init_vulkan_shading()
             vulkan_report_failure("a material kept no Vulkan IR", nullptr);
         }
     }
-    // Which group shades the light primitives: every shading kernel needs it
-    // reachable for the explicit light sample, so it goes into the module
-    // builder before the module is assembled.
+    // Which groups shade the light primitives: every shading kernel needs them
+    // all reachable for the explicit light sample, so they go into the module
+    // builder before the module is assembled.  A scene can have more than one
+    // -- render-shaderball has two emitter groups, and a light primitive can
+    // belong to either -- and a kernel that can only reach one of them renders
+    // the light of that group as black.
     for (size_t i = 0; i < m_shaders.size(); ++i) {
         if (m_shader_is_light[i] && m_vk_dispatch_id[i] >= 0) {
-            m_vk_light_group = m_vk_dispatch_id[i];
-            break;
+            if (m_vk_light_group < 0)
+                m_vk_light_group = m_vk_dispatch_id[i];
+            m_vk_light_groups.push_back(m_vk_dispatch_id[i]);
         }
     }
     std::string mod_ir, log;
     if (!OSL::pvt::vulkan_build_render_module(irs, ents, mod_ir, log,
-                                              m_vk_light_group)) {
+                                              m_vk_light_groups)) {
         fprintf(stderr, "[vulkan] module assembly failed: %s\n", log.c_str());
         vulkan_report_failure("module assembly failed", log.c_str());
         return;
@@ -1471,11 +1498,20 @@ SimpleRaytracer::upload_vulkan_textures()
     if (!m_vk || m_vk_texture_names.empty())
         return;
     std::string err;
+    // Half the buffer, leaving the other half for the shade blocks and the
+    // importance table; scenes with a small texture set keep full resolution,
+    // and only the ones that cannot fit are reduced.
+    const double budget_mb = getenv("OSL_VULKAN_BUFFER_MB")
+                                 ? OIIO::Strutil::from_string<double>(
+                                       getenv("OSL_VULKAN_BUFFER_MB"))
+                                 : 256.0;
+    const int cap = choose_texture_cap(m_vk_texture_names,
+                                       0.5 * budget_mb * 1e6);
     std::vector<VulkanShading::Texture> texs;
     for (const auto& name : m_vk_texture_names) {
         VulkanShading::Texture t;
         t.hash = (unsigned long long)name.hash();
-        if (!decode_texture(name.string(), t)) {
+        if (!decode_texture(name.string(), t, cap)) {
             fprintf(stderr,
                     "[vulkan] texture '%s' could not be decoded on the host; "
                     "the device will sample it as missing\n",
@@ -1492,54 +1528,194 @@ SimpleRaytracer::upload_vulkan_textures()
 }
 
 
-// Decode one texture into RGBA32F, mip 0, for the device.  The .tx files the
-// test scenes use are plain images as far as ImageInput is concerned, so the
-// first subimage at mip 0 is the level the kernel samples.
-static bool
-decode_texture(const std::string& filename, VulkanShading::Texture& out)
+/// Longest side of the level the device gets.  The device samples RGBA32F
+/// texels out of the same storage buffer that holds the per-pixel shade blocks,
+/// so a scene's textures have to be a small part of it: the shaderball set is
+/// seven 2048^2 walls plus a 7500^2 ground plane, which as float texels with
+/// their mip chains is ~1.8 GB -- far past the 256 MB the buffer holds
+/// (`set_textures` refuses the whole upload and every `texture()` returns
+/// black).
+///
+/// The cap is therefore chosen per scene instead of being a constant: the
+/// textures keep their own resolution whenever the whole set fits in half the
+/// buffer, and only a set that does not fit is reduced (uniformly, so every
+/// texture keeps the same ratio between its texel size and the CPU's).  This
+/// matters for more than sharpness: a downscaled environment map moves its hot
+/// spots by a fraction of a texel, and with `render-raytypes`' 4-sample
+/// background those land on different pixels than the reference, which shows
+/// up as isolated pixels off by an order of magnitude.
+static const int kTexBaseMax = 2048;
+
+
+// Bytes one texture occupies on the device at a given base cap: the RGBA32F
+// levels of a chain, which is 4/3 of the base level.
+static double
+texture_chain_bytes(int w, int h, int cap, int nchans = 4)
 {
-    auto in = OIIO::ImageInput::open(filename);
-    if (!in)
+    (void)nchans;
+    int nw = w, nh = h;
+    int big = w > h ? w : h;
+    if (big > cap) {
+        if (w >= h) {
+            nw = cap;
+            nh = (int)std::lround((double)h * (double)cap / (double)w);
+        } else {
+            nh = cap;
+            nw = (int)std::lround((double)w * (double)cap / (double)h);
+        }
+    }
+    if (nw < 1)
+        nw = 1;
+    if (nh < 1)
+        nh = 1;
+    double bytes = 0.0, area = (double)nw * (double)nh;
+    while (nw > 1 || nh > 1) {
+        bytes += area * 16.0;
+        nw = nw > 1 ? nw / 2 : 1;
+        nh = nh > 1 ? nh / 2 : 1;
+        area = (double)nw * (double)nh;
+    }
+    bytes += area * 16.0;
+    return bytes;
+}
+
+
+// Pick the largest cap that keeps the decoded set inside `budget` bytes, then
+// fall back to halving until it does (128 texels is the floor, after which the
+// upload is going to fail anyway).
+static int
+choose_texture_cap(const std::vector<ustring>& names, double budget)
+{
+    std::vector<std::pair<int, int>> sizes;
+    sizes.reserve(names.size());
+    for (const auto& name : names) {
+        int w = 0, h = 0;
+        if (auto in = OIIO::ImageInput::open(name.string())) {
+            const OIIO::ImageSpec& spec = in->spec();
+            w = spec.width, h = spec.height;
+        }
+        sizes.push_back({ w, h });
+    }
+    for (int cap = kTexBaseMax; cap >= 128; cap /= 2) {
+        double total = 0.0;
+        for (const auto& s : sizes)
+            if (s.first > 0 && s.second > 0)
+                total += texture_chain_bytes(s.first, s.second, cap);
+        if (total <= budget || cap == 128) {
+            if (getenv("OSL_VULKAN_TEXTURE_TRACE"))
+                fprintf(stderr,
+                        "[vulkan] texture cap %d: %.1f MB for %zu texture(s)\n",
+                        cap, total * 1e-6, sizes.size());
+            return cap;
+        }
+    }
+    return 128;
+}
+
+
+// Decode one texture into RGBA32F, with a mip chain the kernel can walk.
+//
+// The .tx files the test scenes use carry a full chain, but the shaderball
+// walls ship as plain .exr at a resolution no storage buffer can hold, so the
+// chain is generated here: a box-filtered base at `kTexBaseMax` (or the image's
+// own size, if smaller), then repeated 2x2 averaging down to 1x1.  Every level
+// after the first is half the previous one, which is what the device's level
+// walk assumes.
+static bool
+decode_texture(const std::string& filename, VulkanShading::Texture& out,
+               int cap)
+{
+    OIIO::ImageBuf src(filename);
+    if (!src.read(0, 0, true, OIIO::TypeDesc::FLOAT))
         return false;
 
-    // The .tx files carry a full mip chain, and the CPU path picks a level per
-    // pixel from the texture derivatives.  Uploading every level lets the
-    // device do the same, instead of aliasing mip 0 at low sampling rates.
-    for (int level = 0;; ++level) {
-        OIIO::ImageSpec spec = in->spec(0, level);
-        if (spec.width <= 0 || spec.height <= 0)
-            break;
-        int nchans = spec.nchannels;
-        std::vector<float> raw((size_t)spec.width * spec.height * nchans);
-        if (!in->read_image(0, level, 0, nchans, OIIO::TypeDesc::FLOAT,
-                            raw.data()))
-            break;
-        if (level == 0) {
-            out.width  = spec.width;
-            out.height = spec.height;
+    int w = src.spec().width, h = src.spec().height;
+    if (w <= 0 || h <= 0)
+        return false;
+
+    // Base level: longest side capped, aspect preserved.
+    int nw  = w, nh = h;
+    int big = w > h ? w : h;
+    if (big > cap) {
+        if (w >= h) {
+            nw = cap;
+            nh = (int)std::lround((double)h * (double)cap / (double)w);
+        } else {
+            nh = cap;
+            nw = (int)std::lround((double)w * (double)cap / (double)h);
         }
-        if (getenv("OSL_VULKAN_TEXTURE_TRACE"))
-            fprintf(stderr, "[vulkan] texture level %d: %dx%d", level, spec.width,
-                    spec.height);
-        out.level_width.push_back(spec.width);
-        out.level_height.push_back(spec.height);
-        out.rgba.resize(out.rgba.size() + (size_t)spec.width * spec.height * 4);
-        float* dst0 = out.rgba.data() + out.rgba.size()
-            - (size_t)spec.width * spec.height * 4;
-        for (size_t i = 0, n = (size_t)spec.width * spec.height; i < n; ++i) {
-            const float* src = raw.data() + i * nchans;
-            float* dst       = dst0 + i * 4;
-            dst[0]           = src[0];
-            dst[1]           = nchans > 1 ? src[1] : src[0];
-            dst[2]           = nchans > 2 ? src[2] : src[0];
-            dst[3]           = nchans > 3 ? src[3] : 1.0f;
-        }
-        // A level of 1x1 is the end of the chain.
-        if (spec.width == 1 && spec.height == 1)
-            break;
+        if (nw < 1)
+            nw = 1;
+        if (nh < 1)
+            nh = 1;
+        // Box filter: the resize ratio is the mip ratio, so this is the same
+        // area average the CPU's own mip chain would hold, without aliasing the
+        // way a point-sampled reduction would.
+        OIIO::ImageBuf small;
+        small.reset(OIIO::ImageSpec(nw, nh, src.nchannels(),
+                                    OIIO::TypeDesc::FLOAT));
+        if (!OIIO::ImageBufAlgo::resize(small, src, {{"filtername", "box"}}))
+            return false;
+        src.copy(small);
     }
-    in->close();
-    return !out.level_width.empty();
+
+    if (getenv("OSL_VULKAN_TEXTURE_TRACE"))
+        fprintf(stderr, "[vulkan] texture %s: %dx%d -> %dx%d (mip chain)\n",
+                filename.c_str(), w, h, nw, nh);
+
+    // Level 0: expand whatever channel count the file has to RGBA.
+    out.width  = nw;
+    out.height = nh;
+    out.level_width.clear();
+    out.level_height.clear();
+    out.rgba.clear();
+    int nchans        = src.nchannels();
+    int lw = nw, lh = nh;
+    out.level_width.push_back(lw);
+    out.level_height.push_back(lh);
+    out.rgba.resize((size_t)lw * lh * 4);
+    {
+        // Go through the iterator rather than pixeladdr: it also handles a
+        // scanline-backed buffer whose rows are not contiguous in memory.
+        const int xbeg = src.roi().xbegin, ybeg = src.roi().ybegin;
+        OIIO::ImageBuf::ConstIterator<float> it(src);
+        for (; !it.done(); ++it) {
+            size_t idx = ((size_t)(it.y() - ybeg) * lw + (it.x() - xbeg)) * 4;
+            float* dst = out.rgba.data() + idx;
+            dst[0]     = it[0];
+            dst[1]     = nchans > 1 ? it[1] : it[0];
+            dst[2]     = nchans > 2 ? it[2] : it[0];
+            dst[3]     = nchans > 3 ? it[3] : 1.0f;
+        }
+    }
+
+    // The rest of the chain: 2x2 average of the level before it.
+    while (lw > 1 || lh > 1) {
+        int pw = lw, ph = lh;
+        lw = pw > 1 ? pw / 2 : 1;
+        lh = ph > 1 ? ph / 2 : 1;
+        size_t prev_off = out.rgba.size() - (size_t)pw * ph * 4;
+        size_t off0     = out.rgba.size();
+        out.rgba.resize(off0 + (size_t)lw * lh * 4);
+        const float* p = out.rgba.data() + prev_off;
+        float* cur     = out.rgba.data() + off0;
+        for (int y = 0; y < lh; ++y) {
+            int y0 = 2 * y, y1 = 2 * y + 1 < ph ? 2 * y + 1 : ph - 1;
+            for (int x = 0; x < lw; ++x) {
+                int x0 = 2 * x, x1 = 2 * x + 1 < pw ? 2 * x + 1 : pw - 1;
+                const float* a = p + ((size_t)y0 * pw + x0) * 4;
+                const float* b = p + ((size_t)y0 * pw + x1) * 4;
+                const float* c = p + ((size_t)y1 * pw + x0) * 4;
+                const float* d = p + ((size_t)y1 * pw + x1) * 4;
+                float* o       = cur + ((size_t)y * lw + x) * 4;
+                for (int k = 0; k < 4; ++k)
+                    o[k] = 0.25f * (a[k] + b[k] + c[k] + d[k]);
+            }
+        }
+        out.level_width.push_back(lw);
+        out.level_height.push_back(lh);
+    }
+    return true;
 }
 
 
@@ -1838,6 +2014,28 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
     }
     size_t bvh_off  = take(nbnodes * sizeof(BvhNodeVK));
     size_t bidx_off = take(nbvidx * sizeof(unsigned));
+    if (getenv("OSL_VULKAN_PROBE_NEE")) {
+        fprintf(stderr, "[vulkan] shader dispatch table: %zu groups\n",
+                m_vk_dispatch_id.size());
+        for (size_t i = 0; i < m_vk_dispatch_id.size(); ++i) {
+            fprintf(stderr, "[vulkan]   scene shader %zu -> dispatch %d%s\n", i,
+                    m_vk_dispatch_id[i],
+                    i < m_shader_is_light.size() && m_shader_is_light[i]
+                        ? " (light)"
+                        : "");
+        }
+        for (size_t i = 0; i < m_lightprims.size(); ++i) {
+            const int prim = m_lightprims[i];
+            const int sid  = scene.shaderid(prim);
+            fprintf(stderr,
+                    "[vulkan]   lightprim %zu: prim %d scene shader %d dispatch "
+                    "%d\n",
+                    i, prim, sid,
+                    sid >= 0 && sid < (int)m_vk_dispatch_id.size()
+                        ? m_vk_dispatch_id[sid]
+                        : -99);
+        }
+    }
     if (getenv("OSL_VULKAN_DEBUG_PIXEL")) {
         fprintf(stderr,
                 "[vulkan] surfacearea: %zu meshes, tri_area[0]=%g tri_area[%zu]=%g\n",
@@ -2165,6 +2363,14 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
     fp.wf_dispatch_args  = (long long)wf_dispatch_args;
     fp.num_materials     = (int)nmat;
     fp.fallback_mat      = m_vk_light_group >= 0 ? m_vk_light_group : 0;
+    // The GGX multiple-scattering energy table the MaterialX conductor's
+    // Turquin lobe needs.  Same bytes the CPU reads: BSDL bakes
+    // MiniMicrofacetGGX::get_energy() out of genluts.cpp, and the device
+    // kernel used to carry its own copy as a module-scope constant array --
+    // which Intel's driver refused to compile (see FrameParams::mx_energy).
+    std::memcpy(fp.mx_energy,
+                bsdl::spi::MiniMicrofacetGGX::get_energy().data,
+                sizeof(fp.mx_energy));
     fp.lightprim_offset  = (long long)lp_off;
     fp.num_lightprims    = (int)lp_count;
     fp.area_offset       = (long long)area_off;
@@ -2224,6 +2430,35 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
         return false;
 
     if (bg_res) {
+        // Table statistics, for chasing a firefly: `values` is radiance/pdf, so
+        // its maximum tells whether a single background sample can legitimately
+        // be as bright as a stray pixel.  Off unless OSL_VULKAN_PROBE_NEE is
+        // set.
+        if (getenv("OSL_VULKAN_PROBE_NEE")) {
+            const Vec3* v = background.table_values();
+            Vec3 vmax(0, 0, 0), vsum(0, 0, 0);
+            int argmax = -1, argy = -1, argx = -1;
+            for (int y = 0; y < (int)bg_res; ++y)
+                for (int x = 0; x < (int)bg_res; ++x) {
+                    const Vec3& e = v[y * bg_res + x];
+                    vsum += e;
+                    float m = std::max(std::max(e.x, e.y), e.z);
+                    float mm = std::max(std::max(vmax.x, vmax.y), vmax.z);
+                    if (m > mm) {
+                        vmax   = e;
+                        argmax = y * bg_res + x;
+                        argx   = x;
+                        argy   = y;
+                    }
+                }
+            const double n = (double)bg_res * (double)bg_res;
+            fprintf(stderr,
+                    "[vulkan] bg table %dx%d: max (%g,%g,%g) at (%d,%d), mean "
+                    "(%g,%g,%g)\n",
+                    (int)bg_res, (int)bg_res, vmax.x, vmax.y, vmax.z, argx,
+                    argy, vsum.x / n, vsum.y / n, vsum.z / n);
+            (void)argmax;
+        }
         if (!put(bg_vals_off, background.table_values(),
                  bg_res * bg_res * sizeof(Vec3))
             || !put(bg_rows_off, background.table_rows(),
@@ -2481,6 +2716,29 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
                 if (pending[i])
                     any_nee = true;
             }
+            // Diagnostics: how the NEE shadow rays fared in the intersect pass
+            // that just ran.  `pending` here is already the *next* request set,
+            // so the counts are per wave, not per request -- enough to see
+            // whether the light rays are reaching the emitter at all.
+            if (getenv("OSL_VULKAN_PROBE_NEE") && s == 0) {
+                std::vector<int> visl(npix), visbg(npix);
+                m_vk->download(fp.wf_vis_l, visl.data(), npix * sizeof(int),
+                               err);
+                m_vk->download(fp.wf_vis_bg, visbg.data(),
+                               npix * sizeof(int), err);
+                int hit_l = 0, hit_bg = 0, pend_l = 0, pend_bg = 0, live_n = 0;
+                for (size_t i = 0; i < npix; ++i) {
+                    hit_l += visl[i] ? 1 : 0;
+                    hit_bg += visbg[i] ? 1 : 0;
+                    pend_l += (pending[i] & 2) ? 1 : 0;
+                    pend_bg += (pending[i] & 1) ? 1 : 0;
+                    live_n += live[i] ? 1 : 0;
+                }
+                fprintf(stderr,
+                        "[vulkan] probe b=%d: live=%d light_vis=%d bg_vis=%d "
+                        "next_pend_l=%d next_pend_bg=%d\n",
+                        b, live_n, hit_l, hit_bg, pend_l, pend_bg);
+            }
             if (!any_live && !any_nee) {
                 waves_skipped += bounces - b;
                 break;
@@ -2492,6 +2750,19 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
             errhandler().errorfmt("[vulkan] sample {} read-back failed: {}", s,
                                   err);
             return false;
+        }
+        // Per-sample dump of one pixel, for chasing a value that only one of
+        // the four samples contributes (a silhouette flip, a stray light
+        // sample).  Off unless OSL_VULKAN_DEBUG_PIXEL=x,y is set.
+        if (const char* dbg = getenv("OSL_VULKAN_DEBUG_PIXEL")) {
+            int px = -1, py = -1;
+            if (sscanf(dbg, "%d,%d", &px, &py) == 2 && px >= 0 && py >= 0
+                && (size_t)px < (size_t)xres && (size_t)py < (size_t)yres) {
+                size_t i = ((size_t)py * (size_t)xres + (size_t)px) * 4;
+                fprintf(stderr,
+                        "[vulkan] sample %d px(%d,%d) = %g %g %g\n", s, px, py,
+                        one[i], one[i + 1], one[i + 2]);
+            }
         }
         for (size_t i = 0; i < image.size(); ++i)
             image[i] += one[i];

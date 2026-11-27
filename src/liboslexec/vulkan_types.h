@@ -62,10 +62,12 @@ static const unsigned kClosureSetDelta = 1u << 4;  // mirror / refraction /
                                                    // transparent
 static const unsigned kClosureSetPhong = 1u << 5;  // phong: glossy, one lobe
 static const unsigned kClosureSetON    = 1u << 6;  // oren_nayar: rough diffuse
+static const unsigned kClosureSetMXC   = 1u << 7;  // MaterialX conductor
+                                                   // (conductor_bsdf: GGX)
 // Every family, including the ones no instantiation is tagged for: a set with
 // no entry of its own resolves to the `_all` body, which is instantiated with
 // this value, so `if constexpr (CS & kClosureSetPhong)` is live there.
-static const unsigned kClosureSetAll   = 127u;
+static const unsigned kClosureSetAll   = 255u;
 
 struct Vec3 {
     float x, y, z;
@@ -394,6 +396,21 @@ struct FrameParams {
     /// decide while it owned the sort.
     int num_materials;
     int fallback_mat;
+    /// `MiniMicrofacetGGX`'s energy-compensation table (Nf*Nr*Nc = 1*16*16
+    /// floats: 16 roughness rows of 16 cosines), uploaded by testrender
+    /// straight from BSDL's generated `BSDL/SPI/microfacet_tools_luts.h`.  The
+    /// MaterialX conductor's Turquin lobe multiplies in the multiple-scattering
+    /// energy E_ms, which is a lookup in this table.
+    ///
+    /// It used to be a module-scope `static const float[256]` inside the
+    /// kernel, indexed dynamically.  clspv turned that into a private array
+    /// with a runtime access chain, and Intel's driver aborted at
+    /// vkCreateComputePipelines (0xC0000005) for `osl_kernel_shade1` -- A/B
+    /// verified: with the lookup stubbed out the same module created every
+    /// pipeline.  In the storage buffer a dynamic index is the ordinary case
+    /// (the background importance table already does it), so the table rides
+    /// with the frame parameters instead.
+    float mx_energy[256];
 };
 
 /// Where FrameParams sits: the first bytes of the buffer, so the kernel can

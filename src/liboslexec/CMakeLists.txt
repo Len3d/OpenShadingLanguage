@@ -295,6 +295,7 @@ if (VULKAN_SHADEOPS_CLANG)
     add_custom_command (OUTPUT ${vk_shadeops_bc}
         COMMAND ${VULKAN_SHADEOPS_CLANG}
             -target spirv64 -emit-llvm -c -O2
+            -ffp-contract=off
             -fno-rtti -fno-exceptions
             -I${CMAKE_CURRENT_SOURCE_DIR}
             -o ${vk_shadeops_bc} ${vk_shadeops_src}
@@ -319,6 +320,7 @@ if (VULKAN_SHADEOPS_CLANG)
     add_custom_command (OUTPUT ${vk_render_bc}
         COMMAND ${VULKAN_SHADEOPS_CLANG}
             -target spirv64 -emit-llvm -c -O2
+            -ffp-contract=off
             -fno-rtti -fno-exceptions
             -I${CMAKE_CURRENT_SOURCE_DIR}
             -o ${vk_render_bc} ${vk_render_src}

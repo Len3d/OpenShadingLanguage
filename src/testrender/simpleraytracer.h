@@ -193,6 +193,10 @@ private:
     // The material that shades the light primitives, as a dispatch id.  Every
     // shading kernel has to reach it for the explicit light sample.
     int m_vk_light_group = -1;
+    /// Every group that shades light primitives, as dispatch ids.  A scene can
+    /// have several emitter groups, and every shading kernel has to be able to
+    /// reach all of them for the explicit light sample.
+    std::vector<int> m_vk_light_groups;
     // Textures the shaders referenced while compiling; recorded by the
     // get_texture_handle() override and uploaded to the device.
     std::vector<ustring> m_vk_texture_names;

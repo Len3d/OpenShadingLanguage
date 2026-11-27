@@ -44,16 +44,18 @@ bool vulkan_collect_entry_names (llvm::Module& M, std::vector<std::string>& out,
 /// `osl_vk_shade_dispatch` plus the compute kernel.  Returns the module as IR
 /// text, ready for clspv `-x ir`.
 ///
-/// `light_group` is the group index that shades the light primitives for
-/// explicit light sampling.  When it is given, one shading kernel is emitted
+/// `light_groups` are the group indices that shade the light primitives for
+/// explicit light sampling.  When given, one shading kernel is emitted
 /// per material, and each of those kernels can only reach its own group plus
-/// the light group -- that is what keeps one shader's code per kernel instead
-/// of every shader in every kernel.
+/// the light groups -- that is what keeps one shader's code per kernel instead
+/// of every shader in every kernel.  The list may hold more than one entry: a
+/// scene can have several emitter groups, and a light primitive may belong to
+/// any of them.
 OSL_DLL_EXPORT bool vulkan_build_render_module (
     const std::vector<std::string>& group_ir,
                                  const std::vector<std::vector<std::string>>& entries,
                                  std::string& out_ir, std::string& out_log,
-                                 int light_group = -1);
+                                 const std::vector<int>& light_groups = {});
 
 }  // namespace pvt
 

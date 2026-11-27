@@ -843,8 +843,11 @@ osl_texture(GlobalPtr sg, unsigned long long namehash, GlobalPtr opt,
         }
         GlobalFloatCPtr lvl = (GlobalFloatCPtr)(block + kTexDataOffset + lv_off);
 
-        // OIIO's texture coordinates put t=0 at the *bottom* of the image, while
-        // the decoded rows start at the top, so v has to be flipped.
+        // OIIO's texture coordinates put t=0 at the *bottom* of the image, and
+        // the order the host stores the rows in already matches that, so t
+        // indexes them directly.  Flipping t here was measured to be wrong: it
+        // mirrored the environment map and pushed render-raytypes from
+        // mean 0.0095 up to 0.072.
         float x  = s * (float)lw - 0.5f;
         float y  = t * (float)lh - 0.5f;
         int x0   = floori(x);

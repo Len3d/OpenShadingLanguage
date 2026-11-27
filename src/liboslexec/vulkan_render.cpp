@@ -137,8 +137,17 @@ inline Vec3 cross(const Vec3& a, const Vec3& b)
 inline float length(const Vec3& a) { return __builtin_sqrtf(dot(a, a)); }
 inline Vec3 normalize(const Vec3& a)
 {
+    // Divide, do not multiply by the reciprocal: Imath's normalize()
+    // (ImathVec.h:2083) divides each component by the length and says
+    // explicitly why -- `1/l` can overflow, and even when it does not, the
+    // reciprocal rounds first and the product rounds again, so the result
+    // differs from the CPU's by an ulp on a large fraction of vectors.  An ulp
+    // in the camera-ray direction decides whether a sample that grazes a
+    // silhouette hits the surface, and in render-raytypes that flips whole
+    // pixels by an order of magnitude (the reference is a 4-sample frame, so a
+    // single sample carries a quarter of the pixel).
     float l = length(a);
-    return l > 0.0f ? mul(a, 1.0f / l) : a;
+    return l > 0.0f ? mk(a.x / l, a.y / l, a.z / l) : a;
 }
 /// Two vectors spanning the plane perpendicular to `d` -- the same construction
 /// OSL's `ortho()` uses, so the texture derivatives line up with the CPU ones.
@@ -1154,6 +1163,8 @@ struct ClosureEntryVK {
     int refract;           ///< microfacet lobe: 0 reflection, 1 transmission
     float exponent;        ///< phong falloff exponent (PhongParams.exponent)
     float sigma;           ///< oren_nayar roughness (OrenNayarParams.sigma)
+    Vec3 ior;              ///< conductor: real part of the complex IOR
+    Vec3 ext;              ///< conductor: extinction (the imaginary part)
     long long off;  ///< arena offset of the node, for parameters read on demand
 };
 
@@ -1559,6 +1570,298 @@ inline void on_sample_vk (const ClosureEntryVK& p, const Vec3& wo, float rx,
     on_eval_vk (p, wo, wi, weight, pdf);
 }
 
+// ---------------------------------------------------------------------------
+// MaterialX conductor (`conductor_bsdf`), device side
+// ---------------------------------------------------------------------------
+//
+// testrender turns this closure into BSDL's `mtx::ConductorLobe`
+// (shading.cpp:105): a GGX microfacet distribution whose Fresnel term comes
+// from the *complex* refractive index (`ConductorFresnel`, bsdf_conductor_impl.h
+// :19-76), evaluated and sampled with Turquin's multiple-scattering
+// compensation (microfacet_tools_impl.h:341-391).
+//
+// Nothing of that is Beckmann, so it cannot ride on the `mf_*` path above: the
+// distribution, the Fresnel term and the energy compensation all differ.  The
+// lobe's own weight carries the Fresnel factor (unlike Oren-Nayar, where the
+// weight is a scalar), which is why the albedo handed to `closure_entry_albedo`
+// stays the plain closure weight and the colour arrives with the sampled
+// weight.
+static const int MX_CONDUCTOR_ID_VK = 18;
+
+/// `GGXDist` (microfacet_tools_decl.h:13-47): the anisotropic GGX slope
+/// distribution, built from MaterialX's raw x/y roughness the way
+/// `ConductorLobe` builds it (bsdf_conductor_impl.h:89-107) -- re-derive the
+/// roughness/anisotropy parameterisation, regularise the roughness against the
+/// path roughness, then square it into the two alphas.
+struct GgxVK {
+    float ax, ay;
+    float roughness;  ///< the regularised roughness the energy table is indexed by
+};
+
+inline GgxVK ggx_make (float rx_in, float ry_in, float path_roughness)
+{
+#pragma clang fp contract(off)
+    const float rx = vk_clampf (rx_in, 1e-4f, 2.0f);  // BSDL::EPSILON
+    const float ry = vk_clampf (ry_in, 1e-4f, 2.0f);
+    const float a1 = rx > ry ? rx : ry;
+    const float a2 = rx > ry ? ry : rx;
+    const float b     = a2 / a1;
+    const float aniso = (1.0f - b) / (1.0f + b);
+    // BsdfGlobals::regularize_roughness (bsdf_impl.h:143): the path roughness
+    // widens the lobe of a ray that already travelled through a rough bounce.
+    float rough = __builtin_sqrtf (a1 / (1.0f + aniso));
+    rough       = 1.0f - (1.0f - rough) * (1.0f - path_roughness);
+    const float an = rx < ry ? -aniso : aniso;
+    const float r2 = rough * rough;
+    GgxVK d;
+    d.ax        = bmaxf (r2 * (1.0f + an), 1e-5f);  // GGXDist's ALPHA_MIN
+    d.ay        = bmaxf (r2 * (1.0f - an), 1e-5f);
+    d.roughness = rough;
+    return d;
+}
+
+inline float ggx_D_vk (const GgxVK& d, const Vec3& h)
+{
+#pragma clang fp contract(off)
+    const float cx  = h.x / d.ax;
+    const float cy  = h.y / d.ay;
+    const float c2  = cx * cx + cy * cy;
+    const float cz2 = h.z * h.z;
+    const float t   = cz2 + c2;
+    return 1.0f / (3.14159274f * d.ax * d.ay * t * t);
+}
+
+inline float ggx_G1_vk (const GgxVK& d, Vec3 w)
+{
+#pragma clang fp contract(off)
+    w = mk (w.x * d.ax, w.y * d.ay, w.z);
+    return 2.0f * w.z / (w.z + length (w));
+}
+
+inline float ggx_G2_G1_vk (const GgxVK& d, Vec3 wi, Vec3 wo)
+{
+#pragma clang fp contract(off)
+    wi            = mk (wi.x * d.ax, wi.y * d.ay, wi.z);
+    wo            = mk (wo.x * d.ax, wo.y * d.ay, wo.z);
+    const float nl = length (wi);
+    const float nv = length (wo);
+    return wi.z * (wo.z + nv) / (wo.z * nl + wi.z * nv);
+}
+
+/// `GGXDist::D_refl_D` -- the bounded-VNDF factor of Eto & Tokuyoshi, which is
+/// also the pdf of `sample_for_refl` (microfacet_tools_impl.h:97-111).
+inline float ggx_D_refl_D_vk (const GgxVK& d, const Vec3& wo, const Vec3& m)
+{
+#pragma clang fp contract(off)
+    (void)m;
+    const float axl = wo.x * d.ax, ayl = wo.y * d.ay;
+    const float len2 = axl * axl + ayl * ayl;
+    const float t    = __builtin_sqrtf (len2 + wo.z * wo.z);
+    const float a    = vk_clampf (d.ax < d.ay ? d.ax : d.ay, 0.0f, 1.0f);
+    const float s    = 1.0f + __builtin_sqrtf (wo.x * wo.x + wo.y * wo.y);
+    const float a2 = a * a, s2 = s * s;
+    const float k = (1.0f - a2) * s2 / (s2 + a2 * wo.z * wo.z);
+    return 2.0f * wo.z / (k * wo.z + t);
+}
+
+inline Vec3 ggx_sample_for_refl_vk (const GgxVK& d, const Vec3& wo, float randu,
+                                    float randv)
+{
+#pragma clang fp contract(off)
+    const Vec3 i_std = normalize (mk (wo.x * d.ax, wo.y * d.ay, wo.z));
+    const float phi  = 6.28318548f * randu;
+    const float a    = vk_clampf (d.ax < d.ay ? d.ax : d.ay, 0.0f, 1.0f);
+    const float s    = 1.0f + __builtin_sqrtf (wo.x * wo.x + wo.y * wo.y);
+    const float a2 = a * a, s2 = s * s;
+    const float k = (1.0f - a2) * s2 / (s2 + a2 * wo.z * wo.z);
+    const float b = k * i_std.z;
+    const float z = (1.0f - randv) * (1.0f + b) - b;
+    const float sinTheta
+        = __builtin_sqrtf (vk_clampf (1.0f - z * z, 0.0f, 1.0f));
+    // BSDLConfig::Fast::cosf/sinf are std::cos/std::sin (double) on the CPU;
+    // the float forms differ by ~1 ulp, which only matters as a mip-level
+    // wobble in the reflected environment lookup.
+    const Vec3 o_std = mk (sinTheta * __builtin_cosf (phi),
+                           sinTheta * __builtin_sinf (phi), z);
+    const Vec3 m_std = add (i_std, o_std);
+    return normalize (mk (m_std.x * d.ax, m_std.y * d.ay, m_std.z));
+}
+
+/// `ConductorFresnel::eval` (bsdf_conductor_impl.h:19-42), one channel: the
+/// Fresnel term of a conductor with complex index `n - i*k`, for the angle
+/// between the view direction and the microfacet normal.
+inline float conductor_fresnel_ch (float cos_theta, float n, float k)
+{
+#pragma clang fp contract(off)
+    const float FLT_MIN_ = 1.17549435e-38f;
+    cos_theta            = vk_clampf (cos_theta, 0.0f, 1.0f);
+    const float ct2 = cos_theta * cos_theta;
+    const float st2 = 1.0f - ct2;
+    const float n2 = n * n, k2 = k * k;
+    const float t0     = n2 - k2 - st2;
+    const float a2b2   = __builtin_sqrtf (t0 * t0 + 4.0f * n2 * k2);
+    const float t1     = a2b2 + ct2;
+    const float a      = __builtin_sqrtf (0.5f * (a2b2 + t0));
+    const float t2     = (2.0f * cos_theta) * a;
+    float den          = t1 + t2;
+    den                = den > FLT_MIN_ ? den : FLT_MIN_;
+    const float rs     = (t1 - t2) / den;
+    const float t3     = ct2 * a2b2 + st2 * st2;
+    const float t4     = t2 * st2;
+    float den2         = t3 + t4;
+    den2               = den2 > FLT_MIN_ ? den2 : FLT_MIN_;
+    const float rp     = rs * (t3 - t4) / den2;
+    return vk_clampf (0.5f * (rp + rs), 0.0f, 2.0f);
+}
+
+inline Vec3 conductor_fresnel_vk (float cos_theta, const Vec3& ior,
+                                  const Vec3& ext)
+{
+    return mk (conductor_fresnel_ch (cos_theta, ior.x, ext.x),
+               conductor_fresnel_ch (cos_theta, ior.y, ext.y),
+               conductor_fresnel_ch (cos_theta, ior.z, ext.z));
+}
+
+/// `ConductorFresnel::avg` (bsdf_conductor_impl.h:62-76): the cosine-weighted
+/// average Fresnel, a two-variable fit of (ior, extinction).
+inline Vec3 conductor_avg_vk (const Vec3& ior, const Vec3& ext)
+{
+#pragma clang fp contract(off)
+    const float a = -0.32775145f, b = 0.18346033f, c = 0.61146583f,
+                dd = -0.07785134f;
+    float r[3];
+    r[0] = a + b * ior.x + c * ext.x + dd * ior.x * ext.x;
+    r[1] = a + b * ior.y + c * ext.y + dd * ior.y * ext.y;
+    r[2] = a + b * ior.z + c * ext.z + dd * ior.z * ext.z;
+    return mk (vk_clampf (r[0] / (1.0f + r[0]), 0.0f, 1.0f),
+               vk_clampf (r[1] / (1.0f + r[1]), 0.0f, 1.0f),
+               vk_clampf (r[2] / (1.0f + r[2]), 0.0f, 1.0f));
+}
+
+/// `TabulatedEnergyCurve<MiniMicrofacetGGX>::Emiss_eval` (microfacet_tools_impl.h
+/// :113-210): linear in roughness between the 16 rows, and linear in cosine
+/// over the table's own non-uniform cosine spacing (`get_cosine(i)` = (i/15)^2,
+/// floored at 1e-6).
+inline float mx_emiss_vk (VK_GLOBAL const FrameParams* fp, float roughness, float c)
+{
+#pragma clang fp contract(off)
+    const int Nc = 16;
+    float rf     = roughness * 15.0f;
+    int ra       = (int)rf;
+    ra           = ra < 0 ? 0 : (ra > 15 ? 15 : ra);
+    int rb       = ra + 1 < 15 ? ra + 1 : 15;
+    rf -= (float)ra;
+    if (c < 0.0f)
+        c = 0.0f;
+    float cos0 = 1e-6f;
+    if (c <= cos0)
+        return fp->mx_energy[ra * Nc] * (1.0f - rf)
+               + fp->mx_energy[rb * Nc] * rf;
+    for (int i = 1; i < Nc; ++i) {
+        const float q   = (float)i * (1.0f / 15.0f);
+        const float cos1 = bmaxf (q * q, 1e-6f);
+        if (c < cos1) {
+            const float t = (c - cos0) / (cos1 - cos0);
+            const float ea = fp->mx_energy[ra * Nc + i - 1];
+            const float eb = fp->mx_energy[rb * Nc + i - 1];
+            const float ec = fp->mx_energy[ra * Nc + i];
+            const float ed = fp->mx_energy[rb * Nc + i];
+            return (ea + (ec - ea) * t) + ((eb + (ed - eb) * t)
+                                          - (ea + (ec - ea) * t)) * rf;
+        }
+        cos0 = cos1;
+    }
+    return fp->mx_energy[ra * Nc + Nc - 1] * (1.0f - rf)
+           + fp->mx_energy[rb * Nc + Nc - 1] * rf;
+}
+
+/// BSDL's `Frame(Z, X)` (tools.h): a right-handed basis with Z along the lobe
+/// normal and X as close to the given tangent as orthogonality allows.  It is
+/// *not* `pixar_frame`: the conductor is the one family whose data carries an
+/// explicit tangent, and the CPU orients the GGX ellipse in that basis.
+inline void mx_conductor_frame (const Vec3& N, const Vec3& U, Vec3& X, Vec3& Y)
+{
+    Vec3 nU = normalize (U);
+    float mx = __builtin_fabsf (U.x), my = __builtin_fabsf (U.y),
+          mz = __builtin_fabsf (U.z);
+    float m = mx > my ? mx : my;
+    m       = m > mz ? m : mz;
+    if (m < 1e-4f || __builtin_fabsf (dot (N, nU)) > 0.999f) {
+        // Frame::ortho_build (Duff et al., tools.h)
+        const float s = __builtin_copysignf (1.0f, N.z);
+        const float a = -1.0f / (s + N.z);
+        const float b = N.x * N.y * a;
+        X = mk (1.0f + s * N.x * N.x * a, s * b, -s * N.x);
+        Y = mk (b, s + N.y * N.y * a, -N.y);
+    } else {
+        Y = normalize (cross (N, U));
+        X = cross (Y, N);
+    }
+}
+
+/// `eval_turquin_microms_reflection` (microfacet_tools_impl.h:341-372), the
+/// multiple-scattering compensated GGX reflection lobe.
+inline void mx_conductor_eval_vk (VK_GLOBAL const FrameParams* fp,
+                                  const ClosureEntryVK& p, const Vec3& wo,
+                                  const Vec3& wi, Vec3& weight, float& pdf)
+{
+#pragma clang fp contract(off)
+    weight = mk (0.0f, 0.0f, 0.0f);
+    pdf    = 0.0f;
+    const Vec3 N = visible_normal_vk (wo, p.N);
+    Vec3 X, Y;
+    mx_conductor_frame (N, p.U, X, Y);
+    const Vec3 woL = mk (dot (wo, X), dot (wo, Y), dot (wo, N));
+    const Vec3 wiL = mk (dot (wi, X), dot (wi, Y), dot (wi, N));
+    if (!(woL.z > 0.0f) || !(wiL.z > 0.0f))
+        return;
+    const GgxVK d = ggx_make (p.xalpha, p.yalpha, 0.0f);
+    const Vec3 mh = normalize (add (woL, wiL));
+    const float cosMO = dot (mh, woL);
+    const float D     = ggx_D_vk (d, mh);
+    const float DrD   = ggx_D_refl_D_vk (d, woL, mh);
+    const float D_refl = DrD * D;
+    const float G1     = ggx_G1_vk (d, woL);
+    pdf                = D_refl / (4.0f * woL.z);
+    const float out    = ggx_G2_G1_vk (d, wiL, woL) * G1 / DrD;
+    const Vec3 F       = conductor_fresnel_vk (cosMO, p.ior, p.ext);
+    // Turquin's "Practical multiple scattering compensation", eq. 16: the
+    // single-scatter lobe plus the energy the microfacets re-scatter, scaled by
+    // the tabulated multiple-scattering energy.
+    const float E_ms = mx_emiss_vk (fp, d.roughness, woL.z);
+    const float msf  = E_ms / bmaxf (0.01f, 1.0f - E_ms);
+    weight = mul (mulv (F, add (mk (1.0f, 1.0f, 1.0f), mul (F, msf))), out);
+}
+
+/// `sample_turquin_microms_reflection`: draw a micro normal from the bounded
+/// VNDF, reflect, then evaluate there -- which is why the sampled weight is the
+/// full BRDF value rather than the albedo.
+inline void mx_conductor_sample_vk (VK_GLOBAL const FrameParams* fp,
+                                    const ClosureEntryVK& p, const Vec3& wo,
+                                    float rx, float ry, Vec3& wi, Vec3& weight,
+                                    float& pdf)
+{
+#pragma clang fp contract(off)
+    weight = mk (0.0f, 0.0f, 0.0f);
+    pdf    = 0.0f;
+    wi     = mul (wo, -1.0f);
+    const Vec3 N = visible_normal_vk (wo, p.N);
+    Vec3 X, Y;
+    mx_conductor_frame (N, p.U, X, Y);
+    const Vec3 woL = mk (dot (wo, X), dot (wo, Y), dot (wo, N));
+    if (!(woL.z > 0.0f))
+        return;
+    const GgxVK d = ggx_make (p.xalpha, p.yalpha, 0.0f);
+    const Vec3 m  = ggx_sample_for_refl_vk (d, woL, rx, ry);
+    if (!(dot (m, woL) > 0.0f))
+        return;
+    const Vec3 wiL = sub (mul (m, 2.0f * dot (m, woL)), woL);
+    if (!(wiL.z > 0.0f))
+        return;
+    wi = add (add (mul (X, wiL.x), mul (Y, wiL.y)), mul (N, wiL.z));
+    mx_conductor_eval_vk (fp, p, wo, wi, weight, pdf);
+}
+
 /// Scene::sample() from raytracer.h, device side: the Heitz low-distortion
 /// triangle/square map, then the solid-angle pdf of the resulting direction.
 /// The sample point is expressed in barycentrics (u,v) so the light shader can
@@ -1693,6 +1996,7 @@ static const unsigned CS_MF    = osl_vk_abi::kClosureSetMF;
 static const unsigned CS_DELTA = osl_vk_abi::kClosureSetDelta;
 static const unsigned CS_PHONG = osl_vk_abi::kClosureSetPhong;
 static const unsigned CS_ON    = osl_vk_abi::kClosureSetON;
+static const unsigned CS_MXC   = osl_vk_abi::kClosureSetMXC;
 static const unsigned CS_ALL   = osl_vk_abi::kClosureSetAll;
 
 /// testrender/optics.h:13, verbatim.  TIR returns 1, eta == 0 means "no Fresnel".
@@ -1766,6 +2070,8 @@ fill_closure_entry (ClosureEntryVK& e, int id, long long off, const Vec3& w,
     e.refract = 0;
     e.exponent = 0.0f;
     e.sigma    = 0.0f;
+    e.ior      = mk (0.0f, 0.0f, 0.0f);
+    e.ext      = mk (0.0f, 0.0f, 0.0f);
     if (id == FRESNEL_REFLECTION_ID_VK || id == REFRACTION_ID_VK) {
         // ReflectionParams / RefractionParams { Vec3 N; float eta }
         e.N   = load_vec ((GlobalCVec3)(node + 16));
@@ -1791,6 +2097,19 @@ fill_closure_entry (ClosureEntryVK& e, int id, long long off, const Vec3& w,
         // byte layout as PhongParams above.
         e.N     = load_vec ((GlobalCVec3)(node + 16));
         e.sigma = *(VK_GLOBAL const float*)(node + 28);
+    } else if (id == MX_CONDUCTOR_ID_VK) {
+        // mtx::ConductorLobe::Data as register_closure lays it out
+        // (bsdf_conductor_decl.h:31-43): Vec3 N (16), Vec3 U (28), float
+        // roughness_x (40), float roughness_y (44), C3f IOR (48), C3f
+        // extinction (60), Stringhash distribution (72), thinfilm fields.
+        // Only the GGX path is modelled here, which is what every test
+        // scene's `conductor_bsdf(..., "ggx")` asks for.
+        e.N      = load_vec ((GlobalCVec3)(node + 16));
+        e.U      = load_vec ((GlobalCVec3)(node + 28));
+        e.xalpha = *(VK_GLOBAL const float*)(node + 40);
+        e.yalpha = *(VK_GLOBAL const float*)(node + 44);
+        e.ior    = load_vec ((GlobalCVec3)(node + 48));
+        e.ext    = load_vec ((GlobalCVec3)(node + 60));
     }
 }
 
@@ -1947,7 +2266,8 @@ inline void mis_update_eval_vk (Vec3& w, float& pdf, Vec3 ow, float opdf,
 /// normal the diffuse lobe is defined on (testrender's DiffuseParams.N stores
 /// the same vector the shader wrote).  `CS` gates the families at compile time.
 template <unsigned CS>
-inline Vec3 component_eval (const ClosureEntryVK& e, const WardVK& wardp,
+inline Vec3 component_eval (VK_GLOBAL const FrameParams* fp,
+                            const ClosureEntryVK& e, const WardVK& wardp,
                             const Vec3& wov, const Vec3& wi, const Vec3& n,
                             float& pdf)
 {
@@ -1991,6 +2311,17 @@ inline Vec3 component_eval (const ClosureEntryVK& e, const WardVK& wardp,
             return mul (e.w, lw);
         }
     }
+    if constexpr (CS & CS_MXC) {
+        if (e.id == MX_CONDUCTOR_ID_VK) {
+            // The conductor's weight is a colour (its Fresnel term is
+            // per-channel), so it cannot come back through the scalar path.
+            Vec3 lw;
+            float lp = 0.0f;
+            mx_conductor_eval_vk (fp, e, wov, wi, lw, lp);
+            pdf = lp;
+            return mulv (e.w, lw);
+        }
+    }
     return mk (0.0f, 0.0f, 0.0f);
 }
 
@@ -2012,7 +2343,8 @@ inline Vec3 component_eval (const ClosureEntryVK& e, const WardVK& wardp,
 /// DIFFUSE/WARD/MICROFACET component and reports pdf 0 otherwise, which is what
 /// the old `continue` did.
 template <unsigned CS>
-inline void components_eval_sum (const ClosureEntryVK& e0,
+inline void components_eval_sum (VK_GLOBAL const FrameParams* fp,
+                                 const ClosureEntryVK& e0,
                                  const ClosureEntryVK& e1, int ncomp,
                                  const WardVK& wardp, const Vec3& wov,
                                  const Vec3& wi, const Vec3& n, float b0,
@@ -2021,9 +2353,9 @@ inline void components_eval_sum (const ClosureEntryVK& e0,
     float p0 = 0.0f, p1 = 0.0f;
     Vec3 w0 = mk (0.0f, 0.0f, 0.0f), w1 = mk (0.0f, 0.0f, 0.0f);
     if (ncomp > 0)
-        w0 = component_eval<CS> (e0, wardp, wov, wi, n, p0);
+        w0 = component_eval<CS> (fp, e0, wardp, wov, wi, n, p0);
     if (ncomp > 1)
-        w1 = component_eval<CS> (e1, wardp, wov, wi, n, p1);
+        w1 = component_eval<CS> (fp, e1, wardp, wov, wi, n, p1);
     // Not a plain sum: CompositeBSDF::eval (shading.h:364-374) folds each
     // lobe in with MIS::update_eval, using the lobe's own pick probability
     // `b` = pdfs[i] from prepare().  With more than one lobe that is what
@@ -2044,25 +2376,36 @@ inline void components_eval_sum (const ClosureEntryVK& e0,
 /// the families the set actually contains.  `ar/ag/ab` is the accumulated
 /// albedo, which is what the Lambert lobe evaluates to.
 template <unsigned CS>
-inline void nee_eval_vk (const ClosureEntryVK& ce0, const ClosureEntryVK& ce1,
+inline void nee_eval_vk (VK_GLOBAL const FrameParams* fp,
+                         const ClosureEntryVK& ce0, const ClosureEntryVK& ce1,
                          int ncomp, int has_microfacet, int is_ward,
-                         int has_phong, int has_on, const WardVK& wardp,
-                         const Vec3& wov, const Vec3& wi, const Vec3& n,
-                         float ar, float ag, float ab, float b0, float b1,
-                         Vec3& w, float& pdf)
+                         int has_phong, int has_on, int has_mxc,
+                         const WardVK& wardp, const Vec3& wov, const Vec3& wi,
+                         const Vec3& n, float ar, float ag, float ab, float b0,
+                         float b1, Vec3& w, float& pdf)
 {
+    if constexpr (CS & CS_MXC) {
+        // A conductor lobe is glossy and its eval is angle dependent (GGX
+        // distribution times the complex Fresnel term), so the accumulated
+        // albedo cannot stand in for it.
+        if (has_mxc) {
+            components_eval_sum<CS> (fp, ce0, ce1, ncomp, wardp, wov, wi, n, b0,
+                                     b1, w, pdf);
+            return;
+        }
+    }
     if constexpr (CS & CS_ON) {
         // Oren-Nayar's eval depends on the roughness between the two
         // directions, so it cannot ride on the accumulated albedo either.
         if (has_on) {
-            components_eval_sum<CS> (ce0, ce1, ncomp, wardp, wov, wi, n, b0,
+            components_eval_sum<CS> (fp, ce0, ce1, ncomp, wardp, wov, wi, n, b0,
                                      b1, w, pdf);
             return;
         }
     }
     if constexpr (CS & CS_MF) {
         if (has_microfacet) {
-            components_eval_sum<CS> (ce0, ce1, ncomp, wardp, wov, wi, n, b0,
+            components_eval_sum<CS> (fp, ce0, ce1, ncomp, wardp, wov, wi, n, b0,
                                      b1, w, pdf);
             return;
         }
@@ -2072,7 +2415,7 @@ inline void nee_eval_vk (const ClosureEntryVK& ce0, const ClosureEntryVK& ce1,
         // through the component eval (with the lobe's pick probability folded
         // in) instead of the accumulated-albedo shortcut below.
         if (has_phong) {
-            components_eval_sum<CS> (ce0, ce1, ncomp, wardp, wov, wi, n, b0,
+            components_eval_sum<CS> (fp, ce0, ce1, ncomp, wardp, wov, wi, n, b0,
                                      b1, w, pdf);
             return;
         }
@@ -2817,6 +3160,7 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
     constexpr bool HAS_DLTA = (CS & CS_DELTA) != 0;
     constexpr bool HAS_PHONG = (CS & CS_PHONG) != 0;
     constexpr bool HAS_ON    = (CS & CS_ON) != 0;
+    constexpr bool HAS_MXC   = (CS & CS_MXC) != 0;
 
     VK_GLOBAL const FrameParams* p
         = (VK_GLOBAL const FrameParams*)(base + kFrameParamsOffset);
@@ -2981,6 +3325,16 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
 
         const int shaderID = tri_shader[hit.id];
         if (shaderID >= 0) {
+            // Which kind of ray produced this hit, as `raytype("...")` sees it.
+            // The CPU sets `sg.raytype = r.raytype` (simpleraytracer.cpp:961),
+            // and the rays it makes are exactly two kinds: Ray::CAMERA for the
+            // primary ray (raytracer.h:161) and Ray::DIFFUSE for every ray a
+            // scatter or NEE produces (simpleraytracer.cpp:1210, "FIXME? Use
+            // DIFFUSE for all indirect rays").  Leaving 0 here -- the value
+            // fill_globals parks -- makes *every* query answer false, so a
+            // shader that branches on raytype() takes the indirect branch even
+            // on the primary hit.
+            sg->raytype = (b > 0) ? 16 : 1;
             // Reset the per-sample arena state: cursor at 16 (offset 0 is the
             // two int64s parked at the head of the pool), root sentinel -1.
             *(GlobalI64)((GlobalPtr)sg + kOffRenderstate) = 16;
@@ -3010,6 +3364,10 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
             // constant in the two directions, so it needs component_eval on
             // the NEE side and its own sample weight on the BSDF side.
             int has_on = 0;
+            // At least one component is a MaterialX conductor: GGX with a
+            // complex Fresnel term, which is neither a delta lobe nor a
+            // Lambert one.
+            int has_mxc = 0;
             WardVK wardp;
             long long ci = *(GlobalI64)((GlobalPtr)sg + kOffCi);
             // Flatten ADD/MUL: glass is `Ks*reflection(N,eta) +
@@ -3092,6 +3450,12 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                         if (e.id == PHONG_ID_VK) {
                             // Same for phong: glossy, its own eval/sample.
                             has_phong = 1;
+                            all_delta = 0;
+                        }
+                    }
+                    if constexpr (HAS_MXC) {
+                        if (e.id == MX_CONDUCTOR_ID_VK) {
+                            has_mxc   = 1;
                             all_delta = 0;
                         }
                     }
@@ -3201,9 +3565,10 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                         = background_sample(p, base, xsv, ysv, bg_dir, bg_pdf);
                     float bpdf = 0.0f;
                     Vec3 bwt3  = mk(0.0f, 0.0f, 0.0f);
-                    nee_eval_vk<CS>(ce[0], ce[1], ncomp, has_microfacet, is_ward,
-                                    has_phong, has_on, wardp, wov, bg_dir, n,
-                                    ar, ag, ab, pk0, pk1, bwt3, bpdf);
+                    nee_eval_vk<CS>(p, ce[0], ce[1], ncomp, has_microfacet, is_ward,
+                                    has_phong, has_on, has_mxc, wardp, wov,
+                                    bg_dir, n, ar, ag, ab, pk0, pk1, bwt3,
+                                    bpdf);
                     const float mis = power_heuristic_weight_weight(bg_pdf, bpdf);
                     Vec3 contrib = mulv(mulv(w, bwt3),
                                         mk(bgv.x * mis, bgv.y * mis,
@@ -3243,9 +3608,10 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                         // the weight and the pdf come from the closure itself.
                         float bpdf = 0.0f;
                         Vec3 bwt3  = mk(0.0f, 0.0f, 0.0f);
-                        nee_eval_vk<CS>(ce[0], ce[1], ncomp, has_microfacet, is_ward,
-                                        has_phong, has_on, wardp, wov, lsmp.dir,
-                                        n, ar, ag, ab, pk0, pk1, bwt3, bpdf);
+                        nee_eval_vk<CS>(p, ce[0], ce[1], ncomp, has_microfacet, is_ward,
+                                        has_phong, has_on, has_mxc, wardp, wov,
+                                        lsmp.dir, n, ar, ag, ab, pk0, pk1,
+                                        bwt3, bpdf);
                         float mis = power_heuristic_eval_weight(
                             light_pick_pdf * lsmp.pdf, bpdf);
                         Vec3 contrib
@@ -3297,6 +3663,9 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                 // ---- BSDF sampling -----------------------------------------
                 Vec3 wi;
                 float sweight = 1.0f;
+                // Same value as a colour: the conductor lobe's weight carries
+                // its per-channel Fresnel term, so it cannot be a scalar.
+                Vec3 sweight_v = mk(1.0f, 1.0f, 1.0f);
                 float wmulr = ar, wmulg = ag, wmulb = ab;
                 if (all_delta) {
                     // CompositeBSDF::sample over the flattened components:
@@ -3401,7 +3770,7 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                     if (oe.id >= 0 && oe.id != EMISSION_ID_VK
                         && oe.id != BACKGROUND_ID_VK) {
                         float op = 0.0f;
-                        Vec3 ow  = component_eval<CS>(oe, wardp, wov, wi, n, op);
+                        Vec3 ow  = component_eval<CS>(p, oe, wardp, wov, wi, n, op);
                         mis_update_eval_vk(outw, spdf, ow, op, pick ? p0 : p1);
                     }
                     w        = mulv(w, outw);
@@ -3446,6 +3815,21 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                         w.y = 0.0f;
                         w.z = 0.0f;
                     }
+                } else if (HAS_MXC && has_mxc) {
+                    // sample_turquin_microms_reflection: the bounded VNDF draw,
+                    // the reflection, then the full BRDF eval at that direction.
+                    // The weight is a colour (the Fresnel term is per channel),
+                    // so it rides in `sweight_v` instead of `sweight`.
+                    Vec3 ow;
+                    float op = 0.0f;
+                    mx_conductor_sample_vk(p, ce[0], wov, rx, s3.y, wi, ow, op);
+                    bsdf_pdf  = op * pdf0;
+                    sweight_v = ow;
+                    if (!(op > 0.0f)) {
+                        w.x = 0.0f;
+                        w.y = 0.0f;
+                        w.z = 0.0f;
+                    }
                 } else if constexpr (HAS_DIFF) {
                     // Sampling::sample_cosine_hemisphere (sampling.h:92).
                     float pdf_cos = 0.0f;
@@ -3457,7 +3841,15 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                 if (all_delta) {
                     w = mulv(w, mk(wmulr, wmulg, wmulb));
                 } else if (!(HAS_MF && has_microfacet)) {
-                    w = mulv(w, mk(ar * sweight, ag * sweight, ab * sweight));
+                    if constexpr (HAS_MXC) {
+                        if (has_mxc)
+                            w = mulv(w, mulv(mk(ar, ag, ab), sweight_v));
+                        else
+                            w = mulv(w, mk(ar * sweight, ag * sweight,
+                                           ab * sweight));
+                    } else {
+                        w = mulv(w, mk(ar * sweight, ag * sweight, ab * sweight));
+                    }
                 }
                 r.org    = P;
                 r.dir    = wi;
@@ -3686,5 +4078,6 @@ OSL_VK_SHADE_ENTRY_ALL(12)
 OSL_VK_SHADE_ENTRY_ALL(13)
 OSL_VK_SHADE_ENTRY_ALL(14)
 OSL_VK_SHADE_ENTRY_ALL(15)
+
 
 
