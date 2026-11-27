@@ -2286,6 +2286,11 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
     // BVH walk in the module.
     unsigned groups_ray = (unsigned)((3 * npix + kWorkgroupSize - 1)
                                      / kWorkgroupSize);
+    // A wave that published no NEE shadow ray at all only needs the slot-0
+    // path rays; the shading pass reads the visibility flags only when the
+    // pending bit behind them is set, so launching slots 1 and 2 would be pure
+    // overhead.
+    unsigned groups_path = groups;
     OIIO::Timer t;
     std::vector<float> image(npix * 4);
     // Wavefront loop: per antialiasing sample, generate the primary rays and
@@ -2299,6 +2304,7 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
     std::fill(image.begin(), image.end(), 0.0f);
     std::vector<float> one(npix * 4);
     const int bounces = std::max(0, fp.max_bounces);
+    int waves_skipped = 0;
     if (frame_samples > 1)
         fprintf(stderr,
                 "[vulkan] wavefront: %d samples x %d intersect/shade pairs, "
@@ -2317,9 +2323,18 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
             return false;
         }
         std::vector<int> hitids(npix);
+        std::vector<int> live(npix);
+        std::vector<int> pending(npix);
         std::vector<int> bucket(nmat * bucket_stride, -1);
+        std::vector<int> counts(nmat, 0);
+        // A wave is worth dispatching only while some path can still continue
+        // or some NEE shadow ray is outstanding.  The generation pass cleared
+        // every pending bit, so the first wave's intersection pass needs the
+        // path slot only.
+        bool nee_pending = false;
         for (int b = 0; b <= bounces; ++b) {
-            if (!m_vk->dispatch(m_vk_intersect, groups_ray, err)) {
+            const unsigned nray = nee_pending ? groups_ray : groups_path;
+            if (!m_vk->dispatch(m_vk_intersect, nray, err)) {
                 errhandler().errorfmt(
                     "[vulkan] sample {} bounce {}: intersect failed: {}", s, b,
                     err);
@@ -2335,11 +2350,9 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
                                 npix * sizeof(int), err)) {
                 errhandler().errorfmt(
                     "[vulkan] sample {} bounce {}: hit read-back failed: {}",
-                    s, b, err);
-                return false;
+                    s, b, err);                return false;
             }
-            std::fill(bucket.begin(), bucket.end(), -1);
-            std::vector<int> counts(nmat, 0);
+            std::fill(counts.begin(), counts.end(), 0);
             const int nm       = (int)nmat;
             const int fallback = m_vk_light_group >= 0 ? m_vk_light_group : 0;
             if (getenv("OSL_VK_DEBUG_FRAME")) {
@@ -2387,6 +2400,13 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
                 if (!g)
                     continue;
                 const size_t base = (size_t)m * bucket_stride;
+                // The kernel is dispatched in whole workgroups, so the slots
+                // past the last real index have to carry the sentinel it skips.
+                // Only that tail is touched now: filling every bucket to
+                // bucket_stride on every bounce cost more host time than the
+                // sort itself.
+                for (int k = counts[m]; k < (int)(g * kWorkgroupSize); ++k)
+                    bucket[base + (size_t)k] = -1;
                 if (!m_vk->upload(wf_bucket_index + base * sizeof(int),
                                   bucket.data() + base,
                                   g * kWorkgroupSize * sizeof(int), err)) {
@@ -2414,6 +2434,37 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
                     return false;
                 }
             }
+            // ---- is another wave worth dispatching? -------------------------
+            // Nothing below reads a dead path: the shading pass returns before it
+            // accumulates, so the remaining bounces of a wave in which every path
+            // died and no NEE ray is outstanding would dispatch empty passes over
+            // the whole frame and change no pixel.  Both flags are written by the
+            // shading wave that just finished -- `wf_nee_pending` only ever
+            // holds requests published by it, and a pixel that keeps bouncing has
+            // `wf_active` set.
+            if (b == bounces)
+                break;
+            if (!m_vk->download(fp.wf_active, live.data(), npix * sizeof(int),
+                                err)
+                || !m_vk->download(fp.wf_nee_pending, pending.data(),
+                                   npix * sizeof(int), err)) {
+                errhandler().errorfmt(
+                    "[vulkan] sample {} bounce {}: liveness read-back failed: {}",
+                    s, b, err);
+                return false;
+            }
+            bool any_live = false, any_nee = false;
+            for (size_t i = 0; i < npix; ++i) {
+                if (live[i])
+                    any_live = true;
+                if (pending[i])
+                    any_nee = true;
+            }
+            if (!any_live && !any_nee) {
+                waves_skipped += bounces - b;
+                break;
+            }
+            nee_pending = any_nee;
         }
         if (!m_vk->download(out_off, one.data(), one.size() * sizeof(float),
                             err)) {
@@ -2425,6 +2476,12 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
             image[i] += one[i];
     }
     (void)t;
+
+    if (waves_skipped)
+        fprintf(stderr,
+                "[vulkan] early-out: skipped %d of %d intersect/shade waves "
+                "(no live path, no pending NEE)\n",
+                waves_skipped, frame_samples * (bounces + 1));
 
     if (fp.pad_light) {
         // Mode 2: per-material radiance, written with the material in alpha.
