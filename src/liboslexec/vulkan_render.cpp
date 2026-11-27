@@ -1152,6 +1152,7 @@ struct ClosureEntryVK {
     Vec3 U;      ///< microfacet tangent
     float xalpha, yalpha;  ///< microfacet roughness
     int refract;           ///< microfacet lobe: 0 reflection, 1 transmission
+    float exponent;        ///< phong falloff exponent (PhongParams.exponent)
     long long off;  ///< arena offset of the node, for parameters read on demand
 };
 
@@ -1341,6 +1342,79 @@ inline void mf_sample_vk(const ClosureEntryVK& p, const Vec3& wo, float rx,
     }
 }
 
+/// The Phong specular lobe (testrender/shading.cpp:320-361), device side:
+/// the same (weight, pdf) pair the CPU produces.  `PhongParams` is
+/// `{ Vec3 N; float exponent }`, the lobe is built around the mirror
+/// direction, its weight is `N.wi * (exponent+2)/(exponent+1)` and its
+/// solid-angle pdf the cosine-power falloff
+/// `(exponent+1)/(2*pi) * cosRI^exponent`.
+///
+/// `OIIO::fast_safe_pow` on the domain this lobe uses.  It is not libm: fmath.h
+/// answers `sign * fast_exp2(y*fast_log2(|x|))`, and the microfacet section
+/// above already carries those two polynomials (they are what makes the CPU
+/// and the device pick the same texel out of a near-specular lobe).  Reusing
+/// them keeps the exponent-10000 plate bit-identical instead of a few hundred
+/// ulp off, which at that exponent is a visibly different falloff.
+inline float phong_pow_vk(float x, float y)
+{
+#pragma clang fp contract(off)
+    if (y == 0.0f)
+        return 1.0f;  // x^0 = 1
+    if (x == 0.0f)
+        return 0.0f;  // 0^y = 0
+    if (y == 1.0f)
+        return x;
+    if (y == 2.0f)
+        return x * x;  // fmath.h clamps here too; not reachable in this scene
+    return mf_fast_exp2(y * mf_fast_log2(__builtin_fabsf(x)));
+}
+
+inline void phong_eval_vk(const ClosureEntryVK& p, const Vec3& wo,
+                          const Vec3& wi, float& weight, float& pdf)
+{
+#pragma clang fp contract(off)
+    weight      = 0.0f;
+    pdf         = 0.0f;
+    float cosNI = dot(p.N, wi);
+    float cosNO = dot(p.N, wo);
+    if (cosNI > 0.0f && cosNO > 0.0f) {
+        // reflect the view vector
+        Vec3 R      = sub(mul(p.N, 2.0f * cosNO), wo);
+        float cosRI = dot(R, wi);
+        if (cosRI > 0.0f) {
+            // (exponent+1) * (1/(2*pi)) * cosRI^exponent
+            pdf    = (p.exponent + 1.0f) * 0.15915494f
+                     * phong_pow_vk(cosRI, p.exponent);
+            weight = cosNI * (p.exponent + 2.0f) / (p.exponent + 1.0f);
+        }
+    }
+}
+
+inline void phong_sample_vk(const ClosureEntryVK& p, const Vec3& wo, float rx,
+                            float ry, Vec3& wi, float& weight, float& pdf)
+{
+#pragma clang fp contract(off)
+    wi     = mk(0.0f, 0.0f, 0.0f);
+    weight = 0.0f;
+    pdf    = 0.0f;
+    float cosNO = dot(p.N, wo);
+    if (cosNO > 0.0f) {
+        Vec3 R    = sub(mul(p.N, 2.0f * cosNO), wo);
+        float phi = 6.2831855f * rx;  // 2*pi
+        float sp, cp;
+        fast_sincos_vk(phi, sp, cp);
+        // cosTheta = ry^(1/(exponent+1)), drawn in the frame around R.
+        float cosTheta  = phong_pow_vk(ry, 1.0f / (p.exponent + 1.0f));
+        float sinTheta2 = 1.0f - cosTheta * cosTheta;
+        float sinTheta = sinTheta2 > 0.0f ? __builtin_sqrtf(sinTheta2) : 0.0f;
+        Vec3 u, v;
+        pixar_frame(R, u, v);
+        wi = add(add(mul(u, cp * sinTheta), mul(v, sp * sinTheta)),
+                 mul(R, cosTheta));
+        phong_eval_vk(p, wo, wi, weight, pdf);
+    }
+}
+
 /// Scene::sample() from raytracer.h, device side: the Heitz low-distortion
 /// triangle/square map, then the solid-angle pdf of the resulting direction.
 /// The sample point is expressed in barycentrics (u,v) so the light shader can
@@ -1421,6 +1495,12 @@ static const int DIFFUSE_ID_VK    = 3;
 /// reflection lobe, 1 the transmission lobe, 2 both.  glass is the pair
 /// (refract=1, refract=0), which is why two components have to be kept.
 static const int MICROFACET_ID_VK = 8;
+/// `phong(N, exponent)` is testrender/shading.cpp:320-361: a lobe around the
+/// mirror direction with a cosine power falloff.  Its weight is angle
+/// dependent (`N.wi * (exponent+2)/(exponent+1)`), so like Ward it cannot be
+/// folded into a constant albedo: NEE has to evaluate the real BRDF and the
+/// BSDF sample has to come from the lobe itself.
+static const int PHONG_ID_VK      = 6;
 /// `ward(N, T, ax, ay)` is an anisotropic *glossy* closure: unlike diffuse its
 /// weight is angle dependent, so it cannot be folded into a constant albedo --
 /// NEE has to evaluate the real BRDF toward the light and the BSDF sample has to
@@ -1458,6 +1538,7 @@ static const unsigned CS_DIFF  = osl_vk_abi::kClosureSetDiff;
 static const unsigned CS_WARD  = osl_vk_abi::kClosureSetWard;
 static const unsigned CS_MF    = osl_vk_abi::kClosureSetMF;
 static const unsigned CS_DELTA = osl_vk_abi::kClosureSetDelta;
+static const unsigned CS_PHONG = osl_vk_abi::kClosureSetPhong;
 static const unsigned CS_ALL   = osl_vk_abi::kClosureSetAll;
 
 /// testrender/optics.h:13, verbatim.  TIR returns 1, eta == 0 means "no Fresnel".
@@ -1529,6 +1610,7 @@ fill_closure_entry (ClosureEntryVK& e, int id, long long off, const Vec3& w,
     e.xalpha = 1.0f;
     e.yalpha = 1.0f;
     e.refract = 0;
+    e.exponent = 0.0f;
     if (id == FRESNEL_REFLECTION_ID_VK || id == REFRACTION_ID_VK) {
         // ReflectionParams / RefractionParams { Vec3 N; float eta }
         e.N   = load_vec ((GlobalCVec3)(node + 16));
@@ -1545,6 +1627,10 @@ fill_closure_entry (ClosureEntryVK& e, int id, long long off, const Vec3& w,
         e.refract = *(VK_GLOBAL const int*)(node + 60);
     } else if (id == REFLECTION_ID_VK) {
         e.N = load_vec ((GlobalCVec3)(node + 16));
+    } else if (id == PHONG_ID_VK) {
+        // PhongParams { Vec3 N; float exponent } (testrender/shading.h:74).
+        e.N        = load_vec ((GlobalCVec3)(node + 16));
+        e.exponent = *(VK_GLOBAL const float*)(node + 28);
     }
 }
 
@@ -1729,6 +1815,14 @@ inline Vec3 component_eval (const ClosureEntryVK& e, const WardVK& wardp,
             return mul (e.w, lw);
         }
     }
+    if constexpr (CS & CS_PHONG) {
+        if (e.id == PHONG_ID_VK) {
+            float lw = 0.0f, lp = 0.0f;
+            phong_eval_vk (e, wov, wi, lw, lp);
+            pdf = lp;
+            return mul (e.w, lw);
+        }
+    }
     return mk (0.0f, 0.0f, 0.0f);
 }
 
@@ -1784,12 +1878,22 @@ inline void components_eval_sum (const ClosureEntryVK& e0,
 template <unsigned CS>
 inline void nee_eval_vk (const ClosureEntryVK& ce0, const ClosureEntryVK& ce1,
                          int ncomp, int has_microfacet, int is_ward,
-                         const WardVK& wardp, const Vec3& wov, const Vec3& wi,
-                         const Vec3& n, float ar, float ag, float ab, float b0,
-                         float b1, Vec3& w, float& pdf)
+                         int has_phong, const WardVK& wardp, const Vec3& wov,
+                         const Vec3& wi, const Vec3& n, float ar, float ag,
+                         float ab, float b0, float b1, Vec3& w, float& pdf)
 {
     if constexpr (CS & CS_MF) {
         if (has_microfacet) {
+            components_eval_sum<CS> (ce0, ce1, ncomp, wardp, wov, wi, n, b0,
+                                     b1, w, pdf);
+            return;
+        }
+    }
+    if constexpr (CS & CS_PHONG) {
+        // A phong lobe is glossy, not Lambert, so the light sample has to run
+        // through the component eval (with the lobe's pick probability folded
+        // in) instead of the accumulated-albedo shortcut below.
+        if (has_phong) {
             components_eval_sum<CS> (ce0, ce1, ncomp, wardp, wov, wi, n, b0,
                                      b1, w, pdf);
             return;
@@ -2533,6 +2637,7 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
     constexpr bool HAS_WARD = (CS & CS_WARD) != 0;
     constexpr bool HAS_DIFF = (CS & CS_DIFF) != 0;
     constexpr bool HAS_DLTA = (CS & CS_DELTA) != 0;
+    constexpr bool HAS_PHONG = (CS & CS_PHONG) != 0;
 
     VK_GLOBAL const FrameParams* p
         = (VK_GLOBAL const FrameParams*)(base + kFrameParamsOffset);
@@ -2717,6 +2822,11 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
             // BSDF sample have to go through component_eval / mf_sample_vk
             // instead of the Lambert shortcut below.
             int has_microfacet = 0;
+            // At least one component is a phong lobe: same story as the
+            // microfacet flag -- the Lambert shortcut below would otherwise
+            // shade a glossy plate as a diffuse one (uniform instead of a
+            // mirror-direction highlight).
+            int has_phong = 0;
             WardVK wardp;
             long long ci = *(GlobalI64)((GlobalPtr)sg + kOffCi);
             // Flatten ADD/MUL: glass is `Ks*reflection(N,eta) +
@@ -2793,6 +2903,13 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                             // cosine one.
                             has_microfacet = 1;
                             all_delta      = 0;
+                        }
+                    }
+                    if constexpr (HAS_PHONG) {
+                        if (e.id == PHONG_ID_VK) {
+                            // Same for phong: glossy, its own eval/sample.
+                            has_phong = 1;
+                            all_delta = 0;
                         }
                     }
                     if constexpr (HAS_DLTA) {
@@ -2894,8 +3011,8 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                     float bpdf = 0.0f;
                     Vec3 bwt3  = mk(0.0f, 0.0f, 0.0f);
                     nee_eval_vk<CS>(ce[0], ce[1], ncomp, has_microfacet, is_ward,
-                                    wardp, wov, bg_dir, n, ar, ag, ab, pk0, pk1,
-                                    bwt3, bpdf);
+                                    has_phong, wardp, wov, bg_dir, n, ar, ag,
+                                    ab, pk0, pk1, bwt3, bpdf);
                     const float mis = power_heuristic_weight_weight(bg_pdf, bpdf);
                     Vec3 contrib = mulv(mulv(w, bwt3),
                                         mk(bgv.x * mis, bgv.y * mis,
@@ -2936,8 +3053,8 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                         float bpdf = 0.0f;
                         Vec3 bwt3  = mk(0.0f, 0.0f, 0.0f);
                         nee_eval_vk<CS>(ce[0], ce[1], ncomp, has_microfacet, is_ward,
-                                        wardp, wov, lsmp.dir, n, ar, ag, ab,
-                                        pk0, pk1, bwt3, bpdf);
+                                        has_phong, wardp, wov, lsmp.dir, n, ar,
+                                        ag, ab, pk0, pk1, bwt3, bpdf);
                         float mis = power_heuristic_eval_weight(
                             light_pick_pdf * lsmp.pdf, bpdf);
                         Vec3 contrib
@@ -3105,6 +3222,20 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                     bsdf_pdf = wp * pdf0;
                     sweight  = wv.x;
                     if (!(wp > 0.0f)) {
+                        w.x = 0.0f;
+                        w.y = 0.0f;
+                        w.z = 0.0f;
+                    }
+                } else if (HAS_PHONG && has_phong) {
+                    // Phong::sample (shading.cpp:342-360): the lobe's own
+                    // cosine-power draw around the mirror direction, then eval
+                    // at that direction for the (weight, pdf) pair.
+                    float pw      = 0.0f;
+                    float pweight = 0.0f;
+                    phong_sample_vk(ce[0], wov, rx, s3.y, wi, pweight, pw);
+                    bsdf_pdf = pw * pdf0;
+                    sweight  = pweight;
+                    if (!(pw > 0.0f)) {
                         w.x = 0.0f;
                         w.y = 0.0f;
                         w.z = 0.0f;
