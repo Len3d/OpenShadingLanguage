@@ -3661,7 +3661,13 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                 }
 
                 // ---- BSDF sampling -----------------------------------------
-                Vec3 wi;
+                // Initialised to the mirrored incident direction, the same
+                // fallback every sample_* helper uses when it has no valid
+                // draw: `r.dir` below must never carry uninitialised private
+                // memory, even on the branches that sample nothing (the path
+                // dies there anyway -- `r.active` is cleared at the top of the
+                // body and only the live branches set it again).
+                Vec3 wi       = mul(wov, -1.0f);
                 float sweight = 1.0f;
                 // Same value as a colour: the conductor lobe's weight carries
                 // its per-channel Fresnel term, so it cannot be a scalar.
@@ -3690,7 +3696,11 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                     } else {
                         rx = rx / share;
                     }
-                    if (!(prob > 0.0f))
+                    // `prob > 0` is not enough: a denormal pick probability
+                    // turns the `1 / prob` below into inf, and an infinite
+                    // throughput poisons every later bounce.  Same rule
+                    // mis_update_eval_vk already applies to `1 / b`.
+                    if (!(prob >= 1.17549435e-38f))  // FLT_MIN
                         break;
                     const ClosureEntryVK& e = ce[pick];
                     float cw                = 0.0f;
@@ -3713,6 +3723,16 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                         wi       = mul(wov, -1.0f);
                         cw       = 1.0f;
                         bsdf_pdf = inf();
+                    } else {
+                        // A delta closure the device does not implement yet
+                        // (the MaterialX dielectric and medium ids are still on
+                        // the host only).  Contributes nothing on purpose: a
+                        // zero weight with a finite direction, so the path
+                        // ends with a well-defined ray instead of a direction
+                        // the sampler never wrote.
+                        wi       = mul(wov, -1.0f);
+                        cw       = 0.0f;
+                        bsdf_pdf = 0.0f;
                     }
                     wmulr = e.w.x * cw / prob;
                     wmulg = e.w.y * cw / prob;
@@ -3740,7 +3760,12 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                     p1 /= ptot;
                     int pick   = (rx < p0) ? 0 : 1;
                     float prob = pick ? p1 : p0;
-                    if (!(prob > 0.0f))
+                    // Denormal pick probability would make the `1 / prob` in
+                    // `outw` below inf, i.e. a non-finite throughput.  A lobe
+                    // the mixture picks with (almost) no probability is
+                    // unsamplable: leave the weight at zero and let the path
+                    // die.
+                    if (!(prob >= 1.17549435e-38f))  // FLT_MIN
                         break;
                     float u1 = pick ? (rx - p0) / prob : rx / p0;
                     if (u1 > 0.99999994f)
