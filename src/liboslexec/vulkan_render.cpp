@@ -1165,6 +1165,10 @@ struct ClosureEntryVK {
     float sigma;           ///< oren_nayar roughness (OrenNayarParams.sigma)
     Vec3 ior;              ///< conductor: real part of the complex IOR
     Vec3 ext;              ///< conductor: extinction (the imaginary part)
+    Vec3 refl_tint;        ///< dielectric: reflection tint (Cr)
+    Vec3 refr_tint;        ///< dielectric: transmission tint (Ct); non-black
+                           ///< means the lobe also refracts, which this kernel
+                           ///< does not model yet
     long long off;  ///< arena offset of the node, for parameters read on demand
 };
 
@@ -1587,6 +1591,19 @@ inline void on_sample_vk (const ClosureEntryVK& p, const Vec3& wo, float rx,
 // stays the plain closure weight and the colour arrives with the sampled
 // weight.
 static const int MX_CONDUCTOR_ID_VK = 18;
+/// `dielectric_bsdf`'s closure id (shading.h:46, MX_DIELECTRIC_ID).  Only the
+/// reflection-only flavor is modelled on the device: with a non-black
+/// transmission tint the lobe also refracts, and a transmitted ray leaves the
+/// surface side the wavefront sampler assumes, so those components still fall
+/// back to what they did before (see the sample chain's last branch).
+static const int MX_DIELECTRIC_ID_VK = 17;
+
+/// `layer`'s closure id (shading.h:47, MX_LAYER_ID).  A layer is not a lobe of
+/// its own: `layer(top, base)` puts `base` *under* `top`, with a weight of
+/// `1 - opacity(top)`.  The host walker descends into both halves
+/// (testrender/shading.cpp:1314-1325) and so must this one -- a layer left as a
+/// leaf hides every closure inside it behind an id no family implements.
+static const int MX_LAYER_ID_VK = 27;
 
 /// `GGXDist` (microfacet_tools_decl.h:13-47): the anisotropic GGX slope
 /// distribution, built from MaterialX's raw x/y roughness the way
@@ -1862,6 +1879,200 @@ inline void mx_conductor_sample_vk (VK_GLOBAL const FrameParams* fp,
     mx_conductor_eval_vk (fp, p, wo, wi, weight, pdf);
 }
 
+// ---------------------------------------------------------------------------
+// MaterialX dielectric (`dielectric_bsdf`), device side, reflection-only
+// ---------------------------------------------------------------------------
+//
+// testrender turns this closure into BSDL's `mtx::DielectricLobe`
+// (shading.cpp:106).  With `Ct == 0` the lobe sets `dorefr = false` and reduces
+// to a GGX microfacet reflection whose Fresnel term is the ordinary scalar
+// dielectric one,
+// compensated for multiple scattering with the *same* Turquin scheme the
+// conductor uses (`eval_turquin_microms_reflection`,
+// microfacet_tools_impl.h:341-372) driven by the *same* mini-GGX energy table
+// (bsdf_dielectric_impl.h:74-78).  Only the Fresnel term and the tint differ.
+//
+// A non-black `Ct` would add refraction; those components keep the old
+// behaviour (a cosine-hemisphere stand-in) rather than silently dropping the
+// transmitted half.
+
+/// `DielectricFresnel::DielectricFresnel` (bsdf_dielectric_impl.h:21-28): the
+/// backside inverts first, then the IOR is clamped to [1/5, 1/1.001] or
+/// [1.001, 5] on the way it faces.
+inline float dielec_eta (float eta, int backside)
+{
+    if (backside)
+        eta = 1.0f / eta;
+    return eta >= 1.0f ? vk_clampf (eta, 1.001f, 5.0f)
+                       : vk_clampf (eta, 1.0f / 5.0f, 1.0f / 1.001f);
+}
+
+/// `DielectricFresnel::eval` (bsdf_dielectric_impl.h:30-42): scalar, and `1.0`
+/// past total internal reflection where the lobe has no refracted component.
+inline float dielec_fresnel (float c, float eta)
+{
+#pragma clang fp contract(off)
+    float g = (eta - 1.0f) * (eta + 1.0f) + c * c;
+    if (g > 0.0f) {
+        g           = __builtin_sqrtf (g);
+        const float A = (g - c) / (g + c);
+        const float B = (c * (g + c) - 1.0f) / (c * (g - c) + 1.0f);
+        return 0.5f * A * A * (1.0f + B * B);
+    }
+    return 1.0f;
+}
+
+
+/// `DielectricFresnel::table_index()` (bsdf_dielectric_impl.h:53-64): the IOR
+/// mapped onto [0,1] by its squared position in [IOR_MIN, IOR_MAX], with the
+/// reciprocal taken on the side the eta faces away from.
+inline float dielec_table_index (float eta)
+{
+#pragma clang fp contract(off)
+    const float IOR_MIN = 1.001f, IOR_MAX = 5.0f;
+    const float feta    = eta;
+    const float seta = vk_clampf (feta < 1.0f ? 1.0f / feta : feta, IOR_MIN,
+                                  IOR_MAX);
+    const float x = (seta - IOR_MIN) * (1.0f / (IOR_MAX - IOR_MIN));
+    return __builtin_sqrtf (vk_clampf (x, 0.0f, 1.0f));
+}
+
+/// One (fresnel row, roughness row) of the dielectric energy table, sampled at
+/// cosine `c` over the table's own cosine spacing -- the same interpolation
+/// `mx_emiss_vk` does, one row at a time.
+inline float mx_diel_row_vk (VK_GLOBAL const FrameParams* fp, int frow,
+                             int rrow, float c)
+{
+#pragma clang fp contract(off)
+    const int Nc   = 16;
+    const int base = (frow * 16 + rrow) * Nc;
+    if (c <= 1e-6f)
+        return fp->mx_dielec_energy[base];
+    float cos0 = 1e-6f;
+    for (int i = 1; i < Nc; ++i) {
+        const float cos1 = bmaxf ((float)i * (1.0f / 15.0f), 1e-6f);
+        if (c < cos1) {
+            const float t = (c - cos0) / (cos1 - cos0);
+            const float a = fp->mx_dielec_energy[base + i - 1];
+            const float b = fp->mx_dielec_energy[base + i];
+            return a + (b - a) * t;
+        }
+        cos0 = cos1;
+    }
+    return fp->mx_dielec_energy[base + Nc - 1];
+}
+
+/// `TabulatedEnergyCurve<DielectricReflFront>::Emiss_eval`
+/// (microfacet_tools_impl.h:113-210) with the table's 32 fresnel rows and 16
+/// roughness rows: bilinear in (fresnel index, roughness), then in cosine.
+inline float mx_emiss_diel_vk (VK_GLOBAL const FrameParams* fp, float roughness,
+                               float fresnel_index, float c)
+{
+#pragma clang fp contract(off)
+    float rf = roughness * 15.0f;
+    int ra   = (int)rf;
+    ra       = ra < 0 ? 0 : (ra > 15 ? 15 : ra);
+    int rb   = ra + 1 < 15 ? ra + 1 : 15;
+    rf -= (float)ra;
+    float ff = vk_clampf (fresnel_index, 0.0f, 1.0f) * 31.0f;
+    int fa   = (int)ff;
+    fa       = fa < 0 ? 0 : (fa > 31 ? 31 : fa);
+    int fb   = fa + 1 < 31 ? fa + 1 : 31;
+    ff -= (float)fa;
+    const float e00 = mx_diel_row_vk (fp, fa, ra, c);
+    const float e01 = mx_diel_row_vk (fp, fa, rb, c);
+    const float e10 = mx_diel_row_vk (fp, fb, ra, c);
+    const float e11 = mx_diel_row_vk (fp, fb, rb, c);
+    const float lo  = e00 + (e01 - e00) * rf;
+    const float hi  = e10 + (e11 - e10) * rf;
+    return lo + (hi - lo) * ff;
+}
+
+
+/// `DielectricLobe::E_ms` (bsdf_dielectric_impl.h:258-276): the one
+/// `albedo_impl()` and `filter_o()` read, which comes from the dielectric's own
+/// table and is indexed by the Fresnel term's IOR -- and so depends on which
+/// side of the surface the ray is on.  The lobe's *other* E_ms, the one
+/// `DielectricBSDF`'s eval/sample multiply in, is the mini-GGX table with
+/// fresnel row zero (bsdf_dielectric_impl.h:74-78), which
+/// `mx_dielectric_eval_vk` reads from `fp->mx_energy`.  Same roughness and
+/// anisotropy parameterisation as that one.
+inline float dielec_lobe_E_ms (VK_GLOBAL const FrameParams* fp, const Vec3& N,
+                               const Vec3& Ng, const Vec3& wo, float xalpha,
+                               float yalpha, float eta)
+{
+#pragma clang fp contract(off)
+    const GgxVK d      = ggx_make (xalpha, yalpha, 0.0f);
+    const float cosNO  = dot (N, wo);
+    const int backside = dot (Ng, wo) < 0.0f;
+    const float fidx   = dielec_table_index (dielec_eta (eta, backside));
+    return mx_emiss_diel_vk (fp, d.roughness, fidx,
+                             cosNO > 0.0f ? cosNO : 0.0f);
+}
+
+/// `eval_turquin_microms_reflection` for a dielectric Fresnel, wrapped in
+/// `DielectricLobe::eval_impl`: the tint (Cr) multiplies the lobe value.
+inline void mx_dielectric_eval_vk (VK_GLOBAL const FrameParams* fp,
+                                   const ClosureEntryVK& p, const Vec3& wo,
+                                   const Vec3& wi, Vec3& weight, float& pdf)
+{
+#pragma clang fp contract(off)
+    weight = mk (0.0f, 0.0f, 0.0f);
+    pdf    = 0.0f;
+    const Vec3 N = visible_normal_vk (wo, p.N);
+    Vec3 X, Y;
+    mx_conductor_frame (N, p.U, X, Y);
+    const Vec3 woL = mk (dot (wo, X), dot (wo, Y), dot (wo, N));
+    const Vec3 wiL = mk (dot (wi, X), dot (wi, Y), dot (wi, N));
+    if (!(woL.z > 0.0f) || !(wiL.z > 0.0f))
+        return;
+    const int backside = dot (p.N, wo) < 0.0f;
+    const float eta    = dielec_eta (p.eta, backside);
+    const GgxVK d      = ggx_make (p.xalpha, p.yalpha, 0.0f);
+    const Vec3 mh      = normalize (add (woL, wiL));
+    const float cosMO  = dot (mh, woL);
+    const float D      = ggx_D_vk (d, mh);
+    const float DrD    = ggx_D_refl_D_vk (d, woL, mh);
+    const float D_refl = DrD * D;
+    const float G1     = ggx_G1_vk (d, woL);
+    pdf                = D_refl / (4.0f * woL.z);
+    const float out    = ggx_G2_G1_vk (d, wiL, woL) * G1 / DrD;
+    const float F      = dielec_fresnel (cosMO, eta);
+    const float E_ms   = mx_emiss_vk (fp, d.roughness, woL.z);
+    const float msf    = E_ms / bmaxf (0.01f, 1.0f - E_ms);
+    // Turquin eq. 16, then the dielectric tint (get_tint(wi.z) = refl_tint for
+    // a reflected direction).
+    const float lobe = F * (1.0f + F * msf) * out;
+    weight           = mul (p.refl_tint, lobe);
+}
+
+/// `sample_turquin_microms_reflection` for a dielectric Fresnel.
+inline void mx_dielectric_sample_vk (VK_GLOBAL const FrameParams* fp,
+                                     const ClosureEntryVK& p, const Vec3& wo,
+                                     float rx, float ry, Vec3& wi,
+                                     Vec3& weight, float& pdf)
+{
+#pragma clang fp contract(off)
+    weight = mk (0.0f, 0.0f, 0.0f);
+    pdf    = 0.0f;
+    wi     = mul (wo, -1.0f);
+    const Vec3 N = visible_normal_vk (wo, p.N);
+    Vec3 X, Y;
+    mx_conductor_frame (N, p.U, X, Y);
+    const Vec3 woL = mk (dot (wo, X), dot (wo, Y), dot (wo, N));
+    if (!(woL.z > 0.0f))
+        return;
+    const GgxVK d = ggx_make (p.xalpha, p.yalpha, 0.0f);
+    const Vec3 m  = ggx_sample_for_refl_vk (d, woL, rx, ry);
+    if (!(dot (m, woL) > 0.0f))
+        return;
+    const Vec3 wiL = sub (mul (m, 2.0f * dot (m, woL)), woL);
+    if (!(wiL.z > 0.0f))
+        return;
+    wi = add (add (mul (X, wiL.x), mul (Y, wiL.y)), mul (N, wiL.z));
+    mx_dielectric_eval_vk (fp, p, wo, wi, weight, pdf);
+}
+
 /// Scene::sample() from raytracer.h, device side: the Heitz low-distortion
 /// triangle/square map, then the solid-angle pdf of the resulting direction.
 /// The sample point is expressed in barycentrics (u,v) so the light shader can
@@ -1997,6 +2208,7 @@ static const unsigned CS_DELTA = osl_vk_abi::kClosureSetDelta;
 static const unsigned CS_PHONG = osl_vk_abi::kClosureSetPhong;
 static const unsigned CS_ON    = osl_vk_abi::kClosureSetON;
 static const unsigned CS_MXC   = osl_vk_abi::kClosureSetMXC;
+static const unsigned CS_MXD   = osl_vk_abi::kClosureSetMXD;
 static const unsigned CS_ALL   = osl_vk_abi::kClosureSetAll;
 
 /// testrender/optics.h:13, verbatim.  TIR returns 1, eta == 0 means "no Fresnel".
@@ -2072,6 +2284,8 @@ fill_closure_entry (ClosureEntryVK& e, int id, long long off, const Vec3& w,
     e.sigma    = 0.0f;
     e.ior      = mk (0.0f, 0.0f, 0.0f);
     e.ext      = mk (0.0f, 0.0f, 0.0f);
+    e.refl_tint = mk (0.0f, 0.0f, 0.0f);
+    e.refr_tint = mk (0.0f, 0.0f, 0.0f);
     if (id == FRESNEL_REFLECTION_ID_VK || id == REFRACTION_ID_VK) {
         // ReflectionParams / RefractionParams { Vec3 N; float eta }
         e.N   = load_vec ((GlobalCVec3)(node + 16));
@@ -2110,7 +2324,129 @@ fill_closure_entry (ClosureEntryVK& e, int id, long long off, const Vec3& w,
         e.yalpha = *(VK_GLOBAL const float*)(node + 44);
         e.ior    = load_vec ((GlobalCVec3)(node + 48));
         e.ext    = load_vec ((GlobalCVec3)(node + 60));
+    } else if (id == MX_DIELECTRIC_ID_VK) {
+        // mtx::DielectricLobe::Data (bsdf_dielectric_decl.h:76-88).  Unlike the
+        // conductor it derives from LayeredData, so an 8-byte `const void*
+        // closure` precedes N: at +16 the node header ends and Data starts,
+        // which puts N at +24, U at +36, refl_tint (Cr) at +48, refr_tint (Ct)
+        // at +60, roughness_x at +72, roughness_y at +76, IOR at +80 (its
+        // Stringhash follows at +88, so the floats above are the whole prefix
+        // this kernel needs).
+        e.N         = load_vec ((GlobalCVec3)(node + 24));
+        e.U         = load_vec ((GlobalCVec3)(node + 36));
+        e.refl_tint = load_vec ((GlobalCVec3)(node + 48));
+        e.refr_tint = load_vec ((GlobalCVec3)(node + 60));
+        e.xalpha    = *(VK_GLOBAL const float*)(node + 72);
+        e.yalpha    = *(VK_GLOBAL const float*)(node + 76);
+        e.eta       = *(VK_GLOBAL const float*)(node + 80);
     }
+}
+
+
+/// Opacity of a layer's top closure, i.e. how much of the light reaching the
+/// surface the top reflects or absorbs before it can arrive at the base.
+///
+/// `evaluate_layer_opacity` (testrender/shading.cpp:1195-1284) sums
+/// `branch_weight * w * (1 - filter_o)` over every leaf.  Only the dielectric
+/// has a `filter_o` this kernel can reproduce -- `E_ms * absorption`
+/// (bsdf_dielectric_decl.h:149-153), zero once `Ct` makes the lobe
+/// transmissive; every other family is treated as opaque, which is what the
+/// CPU's own `default:` case does.
+inline Vec3 layer_alpha_vk (VK_GLOBAL ShaderGlobals* sg,
+                            VK_GLOBAL const FrameParams* fp, long long root,
+                            const Vec3& wo)
+{
+    Vec3 acc = mk (0.0f, 0.0f, 0.0f);
+    if (root < 0)
+        return acc;
+
+    long long off0 = 0, off1 = 0;
+    Vec3 w0, w1;
+    int sp        = 0;
+    long long cur = root;
+    Vec3 branch   = mk (1.0f, 1.0f, 1.0f);
+
+    for (;;) {
+        if (cur >= 0) {
+            GlobalCPtr node = (GlobalCPtr)sg + kOffPoolClosure + cur;
+            const int id    = *(VK_GLOBAL const int*)node;
+            if (id == -2) {  // ADD
+                if (sp == 0) {
+                    off0 = *(VK_GLOBAL const long long*)(node + 16);
+                    w0   = branch;
+                } else if (sp == 1) {
+                    off1 = *(VK_GLOBAL const long long*)(node + 16);
+                    w1   = branch;
+                }
+                if (sp < 2)
+                    ++sp;
+                cur = *(VK_GLOBAL const long long*)(node + 8);
+                continue;
+            }
+            if (id == -1) {  // MUL
+                branch = mulv (branch, load_vec ((GlobalCVec3)(node + 4)));
+                cur    = *(VK_GLOBAL const long long*)(node + 16);
+                continue;
+            }
+            if (id == MX_LAYER_ID_VK) {
+                // A nested layer contributes both halves, the base at the
+                // layer's own weight -- the same approximation the CPU makes
+                // for this case (shading.cpp:1227-1232).
+                if (sp == 0) {
+                    off0 = *(VK_GLOBAL const long long*)(node + 24);
+                    w0   = mulv (branch, load_vec ((GlobalCVec3)(node + 4)));
+                } else if (sp == 1) {
+                    off1 = *(VK_GLOBAL const long long*)(node + 24);
+                    w1   = mulv (branch, load_vec ((GlobalCVec3)(node + 4)));
+                }
+                if (sp < 2)
+                    ++sp;
+                cur = *(VK_GLOBAL const long long*)(node + 16);
+                continue;
+            }
+            // A leaf contributes `branch * w * (1 - filter_o)`.  Only the
+            // reflection-only dielectric transmits anything here, and its
+            // transmittance is the multiple-scattered energy it does not
+            // reflect; the transmissive flavour transmits all of it.  Every
+            // other closure counts as opaque and contributes its branch
+            // weight alone -- note that the CPU does *not* apply `comp->w`
+            // for those (shading.cpp:1262-1272), which matters here because
+            // the device folds MUL weights into the component.
+            Vec3 a = mk (1.0f, 1.0f, 1.0f);
+            if (id == MX_DIELECTRIC_ID_VK) {
+                const Vec3 ct = load_vec ((GlobalCVec3)(node + 60));
+                if (ct.x > 0.0f || ct.y > 0.0f || ct.z > 0.0f) {
+                    // A transmissive dielectric has `filter_o = ZERO`
+                    // (bsdf_dielectric_decl.h:149-153).
+                    a = mk (0.0f, 0.0f, 0.0f);
+                } else {
+                    const Vec3 N = visible_normal_vk (wo, load_vec ((GlobalCVec3)(node + 24)));
+                    const float opa = 1.0f
+                                    - dielec_lobe_E_ms (fp, N,
+                                                        load_vec ((GlobalCVec3)(node + 24)),
+                                                        wo,
+                                                        *(VK_GLOBAL const float*)(node + 72),
+                                                        *(VK_GLOBAL const float*)(node + 76),
+                                                        *(VK_GLOBAL const float*)(node + 80));
+                    a = mul (load_vec ((GlobalCVec3)(node + 4)), opa);
+                }
+            }
+            acc  = add (acc, mulv (branch, a));
+            cur  = -1;
+        }
+        if (sp == 0)
+            break;
+        --sp;
+        if (sp == 0) {
+            cur    = off0;
+            branch = w0;
+        } else {
+            cur    = off1;
+            branch = w1;
+        }
+    }
+    return mk (vk_clampf (acc.x, 0.0f, 1.0f), vk_clampf (acc.y, 0.0f, 1.0f),
+               vk_clampf (acc.z, 0.0f, 1.0f));
 }
 
 
@@ -2132,8 +2468,10 @@ fill_closure_entry (ClosureEntryVK& e, int id, long long off, const Vec3& w,
 /// walk stops the moment it has both components, so it can never need a third
 /// pending node.
 inline __attribute__((always_inline)) int
-collect_closure_entries (VK_GLOBAL ShaderGlobals* sg, long long root,
-                         ClosureEntryVK& first, ClosureEntryVK& second)
+collect_closure_entries (VK_GLOBAL ShaderGlobals* sg,
+                         VK_GLOBAL const FrameParams* fp, long long root,
+                         const Vec3& wo, ClosureEntryVK& first,
+                         ClosureEntryVK& second)
 {
     if (root < 0)
         return 0;
@@ -2165,6 +2503,35 @@ collect_closure_entries (VK_GLOBAL ShaderGlobals* sg, long long root,
             if (id == -1) {  // MUL
                 branch = mulv (branch, load_vec ((GlobalCVec3)(node + 4)));
                 cur    = *(VK_GLOBAL const long long*)(node + 16);
+                continue;
+            }
+            if (id == MX_LAYER_ID_VK) {
+                // layer(top, base): `top` takes the layer's own weight, `base`
+                // what the top leaves of it.  Descending is not optional --
+                // leaving the layer as a leaf would hand the shading kernel an
+                // id no family implements, and every closure the material
+                // actually built would be invisible behind it.
+                // `base` is weighted by what the top leaves through:
+                // `base_w = w * (1 - clamp(opacity)` (shading.cpp:1314-1326).
+                const Vec3 lw    = mulv (branch, load_vec ((GlobalCVec3)(node + 4)));
+                const Vec3 alpha = layer_alpha_vk (sg, fp,
+                                                  *(VK_GLOBAL const long long*)
+                                                      (node + 16),
+                                                  wo);
+                const Vec3 basew = mulv (lw, mk (1.0f - alpha.x,
+                                                  1.0f - alpha.y,
+                                                  1.0f - alpha.z));
+                if (sp == 0) {
+                    off0 = *(VK_GLOBAL const long long*)(node + 24);
+                    w0   = basew;
+                } else if (sp == 1) {
+                    off1 = *(VK_GLOBAL const long long*)(node + 24);
+                    w1   = basew;
+                }
+                if (sp < 2)
+                    ++sp;
+                cur    = *(VK_GLOBAL const long long*)(node + 16);
+                branch = lw;
                 continue;
             }
             const Vec3 bw = mulv (branch, load_vec ((GlobalCVec3)(node + 4)));
@@ -2212,7 +2579,8 @@ inline bool closure_entry_is_delta (const ClosureEntryVK& e)
 /// `CS` is the kernel's compile-time closure set: a family the material cannot
 /// produce is not emitted at all.
 template <unsigned CS>
-inline Vec3 closure_entry_albedo (const ClosureEntryVK& e, const Vec3& wo)
+inline Vec3 closure_entry_albedo (VK_GLOBAL const FrameParams* fp,
+                                   const ClosureEntryVK& e, const Vec3& wo)
 {
     if constexpr (CS & CS_DELTA) {
         if (e.id == REFLECTION_ID_VK || e.id == FRESNEL_REFLECTION_ID_VK) {
@@ -2233,6 +2601,24 @@ inline Vec3 closure_entry_albedo (const ClosureEntryVK& e, const Vec3& wo)
         if (e.id == MICROFACET_ID_VK) {
             float a = mf_albedo (e, wo);
             return mk (e.w.x * a, e.w.y * a, e.w.z * a);
+        }
+    }
+    if constexpr (CS & CS_MXD) {
+        if (e.id == MX_DIELECTRIC_ID_VK) {
+            // `DielectricLobe::albedo_impl()` (bsdf_dielectric_decl.h:104-108):
+            // refl_tint * (1 - E_ms), the one supported family whose albedo is
+            // *not* its branch weight -- it is what the CPU's get_albedo hands
+            // prepare() and the roulette, so it has to match here too.
+            if (!(e.refr_tint.x > 0.0f) && !(e.refr_tint.y > 0.0f)
+                && !(e.refr_tint.z > 0.0f)) {
+                const Vec3 N     = visible_normal_vk (wo, e.N);
+                const float E    = dielec_lobe_E_ms (fp, N, e.N, wo, e.xalpha,
+                                                    e.yalpha, e.eta);
+                const float k    = 1.0f - E;
+                return mk (e.w.x * e.refl_tint.x * k,
+                           e.w.y * e.refl_tint.y * k,
+                           e.w.z * e.refl_tint.z * k);
+            }
         }
     }
     return e.w;
@@ -2322,6 +2708,17 @@ inline Vec3 component_eval (VK_GLOBAL const FrameParams* fp,
             return mulv (e.w, lw);
         }
     }
+    if constexpr (CS & CS_MXD) {
+        if (e.id == MX_DIELECTRIC_ID_VK
+            && !(e.refr_tint.x > 0.0f) && !(e.refr_tint.y > 0.0f)
+            && !(e.refr_tint.z > 0.0f)) {
+            Vec3 lw;
+            float lp = 0.0f;
+            mx_dielectric_eval_vk (fp, e, wov, wi, lw, lp);
+            pdf = lp;
+            return mulv (e.w, lw);
+        }
+    }
     return mk (0.0f, 0.0f, 0.0f);
 }
 
@@ -2379,7 +2776,7 @@ template <unsigned CS>
 inline void nee_eval_vk (VK_GLOBAL const FrameParams* fp,
                          const ClosureEntryVK& ce0, const ClosureEntryVK& ce1,
                          int ncomp, int has_microfacet, int is_ward,
-                         int has_phong, int has_on, int has_mxc,
+                         int has_phong, int has_on, int has_mxc, int has_mxd,
                          const WardVK& wardp, const Vec3& wov, const Vec3& wi,
                          const Vec3& n, float ar, float ag, float ab, float b0,
                          float b1, Vec3& w, float& pdf)
@@ -2389,6 +2786,15 @@ inline void nee_eval_vk (VK_GLOBAL const FrameParams* fp,
         // distribution times the complex Fresnel term), so the accumulated
         // albedo cannot stand in for it.
         if (has_mxc) {
+            components_eval_sum<CS> (fp, ce0, ce1, ncomp, wardp, wov, wi, n, b0,
+                                     b1, w, pdf);
+            return;
+        }
+    }
+    if constexpr (CS & CS_MXD) {
+        // Same for the dielectric: GGX reflectance weighted by its own Fresnel
+        // term, nothing a cosine lobe can approximate.
+        if (has_mxd) {
             components_eval_sum<CS> (fp, ce0, ce1, ncomp, wardp, wov, wi, n, b0,
                                      b1, w, pdf);
             return;
@@ -2585,7 +2991,8 @@ inline Vec3 background_table_eval(VK_GLOBAL const FrameParams* p,
     pdf                 = pd > 0.0f ? pd : 0.0f;
     // Read the three floats through the global lvalue: the element type is
     // address-space-qualified, so copying the whole Vec3 is not well formed.
-    return mk(values[i].x, values[i].y, values[i].z);
+    Vec3 bgv3 = mk(values[i].x, values[i].y, values[i].z);
+    return bgv3;
 }
 
 
@@ -3161,6 +3568,7 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
     constexpr bool HAS_PHONG = (CS & CS_PHONG) != 0;
     constexpr bool HAS_ON    = (CS & CS_ON) != 0;
     constexpr bool HAS_MXC   = (CS & CS_MXC) != 0;
+    constexpr bool HAS_MXD   = (CS & CS_MXD) != 0;
 
     VK_GLOBAL const FrameParams* p
         = (VK_GLOBAL const FrameParams*)(base + kFrameParamsOffset);
@@ -3272,9 +3680,9 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
     ray.radius    = r.radius;
     ray.spread    = r.spread;
 
-    Vec3 w          = mk(r.thr_r, r.thr_g, r.thr_b);
-    float bsdf_pdf  = r.bpdf;
-    const int b     = r.depth;
+    Vec3 w         = mk(r.thr_r, r.thr_g, r.thr_b);
+    float bsdf_pdf = r.bpdf;
+    const int b    = r.depth;
 
     Vec3 L = mk(0.0f, 0.0f, 0.0f);
 
@@ -3368,6 +3776,9 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
             // complex Fresnel term, which is neither a delta lobe nor a
             // Lambert one.
             int has_mxc = 0;
+            // At least one component is a MaterialX dielectric (reflection only,
+            // i.e. the layer has no transmission tint).
+            int has_mxd = 0;
             WardVK wardp;
             long long ci = *(GlobalI64)((GlobalPtr)sg + kOffCi);
             // Flatten ADD/MUL: glass is `Ks*reflection(N,eta) +
@@ -3389,7 +3800,9 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
             ce[1].id  = -1;
             ce[0].off = 0;
             ce[1].off = 0;
-            int ncomp   = collect_closure_entries(sg, ci, ce[0], ce[1]);
+            int ncomp   = collect_closure_entries(sg, p, ci,
+                                                  mul (ray.direction, -1.0f),
+                                                  ce[0], ce[1]);
             Vec3 alb0   = mk(0.0f, 0.0f, 0.0f);
             Vec3 alb1   = mk(0.0f, 0.0f, 0.0f);
             if (ncomp > 0) {
@@ -3412,7 +3825,7 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                         all_delta = 0;  // an emitter is not a delta BSDF
                         return;
                     }
-                    Vec3 alb = closure_entry_albedo<CS>(e, wov0);
+                    Vec3 alb = closure_entry_albedo<CS>(p, e, wov0);
                     alb_out  = alb;
                     ar += alb.x;
                     ag += alb.y;
@@ -3459,6 +3872,19 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                             all_delta = 0;
                         }
                     }
+                    if constexpr (HAS_MXD) {
+                        // Reflection-only dielectric components (no transmission
+                        // tint) are sampled and evaluated like the conductor,
+                        // just with a scalar Fresnel.  A transmissive one
+                        // (`Ct != 0`) keeps the old stand-in: `all_delta` stays
+                        // cleared because it is not a delta lobe either way.
+                        if (e.id == MX_DIELECTRIC_ID_VK) {
+                            if (!(e.refr_tint.x > 0.0f) && !(e.refr_tint.y > 0.0f)
+                                && !(e.refr_tint.z > 0.0f))
+                                has_mxd = 1;
+                            all_delta = 0;
+                        }
+                    }
                     if constexpr (HAS_ON) {
                         if (e.id == OREN_NAYAR_ID_VK) {
                             // Rough diffuse: cosine sampling, but the weight
@@ -3494,27 +3920,10 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                     all_delta = 1;
             }
 
-            // CompositeBSDF::prepare's lobe pick probabilities
-            // (shading.h:322-354): pdfs[i] = weights[i] . (path_weight *
-            // albedo_i) / sum(path_weight), normalised by their total the way
-            // prepare() does.  The NEE evaluation of a multi-lobe mixture needs
-            // them: CompositeBSDF::eval folds each lobe in with
-            // MIS::update_eval using its own pick probability, so a plain sum
-            // of the lobes gives a different (weight, pdf) pair -- visible as a
-            // systematic energy difference on glossy two-lobe materials.
-            float pk0 = 0.0f, pk1 = 0.0f;
-            {
-                const float msum = w.x + w.y + w.z;
-                if (msum > 0.0f && ncomp > 0) {
-                    pk0 = (alb0.x * w.x + alb0.y * w.y + alb0.z * w.z) / msum;
-                    pk1 = (alb1.x * w.x + alb1.y * w.y + alb1.z * w.z) / msum;
-                }
-                const float ptot = pk0 + pk1;
-                if (ptot > 0.0f) {
-                    pk0 /= ptot;
-                    pk1 /= ptot;
-                }
-            }
+            // CompositeBSDF::prepare's lobe pick probabilities are recomputed
+            // per bounce, below, from the path weight as it stands at that
+            // bounce -- exactly where the CPU calls prepare()
+            // (simpleraytracer.cpp:1155).
 
             // One random triple per bounce, exactly where the CPU takes it
             // (simpleraytracer.cpp:1103): NEE and the BSDF sample both use it.
@@ -3553,6 +3962,29 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                 if (!(ar > 0.0f) && !(ag > 0.0f) && !(ab > 0.0f))
                     break;
 
+                // CompositeBSDF::prepare's lobe pick probabilities
+                // (shading.h:322-354): pdfs[i] = weights[i] . (path_weight *
+                // albedo_i) / sum(path_weight), normalised by their total the way
+                // prepare() does.  The NEE evaluation of a multi-lobe mixture
+                // needs them: CompositeBSDF::eval folds each lobe in with
+                // MIS::update_eval using its own pick probability, so a plain
+                // sum of the lobes gives a different (weight, pdf) pair --
+                // visible as a systematic energy difference on glossy two-lobe
+                // materials.
+                float pk0 = 0.0f, pk1 = 0.0f;
+                {
+                    const float msum = w.x + w.y + w.z;
+                    if (msum > 0.0f && ncomp > 0) {
+                        pk0 = (alb0.x * w.x + alb0.y * w.y + alb0.z * w.z) / msum;
+                        pk1 = (alb1.x * w.x + alb1.y * w.y + alb1.z * w.z) / msum;
+                    }
+                    const float ptot = pk0 + pk1;
+                    if (ptot > 0.0f) {
+                        pk0 /= ptot;
+                        pk1 /= ptot;
+                    }
+                }
+
                 // ---- explicit background sampling (NEE) ---------------------
                 // Mirrors simpleraytracer.cpp:1137-1155: sample a direction
                 // from the background importance table, evaluate the closure
@@ -3566,8 +3998,8 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                     float bpdf = 0.0f;
                     Vec3 bwt3  = mk(0.0f, 0.0f, 0.0f);
                     nee_eval_vk<CS>(p, ce[0], ce[1], ncomp, has_microfacet, is_ward,
-                                    has_phong, has_on, has_mxc, wardp, wov,
-                                    bg_dir, n, ar, ag, ab, pk0, pk1, bwt3,
+                                    has_phong, has_on, has_mxc, has_mxd, wardp,
+                                    wov, bg_dir, n, ar, ag, ab, pk0, pk1, bwt3,
                                     bpdf);
                     const float mis = power_heuristic_weight_weight(bg_pdf, bpdf);
                     Vec3 contrib = mulv(mulv(w, bwt3),
@@ -3609,9 +4041,9 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                         float bpdf = 0.0f;
                         Vec3 bwt3  = mk(0.0f, 0.0f, 0.0f);
                         nee_eval_vk<CS>(p, ce[0], ce[1], ncomp, has_microfacet, is_ward,
-                                        has_phong, has_on, has_mxc, wardp, wov,
-                                        lsmp.dir, n, ar, ag, ab, pk0, pk1,
-                                        bwt3, bpdf);
+                                        has_phong, has_on, has_mxc, has_mxd,
+                                        wardp, wov, lsmp.dir, n, ar, ag, ab, pk0,
+                                        pk1, bwt3, bpdf);
                         float mis = power_heuristic_eval_weight(
                             light_pick_pdf * lsmp.pdf, bpdf);
                         Vec3 contrib
@@ -3741,11 +4173,13 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                     float cosNO = dot(n, wov);
                     wi          = sub(mul(n, 2.0f * cosNO), wov);
                     bsdf_pdf    = inf();
-                } else if (HAS_MF && has_microfacet) {
-                    // Glass is a two-lobe mixture (transmission + reflection).
-                    // Pick a lobe by its solid-angle share, sample that lobe,
-                    // then fold the other lobe's eval toward the chosen
-                    // direction in with the balance heuristic -- exactly
+                } else if ((HAS_MF && has_microfacet)
+                           || (HAS_MXD && has_mxd)) {
+                    // Glass is a two-lobe mixture (transmission + reflection),
+                    // and so is the same shape built with a dielectric over a
+                    // diffuse base.  Pick a lobe by its solid-angle share, sample
+                    // that lobe, then fold the other lobe's eval toward the
+                    // chosen direction in with the balance heuristic -- exactly
                     // CompositeBSDF::sample (shading.h:376-403).
                     float msum = w.x + w.y + w.z;
                     float p0 = 0.0f, p1 = 0.0f;
@@ -3777,6 +4211,28 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                         float lw = 0.0f;
                         mf_sample_vk(e, wov, u1, s3.y, s3.z, wi, lw, spdf);
                         sw = mk(lw, lw, lw);
+                    } else if constexpr (HAS_MXD) {
+                        // The dielectric lobe samples like the conductor: draw a
+                        // micro normal from the bounded VNDF, reflect, then take
+                        // the full eval there (sample_turquin_microms_reflection).
+                        if (e.id == MX_DIELECTRIC_ID_VK) {
+                            Vec3 dw;
+                            mx_dielectric_sample_vk(p, e, wov, u1, s3.y, wi, dw,
+                                                    spdf);
+                            sw = dw;
+                        } else if constexpr (HAS_DIFF) {
+                            if (e.id == DIFFUSE_ID_VK) {
+                                float pc = 0.0f;
+                                wi       = sample_cosine_hemisphere(e.N, u1, s3.y,
+                                                                    pc);
+                                spdf     = pc;
+                                sw       = mk(1.0f, 1.0f, 1.0f);
+                            } else {
+                                break;  // this lobe cannot be sampled
+                            }
+                        } else {
+                            break;  // this lobe cannot be sampled
+                        }
                     } else if constexpr (HAS_DIFF) {
                         if (e.id == DIFFUSE_ID_VK) {
                             float pc = 0.0f;
@@ -3790,6 +4246,18 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                         break;  // this lobe cannot be sampled
                     }
                     Vec3 outw = mul(mulv(e.w, sw), 1.0f / prob);
+                    // CompositeBSDF::sample drops the whole sample when the lobe
+                    // it picked reports a zero pdf (shading.h:387-388).  It has
+                    // to: a micro normal the sampler drew at the very edge of the
+                    // lobe has `D_refl_D -> 0`, which makes the lobe's own value
+                    // `G2_G1 * G1 / D_refl_D` blow up *and* its pdf vanish, so
+                    // the sample is pure noise the CPU never adds.  Merging the
+                    // other lobe into it instead (below) would divide that
+                    // eval by the pick probability alone -- a firefly.
+                    if (!(spdf > 0.0f)) {
+                        w = mk(0.0f, 0.0f, 0.0f);
+                        break;
+                    }
                     spdf *= prob;
                     const ClosureEntryVK& oe = ce[pick ? 0 : 1];
                     if (oe.id >= 0 && oe.id != EMISSION_ID_VK
@@ -3865,7 +4333,13 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                 }
                 if (all_delta) {
                     w = mulv(w, mk(wmulr, wmulg, wmulb));
-                } else if (!(HAS_MF && has_microfacet)) {
+                } else if (!((HAS_MF && has_microfacet)
+                             || (HAS_MXD && has_mxd))) {
+                    // Single-lobe families: the throughput factor is the
+                    // component weight, which for all of them except the
+                    // dielectric *is* the albedo -- that one samples through the
+                    // mixture branch above instead, where the pick probability
+                    // and the other lobe's eval are already folded in.
                     if constexpr (HAS_MXC) {
                         if (has_mxc)
                             w = mulv(w, mulv(mk(ar, ag, ab), sweight_v));
@@ -3890,6 +4364,7 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                 r.sindex = sampler.index;
                 r.active = (w.x > 0.0f || w.y > 0.0f || w.z > 0.0f) ? 1 : 0;
             } while (0);
+
         }
     }
 

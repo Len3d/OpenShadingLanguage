@@ -23,6 +23,9 @@ namespace pugi = OIIO::pugi;
 // core declarations first, which is what bsdf_conductor_impl.h is here for.
 #    include <BSDL/MTX/bsdf_conductor_impl.h>
 #    include <BSDL/microfacet_tools_impl.h>
+// DielectricReflFront::get_energy() -- the dielectric energy table, baked into
+// BSDL/MTX/bsdf_dielectric_reflfront_luts.h the same way.
+#    include <BSDL/MTX/bsdf_dielectric_impl.h>
 #endif
 
 #include <cmath>
@@ -2386,6 +2389,12 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
     std::memcpy(fp.mx_energy,
                 bsdl::spi::MiniMicrofacetGGX::get_energy().data,
                 sizeof(fp.mx_energy));
+    // `DielectricLobe::E_ms` -- the dielectric energy table `albedo_impl()` and
+    // `filter_o()` are built on (bsdf_dielectric_impl.h:262-266).  Same source
+    // the CPU reads, and the same reason it lives in the frame parameters.
+    std::memcpy(fp.mx_dielec_energy,
+                bsdl::mtx::DielectricReflFront::get_energy().data,
+                sizeof(fp.mx_dielec_energy));
     fp.lightprim_offset  = (long long)lp_off;
     fp.num_lightprims    = (int)lp_count;
     fp.area_offset       = (long long)area_off;

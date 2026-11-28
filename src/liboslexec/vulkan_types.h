@@ -64,10 +64,12 @@ static const unsigned kClosureSetPhong = 1u << 5;  // phong: glossy, one lobe
 static const unsigned kClosureSetON    = 1u << 6;  // oren_nayar: rough diffuse
 static const unsigned kClosureSetMXC   = 1u << 7;  // MaterialX conductor
                                                    // (conductor_bsdf: GGX)
+static const unsigned kClosureSetMXD   = 1u << 8;  // MaterialX dielectric
+                                                   // (dielectric_bsdf: GGX)
 // Every family, including the ones no instantiation is tagged for: a set with
 // no entry of its own resolves to the `_all` body, which is instantiated with
 // this value, so `if constexpr (CS & kClosureSetPhong)` is live there.
-static const unsigned kClosureSetAll   = 255u;
+static const unsigned kClosureSetAll   = 511u;
 
 struct Vec3 {
     float x, y, z;
@@ -411,6 +413,16 @@ struct FrameParams {
     /// (the background importance table already does it), so the table rides
     /// with the frame parameters instead.
     float mx_energy[256];
+    /// `mtx::DielectricReflFront`'s energy-compensation table (Nf*Nr*Nc =
+    /// 32*16*16 floats: 32 fresnel rows, 16 roughness rows, 16 cosines),
+    /// uploaded by testrender from BSDL's generated
+    /// `BSDL/MTX/bsdf_dielectric_reflfront_luts.h`.  This is the table
+    /// `DielectricLobe::E_ms` comes from (bsdf_dielectric_impl.h:262-266), i.e.
+    /// the one `albedo_impl()` and `filter_o()` read -- so it drives the
+    /// dielectric's mixture weight and the opacity of a `layer(top, base)`
+    /// whose top is a dielectric.  The *other* dielectric E_ms, the one the
+    /// Turquin lobe itself multiplies in, is the mini-GGX table above.
+    float mx_dielec_energy[32 * 16 * 16];
 };
 
 /// Where FrameParams sits: the first bytes of the buffer, so the kernel can

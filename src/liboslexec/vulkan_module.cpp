@@ -945,6 +945,9 @@ bool vulkan_build_render_module (const std::vector<std::string>& group_ir,
                             case 18:  // conductor_bsdf (MaterialX)
                                 cs |= osl_vk_abi::kClosureSetMXC;
                                 break;
+                            case 17:  // dielectric_bsdf (MaterialX)
+                                cs |= osl_vk_abi::kClosureSetMXD;
+                                break;
                             case 9:   // reflection
                             case 10:  // fresnel reflection
                             case 11:  // refraction

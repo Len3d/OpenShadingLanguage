@@ -374,6 +374,7 @@ llvm::Function* Retyper::intrinsicFor(llvm::IntrinsicInst* II,
 // rather than by pointer; must agree with vulkan_abi_check.cpp.
 static const long long kShadeBlockRenderstateOffset = 216;
 static const long long kShadeBlockCiOffset          = 288;
+static const long long kShadeBlockPoolOffset        = 320;
 
 /// True when `p` is a byte-field access `getelementptr i8, ptr <shaderglobals>,
 /// i64 <off>` -- i.e. a constant-offset field of the ShadeBlock.
@@ -384,6 +385,56 @@ static bool isShadeBlockByteField(llvm::Value* p, long long off)
         return false;
     auto* C = llvm::dyn_cast<llvm::ConstantInt>(G->getOperand(1));
     return C && (long long)C->getSExtValue() == off;
+}
+
+
+/// The value an address chain starts from, however many links it has: the
+/// front end writes the second slot of a two-pointer parameter block as
+/// `inttoptr(add(ptrtoint(gep), 8))`, the latter half of which is the
+/// `inttoptr` round trip this pass otherwise only folds away.
+static llvm::Value* address_base(llvm::Value* p)
+{
+    using namespace llvm;
+    for (int guard = 0; guard < 16; ++guard) {
+        if (auto* G = dyn_cast<GetElementPtrInst>(p)) {
+            p = G->getPointerOperand();
+        } else if (auto* I = dyn_cast<IntToPtrInst>(p)) {
+            auto* A = dyn_cast<BinaryOperator>(I->getOperand(0));
+            if (!A || A->getOpcode() != Instruction::Add)
+                return nullptr;
+            Value* base = nullptr;
+            for (unsigned k = 0; k < 2; ++k) {
+                if (auto* P = dyn_cast<PtrToIntInst>(A->getOperand(k))) {
+                    base = P->getPointerOperand();
+                    break;
+                }
+            }
+            if (!base)
+                return nullptr;
+            p = base;
+        } else {
+            return p;
+        }
+    }
+    return p;
+}
+
+
+/// True when `p` addresses a closure component's parameter block: that memory
+/// comes from the arena allocator reached through
+/// `osl_allocate[_weighted]_closure_component`.
+static bool is_closure_component_param(llvm::Value* p)
+{
+    auto* C = llvm::dyn_cast<llvm::CallBase>(address_base(p));
+    if (!C)
+        return false;
+    llvm::Value* co = C->getCalledOperand()->stripPointerCasts();
+    llvm::StringRef name;
+    if (auto* F = llvm::dyn_cast<llvm::Function>(co))
+        name = F->getName();
+    else if (auto* GV = llvm::dyn_cast<llvm::GlobalValue>(co))
+        name = GV->getName();
+    return name.contains("closure_component");
 }
 
 
@@ -451,6 +502,38 @@ llvm::Value* Retyper::recreate(llvm::Instruction& I, llvm::IRBuilder<>& B,
                         "[legalize] dropped pointer store to sg+%lld (Ci)\n",
                         kShadeBlockCiOffset);
             return B.getInt32(0);  // no value is consumed from a store
+        }
+
+        // A closure pointer stored into a component's parameter block is the
+        // same shape again, and `layer(top, base)` is the only closure that
+        // writes one.  The device runtime walks each tree by arena offset --
+        // osl_add_closure_closure (vulkan_shadeops.cpp) already publishes its
+        // two children that way -- so publish the layer's the same way rather
+        // than leave a pointer value in the buffer for later to trip over.
+        if (SI.getValueOperand()->getType()->isPointerTy()
+            && is_closure_component_param(SI.getPointerOperand())) {
+            llvm::Value* sg = arenaBase();
+            if (sg) {
+                llvm::Type* i8  = llvm::Type::getInt8Ty(m_ctx);
+                llvm::Type* i64 = llvm::Type::getInt64Ty(m_ctx);
+                llvm::Value* pool
+                    = B.CreateGEP(i8, sg, B.getInt64(kShadeBlockPoolOffset));
+#if OSL_LLVM_VERSION >= 240
+                llvm::Value* from = B.CreatePtrToAddr(arg(0));
+                llvm::Value* base = B.CreatePtrToAddr(pool);
+                if (from->getType() != i64)
+                    from = B.CreateZExt(from, i64);
+                if (base->getType() != i64)
+                    base = B.CreateZExt(base, i64);
+#else
+                llvm::Value* from = B.CreatePtrToInt(arg(0), i64);
+                llvm::Value* base = B.CreatePtrToInt(pool, i64);
+#endif
+                StoreInst* NS = B.CreateStore(B.CreateSub(from, base), arg(1));
+                NS->setAlignment(SI.getAlign());
+                NS->setVolatile(SI.isVolatile());
+                return NS;
+            }
         }
 
         StoreInst* NS = B.CreateStore(arg(0), arg(1));
