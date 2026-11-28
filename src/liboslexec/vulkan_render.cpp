@@ -1820,7 +1820,8 @@ inline void mx_conductor_frame (const Vec3& N, const Vec3& U, Vec3& X, Vec3& Y)
 /// multiple-scattering compensated GGX reflection lobe.
 inline void mx_conductor_eval_vk (VK_GLOBAL const FrameParams* fp,
                                   const ClosureEntryVK& p, const Vec3& wo,
-                                  const Vec3& wi, Vec3& weight, float& pdf)
+                                  const Vec3& wi, Vec3& weight, float& pdf,
+                                  float path_rough)
 {
 #pragma clang fp contract(off)
     weight = mk (0.0f, 0.0f, 0.0f);
@@ -1832,7 +1833,7 @@ inline void mx_conductor_eval_vk (VK_GLOBAL const FrameParams* fp,
     const Vec3 wiL = mk (dot (wi, X), dot (wi, Y), dot (wi, N));
     if (!(woL.z > 0.0f) || !(wiL.z > 0.0f))
         return;
-    const GgxVK d = ggx_make (p.xalpha, p.yalpha, 0.0f);
+    const GgxVK d = ggx_make (p.xalpha, p.yalpha, path_rough);
     const Vec3 mh = normalize (add (woL, wiL));
     const float cosMO = dot (mh, woL);
     const float D     = ggx_D_vk (d, mh);
@@ -1856,19 +1857,25 @@ inline void mx_conductor_eval_vk (VK_GLOBAL const FrameParams* fp,
 inline void mx_conductor_sample_vk (VK_GLOBAL const FrameParams* fp,
                                     const ClosureEntryVK& p, const Vec3& wo,
                                     float rx, float ry, Vec3& wi, Vec3& weight,
-                                    float& pdf)
+                                    float& pdf, float& lobe_rough,
+                                    float path_rough)
 {
 #pragma clang fp contract(off)
-    weight = mk (0.0f, 0.0f, 0.0f);
-    pdf    = 0.0f;
-    wi     = mul (wo, -1.0f);
+    weight     = mk (0.0f, 0.0f, 0.0f);
+    pdf        = 0.0f;
+    lobe_rough = 0.0f;
+    wi         = mul (wo, -1.0f);
     const Vec3 N = visible_normal_vk (wo, p.N);
     Vec3 X, Y;
     mx_conductor_frame (N, p.U, X, Y);
     const Vec3 woL = mk (dot (wo, X), dot (wo, Y), dot (wo, N));
     if (!(woL.z > 0.0f))
         return;
-    const GgxVK d = ggx_make (p.xalpha, p.yalpha, 0.0f);
+    const GgxVK d = ggx_make (p.xalpha, p.yalpha, path_rough);
+    // GGXDist::roughness() is the max alpha, and that is what the CPU tracer
+    // carries to the next bounce as `path_roughness`
+    // (microfacet_tools_impl.h:224 -> Ray::roughness).
+    lobe_rough    = d.ax > d.ay ? d.ax : d.ay;
     const Vec3 m  = ggx_sample_for_refl_vk (d, woL, rx, ry);
     if (!(dot (m, woL) > 0.0f))
         return;
@@ -1876,7 +1883,7 @@ inline void mx_conductor_sample_vk (VK_GLOBAL const FrameParams* fp,
     if (!(wiL.z > 0.0f))
         return;
     wi = add (add (mul (X, wiL.x), mul (Y, wiL.y)), mul (N, wiL.z));
-    mx_conductor_eval_vk (fp, p, wo, wi, weight, pdf);
+    mx_conductor_eval_vk (fp, p, wo, wi, weight, pdf, path_rough);
 }
 
 // ---------------------------------------------------------------------------
@@ -1999,10 +2006,10 @@ inline float mx_emiss_diel_vk (VK_GLOBAL const FrameParams* fp, float roughness,
 /// anisotropy parameterisation as that one.
 inline float dielec_lobe_E_ms (VK_GLOBAL const FrameParams* fp, const Vec3& N,
                                const Vec3& Ng, const Vec3& wo, float xalpha,
-                               float yalpha, float eta)
+                               float yalpha, float eta, float path_rough)
 {
 #pragma clang fp contract(off)
-    const GgxVK d      = ggx_make (xalpha, yalpha, 0.0f);
+    const GgxVK d      = ggx_make (xalpha, yalpha, path_rough);
     const float cosNO  = dot (N, wo);
     const int backside = dot (Ng, wo) < 0.0f;
     const float fidx   = dielec_table_index (dielec_eta (eta, backside));
@@ -2014,7 +2021,8 @@ inline float dielec_lobe_E_ms (VK_GLOBAL const FrameParams* fp, const Vec3& N,
 /// `DielectricLobe::eval_impl`: the tint (Cr) multiplies the lobe value.
 inline void mx_dielectric_eval_vk (VK_GLOBAL const FrameParams* fp,
                                    const ClosureEntryVK& p, const Vec3& wo,
-                                   const Vec3& wi, Vec3& weight, float& pdf)
+                                   const Vec3& wi, Vec3& weight, float& pdf,
+                                   float path_rough)
 {
 #pragma clang fp contract(off)
     weight = mk (0.0f, 0.0f, 0.0f);
@@ -2028,7 +2036,7 @@ inline void mx_dielectric_eval_vk (VK_GLOBAL const FrameParams* fp,
         return;
     const int backside = dot (p.N, wo) < 0.0f;
     const float eta    = dielec_eta (p.eta, backside);
-    const GgxVK d      = ggx_make (p.xalpha, p.yalpha, 0.0f);
+    const GgxVK d      = ggx_make (p.xalpha, p.yalpha, path_rough);
     const Vec3 mh      = normalize (add (woL, wiL));
     const float cosMO  = dot (mh, woL);
     const float D      = ggx_D_vk (d, mh);
@@ -2050,19 +2058,22 @@ inline void mx_dielectric_eval_vk (VK_GLOBAL const FrameParams* fp,
 inline void mx_dielectric_sample_vk (VK_GLOBAL const FrameParams* fp,
                                      const ClosureEntryVK& p, const Vec3& wo,
                                      float rx, float ry, Vec3& wi,
-                                     Vec3& weight, float& pdf)
+                                     Vec3& weight, float& pdf,
+                                     float& lobe_rough, float path_rough)
 {
 #pragma clang fp contract(off)
-    weight = mk (0.0f, 0.0f, 0.0f);
-    pdf    = 0.0f;
-    wi     = mul (wo, -1.0f);
+    weight     = mk (0.0f, 0.0f, 0.0f);
+    pdf        = 0.0f;
+    lobe_rough = 0.0f;
+    wi         = mul (wo, -1.0f);
     const Vec3 N = visible_normal_vk (wo, p.N);
     Vec3 X, Y;
     mx_conductor_frame (N, p.U, X, Y);
     const Vec3 woL = mk (dot (wo, X), dot (wo, Y), dot (wo, N));
     if (!(woL.z > 0.0f))
         return;
-    const GgxVK d = ggx_make (p.xalpha, p.yalpha, 0.0f);
+    const GgxVK d = ggx_make (p.xalpha, p.yalpha, path_rough);
+    lobe_rough    = d.ax > d.ay ? d.ax : d.ay;
     const Vec3 m  = ggx_sample_for_refl_vk (d, woL, rx, ry);
     if (!(dot (m, woL) > 0.0f))
         return;
@@ -2070,7 +2081,7 @@ inline void mx_dielectric_sample_vk (VK_GLOBAL const FrameParams* fp,
     if (!(wiL.z > 0.0f))
         return;
     wi = add (add (mul (X, wiL.x), mul (Y, wiL.y)), mul (N, wiL.z));
-    mx_dielectric_eval_vk (fp, p, wo, wi, weight, pdf);
+    mx_dielectric_eval_vk (fp, p, wo, wi, weight, pdf, path_rough);
 }
 
 /// Scene::sample() from raytracer.h, device side: the Heitz low-distortion
@@ -2354,7 +2365,7 @@ fill_closure_entry (ClosureEntryVK& e, int id, long long off, const Vec3& w,
 /// CPU's own `default:` case does.
 inline Vec3 layer_alpha_vk (VK_GLOBAL ShaderGlobals* sg,
                             VK_GLOBAL const FrameParams* fp, long long root,
-                            const Vec3& wo)
+                            const Vec3& wo, float path_rough)
 {
     Vec3 acc = mk (0.0f, 0.0f, 0.0f);
     if (root < 0)
@@ -2427,7 +2438,8 @@ inline Vec3 layer_alpha_vk (VK_GLOBAL ShaderGlobals* sg,
                                                         wo,
                                                         *(VK_GLOBAL const float*)(node + 72),
                                                         *(VK_GLOBAL const float*)(node + 76),
-                                                        *(VK_GLOBAL const float*)(node + 80));
+                                                        *(VK_GLOBAL const float*)(node + 80),
+                                                        path_rough);
                     a = mul (load_vec ((GlobalCVec3)(node + 4)), opa);
                 }
             }
@@ -2471,7 +2483,7 @@ inline __attribute__((always_inline)) int
 collect_closure_entries (VK_GLOBAL ShaderGlobals* sg,
                          VK_GLOBAL const FrameParams* fp, long long root,
                          const Vec3& wo, ClosureEntryVK& first,
-                         ClosureEntryVK& second)
+                         ClosureEntryVK& second, float path_rough)
 {
     if (root < 0)
         return 0;
@@ -2517,7 +2529,7 @@ collect_closure_entries (VK_GLOBAL ShaderGlobals* sg,
                 const Vec3 alpha = layer_alpha_vk (sg, fp,
                                                   *(VK_GLOBAL const long long*)
                                                       (node + 16),
-                                                  wo);
+                                                  wo, path_rough);
                 const Vec3 basew = mulv (lw, mk (1.0f - alpha.x,
                                                   1.0f - alpha.y,
                                                   1.0f - alpha.z));
@@ -2580,7 +2592,8 @@ inline bool closure_entry_is_delta (const ClosureEntryVK& e)
 /// produce is not emitted at all.
 template <unsigned CS>
 inline Vec3 closure_entry_albedo (VK_GLOBAL const FrameParams* fp,
-                                   const ClosureEntryVK& e, const Vec3& wo)
+                                  const ClosureEntryVK& e, const Vec3& wo,
+                                  float path_rough)
 {
     if constexpr (CS & CS_DELTA) {
         if (e.id == REFLECTION_ID_VK || e.id == FRESNEL_REFLECTION_ID_VK) {
@@ -2613,7 +2626,7 @@ inline Vec3 closure_entry_albedo (VK_GLOBAL const FrameParams* fp,
                 && !(e.refr_tint.z > 0.0f)) {
                 const Vec3 N     = visible_normal_vk (wo, e.N);
                 const float E    = dielec_lobe_E_ms (fp, N, e.N, wo, e.xalpha,
-                                                    e.yalpha, e.eta);
+                                                    e.yalpha, e.eta, path_rough);
                 const float k    = 1.0f - E;
                 return mk (e.w.x * e.refl_tint.x * k,
                            e.w.y * e.refl_tint.y * k,
@@ -2655,7 +2668,7 @@ template <unsigned CS>
 inline Vec3 component_eval (VK_GLOBAL const FrameParams* fp,
                             const ClosureEntryVK& e, const WardVK& wardp,
                             const Vec3& wov, const Vec3& wi, const Vec3& n,
-                            float& pdf)
+                            float& pdf, float path_rough)
 {
     pdf = 0.0f;
     if constexpr (CS & CS_DIFF) {
@@ -2703,7 +2716,7 @@ inline Vec3 component_eval (VK_GLOBAL const FrameParams* fp,
             // per-channel), so it cannot come back through the scalar path.
             Vec3 lw;
             float lp = 0.0f;
-            mx_conductor_eval_vk (fp, e, wov, wi, lw, lp);
+            mx_conductor_eval_vk (fp, e, wov, wi, lw, lp, path_rough);
             pdf = lp;
             return mulv (e.w, lw);
         }
@@ -2714,7 +2727,7 @@ inline Vec3 component_eval (VK_GLOBAL const FrameParams* fp,
             && !(e.refr_tint.z > 0.0f)) {
             Vec3 lw;
             float lp = 0.0f;
-            mx_dielectric_eval_vk (fp, e, wov, wi, lw, lp);
+            mx_dielectric_eval_vk (fp, e, wov, wi, lw, lp, path_rough);
             pdf = lp;
             return mulv (e.w, lw);
         }
@@ -2745,14 +2758,14 @@ inline void components_eval_sum (VK_GLOBAL const FrameParams* fp,
                                  const ClosureEntryVK& e1, int ncomp,
                                  const WardVK& wardp, const Vec3& wov,
                                  const Vec3& wi, const Vec3& n, float b0,
-                                 float b1, Vec3& w, float& pdf)
+                                 float b1, float path_rough, Vec3& w, float& pdf)
 {
     float p0 = 0.0f, p1 = 0.0f;
     Vec3 w0 = mk (0.0f, 0.0f, 0.0f), w1 = mk (0.0f, 0.0f, 0.0f);
     if (ncomp > 0)
-        w0 = component_eval<CS> (fp, e0, wardp, wov, wi, n, p0);
+        w0 = component_eval<CS> (fp, e0, wardp, wov, wi, n, p0, path_rough);
     if (ncomp > 1)
-        w1 = component_eval<CS> (fp, e1, wardp, wov, wi, n, p1);
+        w1 = component_eval<CS> (fp, e1, wardp, wov, wi, n, p1, path_rough);
     // Not a plain sum: CompositeBSDF::eval (shading.h:364-374) folds each
     // lobe in with MIS::update_eval, using the lobe's own pick probability
     // `b` = pdfs[i] from prepare().  With more than one lobe that is what
@@ -2779,7 +2792,7 @@ inline void nee_eval_vk (VK_GLOBAL const FrameParams* fp,
                          int has_phong, int has_on, int has_mxc, int has_mxd,
                          const WardVK& wardp, const Vec3& wov, const Vec3& wi,
                          const Vec3& n, float ar, float ag, float ab, float b0,
-                         float b1, Vec3& w, float& pdf)
+                         float b1, float path_rough, Vec3& w, float& pdf)
 {
     if constexpr (CS & CS_MXC) {
         // A conductor lobe is glossy and its eval is angle dependent (GGX
@@ -2787,7 +2800,7 @@ inline void nee_eval_vk (VK_GLOBAL const FrameParams* fp,
         // albedo cannot stand in for it.
         if (has_mxc) {
             components_eval_sum<CS> (fp, ce0, ce1, ncomp, wardp, wov, wi, n, b0,
-                                     b1, w, pdf);
+                                     b1, path_rough, w, pdf);
             return;
         }
     }
@@ -2796,7 +2809,7 @@ inline void nee_eval_vk (VK_GLOBAL const FrameParams* fp,
         // term, nothing a cosine lobe can approximate.
         if (has_mxd) {
             components_eval_sum<CS> (fp, ce0, ce1, ncomp, wardp, wov, wi, n, b0,
-                                     b1, w, pdf);
+                                     b1, path_rough, w, pdf);
             return;
         }
     }
@@ -2805,14 +2818,14 @@ inline void nee_eval_vk (VK_GLOBAL const FrameParams* fp,
         // directions, so it cannot ride on the accumulated albedo either.
         if (has_on) {
             components_eval_sum<CS> (fp, ce0, ce1, ncomp, wardp, wov, wi, n, b0,
-                                     b1, w, pdf);
+                                     b1, path_rough, w, pdf);
             return;
         }
     }
     if constexpr (CS & CS_MF) {
         if (has_microfacet) {
             components_eval_sum<CS> (fp, ce0, ce1, ncomp, wardp, wov, wi, n, b0,
-                                     b1, w, pdf);
+                                     b1, path_rough, w, pdf);
             return;
         }
     }
@@ -2822,7 +2835,7 @@ inline void nee_eval_vk (VK_GLOBAL const FrameParams* fp,
         // in) instead of the accumulated-albedo shortcut below.
         if (has_phong) {
             components_eval_sum<CS> (fp, ce0, ce1, ncomp, wardp, wov, wi, n, b0,
-                                     b1, w, pdf);
+                                     b1, path_rough, w, pdf);
             return;
         }
     }
@@ -3266,6 +3279,12 @@ static const long long kTexTableOffsetVK = 64 * 1024;
 struct WaveRay {
     Vec3 org, dir;
     float radius, spread;
+    /// Roughness the path has picked up so far: BSDL's `path_roughness`, which
+    /// `regularize_roughness()` (bsdf_impl.h:143) widens the next lobe by.  The
+    /// CPU tracer carries it in `Ray::roughness` and sets it from the sampled
+    /// lobe (`simpleraytracer.cpp:1225`), which is `GGXDist::roughness()`, i.e.
+    /// the *alpha* of the lobe that was sampled.
+    float rough;
     float thr_r, thr_g, thr_b;
     float bpdf;                 ///< bsdf pdf of the ray (inf for a delta)
     unsigned int seed, sindex;  ///< sampler state, advanced across bounces
@@ -3310,6 +3329,7 @@ wave_ray_load(VK_GLOBAL const FrameParams* p, GlobalPtr base,
     r.dir.z  = wf_fcp(base, p->wf_dir_z)[i];
     r.radius = wf_fcp(base, p->wf_radius)[i];
     r.spread = wf_fcp(base, p->wf_spread)[i];
+    r.rough  = wf_fcp(base, p->wf_rough)[i];
     r.thr_r  = wf_fcp(base, p->wf_thr_r)[i];
     r.thr_g  = wf_fcp(base, p->wf_thr_g)[i];
     r.thr_b  = wf_fcp(base, p->wf_thr_b)[i];
@@ -3333,6 +3353,7 @@ wave_ray_store(VK_GLOBAL const FrameParams* p, GlobalPtr base,
     wf_fp(base, p->wf_dir_z)[i]  = r.dir.z;
     wf_fp(base, p->wf_radius)[i] = r.radius;
     wf_fp(base, p->wf_spread)[i] = r.spread;
+    wf_fp(base, p->wf_rough)[i]  = r.rough;
     wf_fp(base, p->wf_thr_r)[i]  = r.thr_r;
     wf_fp(base, p->wf_thr_g)[i]  = r.thr_g;
     wf_fp(base, p->wf_thr_b)[i]  = r.thr_b;
@@ -3437,6 +3458,7 @@ extern "C" void osl_vk_wave_gen(GlobalPtr base)
     r.dir    = dirv;
     r.radius = 0.0f;
     r.spread = spread;
+    r.rough  = 0.0f;  // a camera ray has no glossy history yet
     r.thr_r  = 1.0f;
     r.thr_g  = 1.0f;
     r.thr_b  = 1.0f;
@@ -3802,7 +3824,7 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
             ce[1].off = 0;
             int ncomp   = collect_closure_entries(sg, p, ci,
                                                   mul (ray.direction, -1.0f),
-                                                  ce[0], ce[1]);
+                                                  ce[0], ce[1], r.rough);
             Vec3 alb0   = mk(0.0f, 0.0f, 0.0f);
             Vec3 alb1   = mk(0.0f, 0.0f, 0.0f);
             if (ncomp > 0) {
@@ -3825,7 +3847,7 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                         all_delta = 0;  // an emitter is not a delta BSDF
                         return;
                     }
-                    Vec3 alb = closure_entry_albedo<CS>(p, e, wov0);
+                    Vec3 alb = closure_entry_albedo<CS>(p, e, wov0, r.rough);
                     alb_out  = alb;
                     ar += alb.x;
                     ag += alb.y;
@@ -3999,8 +4021,8 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                     Vec3 bwt3  = mk(0.0f, 0.0f, 0.0f);
                     nee_eval_vk<CS>(p, ce[0], ce[1], ncomp, has_microfacet, is_ward,
                                     has_phong, has_on, has_mxc, has_mxd, wardp,
-                                    wov, bg_dir, n, ar, ag, ab, pk0, pk1, bwt3,
-                                    bpdf);
+                                    wov, bg_dir, n, ar, ag, ab, pk0, pk1,
+                                    r.rough, bwt3, bpdf);
                     const float mis = power_heuristic_weight_weight(bg_pdf, bpdf);
                     Vec3 contrib = mulv(mulv(w, bwt3),
                                         mk(bgv.x * mis, bgv.y * mis,
@@ -4043,7 +4065,7 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                         nee_eval_vk<CS>(p, ce[0], ce[1], ncomp, has_microfacet, is_ward,
                                         has_phong, has_on, has_mxc, has_mxd,
                                         wardp, wov, lsmp.dir, n, ar, ag, ab, pk0,
-                                        pk1, bwt3, bpdf);
+                                        pk1, r.rough, bwt3, bpdf);
                         float mis = power_heuristic_eval_weight(
                             light_pick_pdf * lsmp.pdf, bpdf);
                         Vec3 contrib
@@ -4101,6 +4123,10 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                 // body and only the live branches set it again).
                 Vec3 wi       = mul(wov, -1.0f);
                 float sweight = 1.0f;
+                // Path roughness the sampled lobe hands to the next bounce:
+                // `GGXDist::roughness()` of the lobe that was picked, 0 for
+                // everything that is not a grazing-angle microfacet lobe.
+                float lobe_rough = 0.0f;
                 // Same value as a colour: the conductor lobe's weight carries
                 // its per-channel Fresnel term, so it cannot be a scalar.
                 Vec3 sweight_v = mk(1.0f, 1.0f, 1.0f);
@@ -4211,6 +4237,10 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                         float lw = 0.0f;
                         mf_sample_vk(e, wov, u1, s3.y, s3.z, wi, lw, spdf);
                         sw = mk(lw, lw, lw);
+                        // The CPU's MicrofacetBSDF reports `d.roughness()`, i.e.
+                        // the larger alpha of the Beckmann slope it built
+                        // (microfacet_tools_impl.h:224).
+                        lobe_rough = e.xalpha > e.yalpha ? e.xalpha : e.yalpha;
                     } else if constexpr (HAS_MXD) {
                         // The dielectric lobe samples like the conductor: draw a
                         // micro normal from the bounded VNDF, reflect, then take
@@ -4218,12 +4248,22 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                         if (e.id == MX_DIELECTRIC_ID_VK) {
                             Vec3 dw;
                             mx_dielectric_sample_vk(p, e, wov, u1, s3.y, wi, dw,
-                                                    spdf);
+                                                    spdf, lobe_rough, r.rough);
                             sw = dw;
                         } else if constexpr (HAS_DIFF) {
                             if (e.id == DIFFUSE_ID_VK) {
+                                // The cosine sample must use the same normal
+                                // the diffuse eval is defined on (`n`), the way
+                                // `Diffuse::sample` uses `DiffuseParams.N`.
+                                // `e.N` is not filled in for a diffuse
+                                // component: it is a zero vector, and the
+                                // Pixar basis of a zero normal samples a fixed
+                                // world hemisphere instead of the one around
+                                // the surface -- which put rays under the
+                                // surface and made the dielectric lobe eval at
+                                // grazing directions blow up.
                                 float pc = 0.0f;
-                                wi       = sample_cosine_hemisphere(e.N, u1, s3.y,
+                                wi       = sample_cosine_hemisphere(n, u1, s3.y,
                                                                     pc);
                                 spdf     = pc;
                                 sw       = mk(1.0f, 1.0f, 1.0f);
@@ -4236,7 +4276,8 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                     } else if constexpr (HAS_DIFF) {
                         if (e.id == DIFFUSE_ID_VK) {
                             float pc = 0.0f;
-                            wi       = sample_cosine_hemisphere(e.N, u1, s3.y, pc);
+                            wi       = sample_cosine_hemisphere(n, u1, s3.y,
+                                                                pc);
                             spdf     = pc;
                             sw       = mk(1.0f, 1.0f, 1.0f);
                         } else {
@@ -4263,7 +4304,8 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                     if (oe.id >= 0 && oe.id != EMISSION_ID_VK
                         && oe.id != BACKGROUND_ID_VK) {
                         float op = 0.0f;
-                        Vec3 ow  = component_eval<CS>(p, oe, wardp, wov, wi, n, op);
+                        Vec3 ow  = component_eval<CS>(p, oe, wardp, wov, wi, n,
+                                                      op, r.rough);
                         mis_update_eval_vk(outw, spdf, ow, op, pick ? p0 : p1);
                     }
                     w        = mulv(w, outw);
@@ -4315,7 +4357,8 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                     // so it rides in `sweight_v` instead of `sweight`.
                     Vec3 ow;
                     float op = 0.0f;
-                    mx_conductor_sample_vk(p, ce[0], wov, rx, s3.y, wi, ow, op);
+                    mx_conductor_sample_vk(p, ce[0], wov, rx, s3.y, wi, ow, op,
+                                           lobe_rough, r.rough);
                     bsdf_pdf  = op * pdf0;
                     sweight_v = ow;
                     if (!(op > 0.0f)) {
@@ -4354,6 +4397,7 @@ void wave_shade_body(GlobalPtr base, unsigned pix)
                 r.dir    = wi;
                 r.radius = ray.radius;
                 r.spread = ray.spread;
+                r.rough  = lobe_rough;
                 r.prev   = hit.id;
                 r.depth  = b + 1;
                 r.bpdf   = bsdf_pdf;

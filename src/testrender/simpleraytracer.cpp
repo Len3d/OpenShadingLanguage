@@ -2073,6 +2073,7 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
     size_t wf_dir_z = take(npix * sizeof(float));
     size_t wf_radius = take(npix * sizeof(float));
     size_t wf_spread = take(npix * sizeof(float));
+    size_t wf_rough  = take(npix * sizeof(float));
     size_t wf_thr_r  = take(npix * sizeof(float));
     size_t wf_thr_g  = take(npix * sizeof(float));
     size_t wf_thr_b  = take(npix * sizeof(float));
@@ -2338,6 +2339,7 @@ SimpleRaytracer::render_vulkan_frame(int xres, int yres)
     fp.wf_dir_z          = (long long)wf_dir_z;
     fp.wf_radius         = (long long)wf_radius;
     fp.wf_spread         = (long long)wf_spread;
+    fp.wf_rough          = (long long)wf_rough;
     fp.wf_thr_r          = (long long)wf_thr_r;
     fp.wf_thr_g          = (long long)wf_thr_g;
     fp.wf_thr_b          = (long long)wf_thr_b;

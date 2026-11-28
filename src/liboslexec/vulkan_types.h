@@ -335,8 +335,8 @@ struct FrameParams {
     // striding a per-ray struct:
     //
     //   ray buffer : origin (x,y,z), direction (x,y,z), radius, spread,
-    //                throughput (r,g,b), sampler seed/index, depth,
-    //                previous primitive, liveness, bsdf pdf
+    //                path roughness, throughput (r,g,b), sampler seed/index,
+    //                depth, previous primitive, liveness, bsdf pdf
     //   hit buffer : t, u, v, primitive id, "did it hit" flag
     //
     // The shading pass reads the ray buffer, the intersect pass reads it and
@@ -346,6 +346,10 @@ struct FrameParams {
     long long wf_org_x, wf_org_y, wf_org_z;
     long long wf_dir_x, wf_dir_y, wf_dir_z;
     long long wf_radius, wf_spread;
+    /// Path roughness of the ray (`RsdfGlobals::path_roughness` on the CPU side:
+    /// the alpha of the lobe the previous bounce sampled, which
+    /// `regularize_roughness()` widens the next lobe by).
+    long long wf_rough;
     long long wf_thr_r, wf_thr_g, wf_thr_b;
     long long wf_seed, wf_sindex;  ///< sampler state (int arrays)
     long long wf_depth, wf_prev;   ///< int arrays
