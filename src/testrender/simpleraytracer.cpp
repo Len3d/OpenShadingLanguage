@@ -44,6 +44,7 @@ namespace pugi = OIIO::pugi;
 #    include <OpenImageIO/imagebuf.h>
 #    include <OpenImageIO/imagebufalgo.h>
 #    include <cmath>
+#    include <thread>
 #endif
 #include <algorithm>
 
@@ -1451,45 +1452,45 @@ SimpleRaytracer::init_vulkan_shading()
             fprintf(stderr, "[vulkan] wrote %s\n", spvpath);
         }
     }
-    // Entry names must match the kernels vulkan_module.cpp synthesises: two
+    // Entry names must match the kernels vulkan_module.cpp synthesises: four
     // wavefront passes plus one shading kernel per material.  The material
     // groups are what the host sorts the wave into, so the count has to be the
     // number of groups in the module.
-    struct PassSpec {
-        const char* entry;
-        int* slot;
-    };
-    const PassSpec passes[] = {
-        { "osl_kernel_gen", &m_vk_gen },
-        { "osl_kernel_intersect", &m_vk_intersect },
-        { "osl_kernel_compact", &m_vk_compact },
-        { "osl_kernel_bucket_tail", &m_vk_bucket_tail },
-    };
-    for (auto& ps : passes) {
-        fprintf(stderr, "[vulkan] creating pipeline '%s'...\n", ps.entry);
-        int id = m_vk->add_shader(spirv.data(), spirv.size(), ps.entry, err);
-        if (id < 0) {
-            fprintf(stderr, "[vulkan] pipeline '%s' failed: %s\n", ps.entry,
-                    err.c_str());
-            vulkan_report_failure("wavefront pipeline failed", ps.entry);
-            return;
-        }
-        *ps.slot = id;
-    }
-    m_vk_shade.assign(irs.size(), -1);
+    //
+    // Every one of them is a full pipeline build in the driver, which is what
+    // makes setup dominate a render (290-450 s on this machine).  They are
+    // independent of each other -- same SPIR-V module, different entry point --
+    // so they go through add_shaders() and the driver compiles several at once.
+    // OSL_VULKAN_PIPE_THREADS overrides the thread count; a value <= 0 means
+    // serial.
+    std::vector<std::string> shade_entries(irs.size());
+    std::vector<const char*> entries { "osl_kernel_gen", "osl_kernel_intersect",
+                                       "osl_kernel_compact",
+                                       "osl_kernel_bucket_tail" };
     for (size_t i = 0; i < irs.size(); ++i) {
-        std::string entry = "osl_kernel_shade" + std::to_string(i);
-        fprintf(stderr, "[vulkan] creating pipeline '%s'...\n", entry.c_str());
-        int id = m_vk->add_shader(spirv.data(), spirv.size(), entry.c_str(),
-                                 err);
-        if (id < 0) {
-            fprintf(stderr, "[vulkan] pipeline '%s' failed: %s\n",
-                    entry.c_str(), err.c_str());
-            vulkan_report_failure("wavefront pipeline failed", entry.c_str());
-            return;
-        }
-        m_vk_shade[i] = id;
+        shade_entries[i] = "osl_kernel_shade" + std::to_string(i);
+        entries.push_back(shade_entries[i].c_str());
     }
+    int threads = (int)std::thread::hardware_concurrency();
+    if (const char* n = getenv("OSL_VULKAN_PIPE_THREADS"))
+        threads = atoi(n);
+    if (threads <= 0)
+        threads = 1;
+    fprintf(stderr, "[vulkan] creating %zu pipelines on %d thread(s)...\n",
+            entries.size(), threads);
+    std::vector<int> ids;
+    if (!m_vk->add_shaders(spirv.data(), spirv.size(), entries, ids, threads,
+                           err)) {
+        fprintf(stderr, "[vulkan] pipeline creation failed: %s\n",
+                err.c_str());
+        vulkan_report_failure("wavefront pipeline failed", err.c_str());
+        return;
+    }
+    m_vk_gen         = ids[0];
+    m_vk_intersect   = ids[1];
+    m_vk_compact     = ids[2];
+    m_vk_bucket_tail = ids[3];
+    m_vk_shade.assign(ids.begin() + 4, ids.end());
     upload_vulkan_textures();
     fprintf(stderr,
             "[vulkan] wavefront pipeline ready (gen %d, intersect %d, %zu shade "

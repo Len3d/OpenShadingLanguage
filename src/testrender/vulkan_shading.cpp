@@ -31,6 +31,13 @@ int VulkanShading::add_shader(const uint32_t*, size_t, const char*,
     err = "testrender was built without a Vulkan SDK";
     return -1;
 }
+bool VulkanShading::add_shaders(const uint32_t*, size_t,
+                                const std::vector<const char*>&,
+                                std::vector<int>&, int, std::string& err)
+{
+    err = "testrender was built without a Vulkan SDK";
+    return false;
+}
 bool VulkanShading::shade(int, void*, size_t, std::string& err)
 {
     err = "testrender was built without a Vulkan SDK";
@@ -39,8 +46,12 @@ bool VulkanShading::shade(int, void*, size_t, std::string& err)
 
 #else
 
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <thread>
 
 #include <vulkan/vulkan.h>
 
@@ -98,6 +109,85 @@ struct VulkanShading::Impl {
         VkPipeline pipe         = VK_NULL_HANDLE;
     };
     std::vector<Pipeline> pipelines;
+    /// Shared by every pipeline built from `add_shaders()`.  Created without
+    /// VK_PIPELINE_CACHE_CREATE_EXTERNALLY_SYNCHRONIZED_BIT, so the
+    /// implementation serialises the cache itself and several threads can
+    /// compile into it at once.
+    VkPipelineCache cache = VK_NULL_HANDLE;
+    std::mutex pipeline_mutex;  ///< guards `pipelines` growth
+
+    /// One shader module, one layout, one compute pipeline, built into the
+    /// shared cache.  Safe to call from several threads at once as long as
+    /// each one fills a different `Pipeline` slot: everything it touches
+    /// belongs to the caller or to the internally synchronised cache.
+    bool build_pipeline(Pipeline& p, const uint32_t* spirv, size_t word_count,
+                        const char* entry, std::string& err)
+    {
+        if (!make_stage(p, spirv, word_count, entry, err))
+            return false;
+        return make_pipe(p, entry, err);
+    }
+
+    /// The pipeline itself: the driver's compiler is what makes this the
+    /// expensive half, so `add_shaders()` runs it on several threads.
+    bool make_pipe(Pipeline& p, const char* entry, std::string& err)
+    {
+        VkComputePipelineCreateInfo cpci {};
+        cpci.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        cpci.stage  = stage_info(p, entry);
+        cpci.layout = p.layout;
+        if (vkCreateComputePipelines(device, cache, 1, &cpci, nullptr, &p.pipe)
+            != VK_SUCCESS) {
+            err = "vkCreateComputePipelines failed";
+            return false;
+        }
+        return true;
+    }
+
+    /// The module + pipeline layout half of a pipeline: cheap, and serial-safe
+    /// (Vulkan only requires external synchronisation of the device, which is
+    /// not needed for these).
+    bool make_stage(Pipeline& p, const uint32_t* spirv, size_t word_count,
+                    const char* entry, std::string& err)
+    {
+        VkShaderModuleCreateInfo smci {};
+        smci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        smci.codeSize = word_count * sizeof(uint32_t);
+        smci.pCode    = spirv;
+        if (vkCreateShaderModule(device, &smci, nullptr, &p.module)
+            != VK_SUCCESS) {
+            err = "vkCreateShaderModule failed";
+            return false;
+        }
+
+        VkPipelineLayoutCreateInfo plci {};
+        plci.sType          = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        // The module declares a storage-buffer variable, so the layout must
+        // carry the matching set layout.  Leaving it empty is a validation
+        // error (VUID-VkComputePipelineCreateInfo-layout-07988) and, on the
+        // Intel driver, a process-level access violation at the first
+        // dispatch.
+        plci.setLayoutCount = 1;
+        plci.pSetLayouts    = &dslayout;
+        if (vkCreatePipelineLayout(device, &plci, nullptr, &p.layout)
+            != VK_SUCCESS) {
+            err = "vkCreatePipelineLayout failed";
+            return false;
+        }
+        return true;
+    }
+
+    VkPipelineShaderStageCreateInfo stage_info (const Pipeline& p,
+                                                const char* entry) const
+    {
+        VkPipelineShaderStageCreateInfo stage {};
+        stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+        stage.module = p.module;
+        stage.pName  = (entry && *entry) ? entry : "osl_kernel";
+        return stage;
+    }
+
 
     std::mutex submit_mutex;
     std::string device_name;
@@ -124,6 +214,8 @@ struct VulkanShading::Impl {
                 vkDestroyShaderModule(device, p.module, nullptr);
         }
         pipelines.clear();
+        if (cache != VK_NULL_HANDLE)
+            vkDestroyPipelineCache(device, cache, nullptr);
         if (dspool != VK_NULL_HANDLE)
             vkDestroyDescriptorPool(device, dspool, nullptr);
         if (dslayout != VK_NULL_HANDLE)
@@ -440,6 +532,15 @@ bool VulkanShading::init(std::string& err)
     fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
     VK_TRY(vkCreateFence(I.device, &fci, nullptr, &I.fence), err);
 
+    // Shared pipeline cache.  Deliberately without
+    // VK_PIPELINE_CACHE_CREATE_EXTERNALLY_SYNCHRONIZED_BIT: that flag would
+    // make concurrent use of it our problem, and the driver can hold the lock
+    // around its own cache bookkeeping far better than we can (the compilers
+    // themselves still run in parallel).
+    VkPipelineCacheCreateInfo pcci {};
+    pcci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+    VK_TRY(vkCreatePipelineCache(I.device, &pcci, nullptr, &I.cache), err);
+
     I.inited = true;
     return true;
 }
@@ -459,51 +560,98 @@ int VulkanShading::add_shader(const uint32_t* spirv, size_t word_count,
     }
 
     Impl::Pipeline p;
-
-    VkShaderModuleCreateInfo smci {};
-    smci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    smci.codeSize = word_count * sizeof(uint32_t);
-    smci.pCode    = spirv;
-    if (vkCreateShaderModule(I.device, &smci, nullptr, &p.module)
-        != VK_SUCCESS) {
-        err = "vkCreateShaderModule failed";
+    if (!I.build_pipeline(p, spirv, word_count, entry, err))
         return -1;
-    }
 
-    VkPipelineLayoutCreateInfo plci {};
-    plci.sType          = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    // The module declares a storage-buffer variable, so the layout must carry
-    // the matching set layout.  Leaving it empty is a validation error
-    // (VUID-VkComputePipelineCreateInfo-layout-07988) and, on the Intel
-    // driver, a process-level access violation at the first dispatch.
-    plci.setLayoutCount = 1;
-    plci.pSetLayouts    = &I.dslayout;
-    if (vkCreatePipelineLayout(I.device, &plci, nullptr, &p.layout)
-        != VK_SUCCESS) {
-        err = "vkCreatePipelineLayout failed";
-        return -1;
-    }
-
-    VkPipelineShaderStageCreateInfo stage {};
-    stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
-    stage.module = p.module;
-    stage.pName  = (entry && *entry) ? entry : "osl_kernel";
-
-    VkComputePipelineCreateInfo cpci {};
-    cpci.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-    cpci.stage  = stage;
-    cpci.layout = p.layout;
-
-    VkResult r = vkCreateComputePipelines(I.device, VK_NULL_HANDLE, 1, &cpci,
-                                          nullptr, &p.pipe);
-    if (r != VK_SUCCESS) {
-        err = "vkCreateComputePipelines returned " + std::to_string((int)r);
-        return -1;
-    }
-
+    std::lock_guard<std::mutex> lock(I.pipeline_mutex);
     I.pipelines.push_back(p);
     return (int)I.pipelines.size() - 1;
+}
+
+
+bool VulkanShading::add_shaders(const uint32_t* spirv, size_t word_count,
+                                const std::vector<const char*>& entries,
+                                std::vector<int>& ids, int threads,
+                                std::string& err)
+{
+    Impl& I = *m_impl;
+    ids.assign(entries.size(), -1);
+    if (!I.inited) {
+        err = "VulkanShading::add_shaders before init";
+        return false;
+    }
+    if (word_count == 0) {
+        err = "empty SPIR-V module";
+        return false;
+    }
+    if (entries.empty())
+        return true;
+
+    // Reserve every slot up front: growing the vector is the only shared
+    // state the workers could race on, and filling distinct elements of a
+    // vector that is not reallocating is safe.
+    size_t base;
+    {
+        std::lock_guard<std::mutex> lock(I.pipeline_mutex);
+        base = I.pipelines.size();
+        I.pipelines.resize(base + entries.size());
+    }
+
+    // Modules and layouts first: cheap bookkeeping, and the pipeline call
+    // below wants them already in place.
+    for (size_t i = 0; i < entries.size(); ++i) {
+        if (!I.make_stage(I.pipelines[base + i], spirv, word_count, entries[i],
+                          err))
+            return false;
+    }
+
+    // One cache, N compilers.  Without
+    // VK_PIPELINE_CACHE_CREATE_EXTERNALLY_SYNCHRONIZED_BIT the implementation
+    // owns the cache lock, so the only serialisation left is the driver's own
+    // bookkeeping -- the SPIR-V -> ISA work overlaps.
+    int nthreads = threads > 0 ? threads : 1;
+    if ((size_t)nthreads > entries.size())
+        nthreads = (int)entries.size();
+
+    std::atomic<size_t> next { 0 };
+    std::mutex err_mutex;
+    std::string first_err;
+    std::vector<std::thread> pool;
+    pool.reserve(nthreads);
+    for (int t = 0; t < nthreads; ++t) {
+        pool.emplace_back([&]() {
+            std::string local_err;
+            for (size_t i = next.fetch_add(1); i < entries.size();
+                 i = next.fetch_add(1)) {
+                auto t0 = std::chrono::steady_clock::now();
+                bool ok = I.make_pipe(I.pipelines[base + i], entries[i],
+                                      local_err);
+                if (getenv("OSL_VULKAN_PIPE_TIME")) {
+                    double dt = std::chrono::duration<double>(
+                                    std::chrono::steady_clock::now() - t0)
+                                    .count();
+                    fprintf(stderr, "[pipe] %-20s %6.2f s\n", entries[i], dt);
+                }
+                if (!ok) {
+                    std::string msg = std::string(entries[i]) + ": "
+                        + local_err;
+                    std::lock_guard<std::mutex> lock(err_mutex);
+                    if (first_err.empty())
+                        first_err = msg;
+                }
+            }
+        });
+    }
+    for (auto& t : pool)
+        t.join();
+
+    if (!first_err.empty()) {
+        err = first_err;
+        return false;
+    }
+    for (size_t i = 0; i < entries.size(); ++i)
+        ids[i] = (int)(base + i);
+    return true;
 }
 
 

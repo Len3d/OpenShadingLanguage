@@ -32,6 +32,17 @@ public:
     int add_shader(const uint32_t* spirv, size_t word_count, const char* entry,
                    std::string& err);
 
+    /// Build one pipeline per entry out of the same SPIR-V module.  The
+    /// wavefront path creates ten to sixteen pipelines per scene and the
+    /// driver's compiler is what makes setup cost minutes, so the entries are
+    /// compiled on `threads` host threads instead of one after another
+    /// (serial when the count is not positive).  `ids` comes back in entry
+    /// order; the call fails as a whole if any pipeline failed, with `err`
+    /// naming the entry.
+    bool add_shaders(const uint32_t* spirv, size_t word_count,
+                     const std::vector<const char*>& entries,
+                     std::vector<int>& ids, int threads, std::string& err);
+
     /// One decoded texture: RGBA32F, the whole mip chain, largest level first.
     /// `hash` is the ustring hash of the filename, which is exactly what the
     /// compiled shader passes to osl_texture(), so the device can match it
